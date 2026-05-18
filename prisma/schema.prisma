@@ -24,8 +24,9 @@ model User {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  projects  Project[]
-  usageLogs UsageLog[]
+  projects       Project[]
+  usageLogs      UsageLog[]
+  searchHistory  SearchHistory[]
 
   @@index([clerkId])
 }
@@ -88,6 +89,25 @@ model Cache {
   createdAt DateTime @default(now())
 
   @@index([namespace, expiresAt])
+}
+
+/// Auto-saved log of every successful scene parse, regardless of whether it
+/// came from Claude or the cache. Surfaces as "Recent searches" on the
+/// dashboard. Distinct from `Project` (M5), which is an explicit save with
+/// a user-chosen title and attached locations.
+model SearchHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sceneText String   @db.Text
+  city      String?
+  /// Claude's structured analysis at the time of this search.
+  analysis  Json
+  /// Whether this row was served from cache (true) or live Claude call (false).
+  cached    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
 
 /// Per-user, per-day usage counter for rate-limiting on the free tier.

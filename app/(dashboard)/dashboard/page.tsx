@@ -1,9 +1,26 @@
 import Link from "next/link";
 import { currentUser } from "@clerk/nextjs/server";
 
+import { requireDbUser } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+
 export default async function DashboardPage() {
-  const user = await currentUser();
+  const [user, { dbUserId }] = await Promise.all([currentUser(), requireDbUser()]);
   const greeting = user?.firstName ? `Welcome back, ${user.firstName}.` : "Welcome back.";
+
+  const recentSearches = await prisma.searchHistory.findMany({
+    where: { userId: dbUserId },
+    orderBy: { createdAt: "desc" },
+    take: 5,
+    select: {
+      id: true,
+      sceneText: true,
+      city: true,
+      cached: true,
+      createdAt: true,
+      analysis: true,
+    },
+  });
 
   return (
     <div className="space-y-10">
@@ -49,14 +66,85 @@ export default async function DashboardPage() {
       </section>
 
       <section>
+        <div className="mb-4 flex items-baseline justify-between">
+          <h2 className="text-lg font-semibold">Recent searches</h2>
+          {recentSearches.length > 0 && (
+            <span className="text-xs text-muted-foreground">
+              Last {recentSearches.length} of yours
+            </span>
+          )}
+        </div>
+
+        {recentSearches.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-white/10 p-10 text-center">
+            <p className="text-sm text-muted-foreground">
+              No searches yet. Run your first scene through the analyzer and it&apos;ll show up
+              here automatically.
+            </p>
+          </div>
+        ) : (
+          <ul className="divide-y divide-white/5 overflow-hidden rounded-lg border border-white/10">
+            {recentSearches.map((s) => (
+              <li key={s.id}>
+                <Link
+                  href={`/dashboard/new?historyId=${s.id}`}
+                  className="block px-5 py-4 transition hover:bg-white/5"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">
+                          {s.city ?? extractCityFromAnalysis(s.analysis) ?? "Unspecified city"}
+                        </span>
+                        {s.cached && (
+                          <span className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+                            cached
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 truncate text-sm text-muted-foreground">
+                        {s.sceneText.slice(0, 140)}
+                        {s.sceneText.length > 140 ? "…" : ""}
+                      </p>
+                    </div>
+                    <span className="shrink-0 text-xs text-muted-foreground">
+                      {formatRelative(s.createdAt)}
+                    </span>
+                  </div>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section>
         <h2 className="mb-4 text-lg font-semibold">Your projects</h2>
         <div className="rounded-lg border border-dashed border-white/10 p-10 text-center">
           <p className="text-sm text-muted-foreground">
-            You don&apos;t have any saved projects yet. Start a new search and we&apos;ll save
-            it here.
+            Saved projects land in M5 — explicit save with a custom name and per-location notes.
           </p>
         </div>
       </section>
     </div>
   );
+}
+
+function extractCityFromAnalysis(analysis: unknown): string | null {
+  if (typeof analysis !== "object" || analysis === null) return null;
+  const obj = analysis as Record<string, unknown>;
+  return typeof obj.city === "string" ? obj.city : null;
+}
+
+function formatRelative(date: Date): string {
+  const ms = Date.now() - date.getTime();
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const d = Math.round(hr / 24);
+  if (d < 7) return `${d}d ago`;
+  return date.toLocaleDateString();
 }

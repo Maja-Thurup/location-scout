@@ -5,6 +5,7 @@ import { withAuth } from "@/lib/auth";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { analyzeScene, type SceneAnalysis } from "@/lib/claude";
 import { logger } from "@/lib/logger";
+import { prisma } from "@/lib/prisma";
 import { checkRateLimit, incrementUsage } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
@@ -26,6 +27,31 @@ type ParseSceneResponse = {
     resetAt: string;
   };
 };
+
+async function recordHistory(args: {
+  userId: string;
+  sceneText: string;
+  city?: string;
+  analysis: SceneAnalysis;
+  fromCache: boolean;
+}): Promise<void> {
+  try {
+    await prisma.searchHistory.create({
+      data: {
+        userId: args.userId,
+        sceneText: args.sceneText,
+        city: args.city ?? null,
+        analysis: args.analysis as never,
+        cached: args.fromCache,
+      },
+    });
+  } catch (err) {
+    logger.warn("history.write failed", {
+      userId: args.userId,
+      err: String(err),
+    });
+  }
+}
 
 export const POST = withAuth(async (req) => {
   const t0 = Date.now();
@@ -59,6 +85,13 @@ export const POST = withAuth(async (req) => {
 
   if (cached) {
     const rl = await checkRateLimit(req.dbUserId, "parse_scene");
+    await recordHistory({
+      userId: req.dbUserId,
+      sceneText,
+      city,
+      analysis: cached.analysis,
+      fromCache: true,
+    });
     logger.info("parse-scene cache hit", {
       userId: req.dbUserId,
       ms: Date.now() - t0,
@@ -130,6 +163,15 @@ export const POST = withAuth(async (req) => {
 
   // 6) Charge the user (cache miss only).
   const post = await incrementUsage(req.dbUserId, "parse_scene");
+
+  // 7) Record this search in the user's history.
+  await recordHistory({
+    userId: req.dbUserId,
+    sceneText,
+    city,
+    analysis: analysisResult.analysis,
+    fromCache: false,
+  });
 
   logger.info("parse-scene success", {
     userId: req.dbUserId,

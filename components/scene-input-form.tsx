@@ -7,7 +7,7 @@ import { useMutation } from "@tanstack/react-query";
 import { z } from "zod";
 import posthog from "posthog-js";
 
-import type { SceneInputProps } from "@/components/contracts";
+import type { SceneAnalysis } from "@/lib/claude";
 
 // ---------------------------------------------------------------------------
 // Form schema (client-side validation; mirrors the server's stricter check).
@@ -32,16 +32,7 @@ type FormValues = z.input<typeof formSchema>;
 // ---------------------------------------------------------------------------
 
 type ParseSceneResponse = {
-  analysis: {
-    osm_tags: Record<string, string>;
-    google_query: string;
-    google_types: string[];
-    city: string;
-    visual: string;
-    mood: string | null;
-    time_of_day: string | null;
-    interior_exterior: "interior" | "exterior" | "both" | null;
-  };
+  analysis: SceneAnalysis;
   cached: boolean;
   attempts: number;
   rateLimit: { used: number; limit: number; remaining: number; resetAt: string };
@@ -93,8 +84,42 @@ const SAMPLES: ReadonlyArray<{ label: string; sceneText: string; city?: string }
 // Component
 // ---------------------------------------------------------------------------
 
-export function SceneInputForm(_props: Partial<SceneInputProps> = {}) {
+export type SceneInputFormProps = {
+  /** Optional starting scene text (e.g. when loading from search history). */
+  initialSceneText?: string;
+  /** Optional starting city. */
+  initialCity?: string;
+  /** Optional pre-existing analysis to render below the form on first paint. */
+  initialAnalysis?: SceneAnalysis | null;
+};
+
+export function SceneInputForm({
+  initialSceneText = "",
+  initialCity = "",
+  initialAnalysis = null,
+}: SceneInputFormProps) {
   const [serverError, setServerError] = useState<string | null>(null);
+
+  // If we hydrated with a previous analysis, surface it as the initial
+  // result panel state. Once the user runs a fresh search the mutation's
+  // own data takes over.
+  const [initialResult] = useState<ParseSceneResponse | null>(() =>
+    initialAnalysis
+      ? {
+          analysis: initialAnalysis,
+          cached: true,
+          attempts: 1,
+          rateLimit: {
+            used: 0,
+            limit: 5,
+            remaining: 5,
+            resetAt: new Date(
+              new Date().setUTCHours(24, 0, 0, 0),
+            ).toISOString(),
+          },
+        }
+      : null,
+  );
 
   const {
     register,
@@ -104,7 +129,7 @@ export function SceneInputForm(_props: Partial<SceneInputProps> = {}) {
     formState: { errors },
   } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    defaultValues: { sceneText: "", city: "" },
+    defaultValues: { sceneText: initialSceneText, city: initialCity },
   });
 
   const mutation = useMutation({
@@ -206,7 +231,12 @@ export function SceneInputForm(_props: Partial<SceneInputProps> = {}) {
         )}
       </form>
 
-      {mutation.data && <AnalysisResultPanel result={mutation.data} />}
+      {(mutation.data ?? initialResult) && (
+        <AnalysisResultPanel
+          result={mutation.data ?? (initialResult as ParseSceneResponse)}
+          isLoadedFromHistory={!mutation.data && initialResult !== null}
+        />
+      )}
     </div>
   );
 }
@@ -215,27 +245,41 @@ export function SceneInputForm(_props: Partial<SceneInputProps> = {}) {
 // Result preview (placeholder — replaced by real result UI in M3/M4).
 // ---------------------------------------------------------------------------
 
-function AnalysisResultPanel({ result }: { result: ParseSceneResponse }) {
+function AnalysisResultPanel({
+  result,
+  isLoadedFromHistory,
+}: {
+  result: ParseSceneResponse;
+  isLoadedFromHistory?: boolean;
+}) {
   const { analysis, cached, attempts, rateLimit } = result;
 
   return (
     <section className="space-y-4 rounded-lg border border-white/10 bg-card p-6">
       <header className="flex flex-wrap items-center gap-3">
         <h2 className="text-lg font-semibold">Claude analysis</h2>
-        <span
-          className={
-            "rounded-full px-2 py-0.5 text-xs font-medium " +
-            (cached
-              ? "bg-emerald-500/15 text-emerald-300"
-              : "bg-blue-500/15 text-blue-300")
-          }
-        >
-          {cached ? "cached" : `live · ${attempts} attempt${attempts === 1 ? "" : "s"}`}
-        </span>
-        <span className="text-xs text-muted-foreground">
-          {rateLimit.used} / {rateLimit.limit} scenes today · resets{" "}
-          {new Date(rateLimit.resetAt).toLocaleTimeString()}
-        </span>
+        {isLoadedFromHistory ? (
+          <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
+            from history
+          </span>
+        ) : (
+          <span
+            className={
+              "rounded-full px-2 py-0.5 text-xs font-medium " +
+              (cached
+                ? "bg-emerald-500/15 text-emerald-300"
+                : "bg-blue-500/15 text-blue-300")
+            }
+          >
+            {cached ? "cached" : `live · ${attempts} attempt${attempts === 1 ? "" : "s"}`}
+          </span>
+        )}
+        {!isLoadedFromHistory && (
+          <span className="text-xs text-muted-foreground">
+            {rateLimit.used} / {rateLimit.limit} scenes today · resets{" "}
+            {new Date(rateLimit.resetAt).toLocaleTimeString()}
+          </span>
+        )}
       </header>
 
       <dl className="grid gap-3 text-sm md:grid-cols-2">
