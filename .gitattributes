@@ -1,0 +1,24 @@
+# Normalize all text files to LF for cross-platform consistency.
+* text=auto eol=lf
+
+# Force LF for source code regardless of platform.
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.css text eol=lf
+*.yml text eol=lf
+*.prisma text eol=lf
+*.sql text eol=lf
+
+# Binary files (just in case).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary

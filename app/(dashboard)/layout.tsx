@@ -2,6 +2,10 @@ import Link from "next/link";
 import { UserButton } from "@clerk/nextjs";
 import { Footer } from "@/components/footer";
 
+// Every page under (dashboard) requires an authenticated user, so these
+// routes must be rendered per-request, never prerendered at build time.
+export const dynamic = "force-dynamic";
+
 export default function DashboardLayout({
   children,
 }: {
