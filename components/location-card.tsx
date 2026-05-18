@@ -30,7 +30,10 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
   const {
     id,
     name,
-    address,
+    // address is intentionally received and ignored — the card no longer
+    // shows it, but the prop stays in the LocationCardProps contract for
+    // when designed components want it back.
+    address: _address,
     lat,
     lng,
     rating,
@@ -129,15 +132,10 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
         </div>
 
         <div className="flex flex-1 flex-col gap-2 p-4">
-          {/* Coordinates first, address below. */}
-          <div className="space-y-1">
-            <p className="font-mono text-xs leading-tight text-foreground">
-              {lat.toFixed(5)}, {lng.toFixed(5)}
-            </p>
-            {address && (
-              <p className="text-xs leading-snug text-muted-foreground">{address}</p>
-            )}
-          </div>
+          {/* Coordinates as the primary location identifier (no street address). */}
+          <p className="font-mono text-xs leading-tight text-foreground">
+            {lat.toFixed(5)}, {lng.toFixed(5)}
+          </p>
 
           <header className="flex items-start justify-between gap-2">
             <h3 className="text-sm font-semibold leading-snug">{name}</h3>

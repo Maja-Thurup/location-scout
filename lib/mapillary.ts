@@ -163,3 +163,124 @@ export async function findBestImageNear(
 function round(n: number): number {
   return Math.round(n * 1e4) / 1e4;
 }
+
+// ---------------------------------------------------------------------------
+// Object detections
+//
+// Mapillary's `/map_features` endpoint returns geometric features detected
+// in their imagery — bike racks, benches, traffic signs, fire hydrants, etc.
+// Useful when Claude's scene mentions specific objects we can match against.
+//
+// Note: building/person classes are excluded by Mapillary; for those we
+// rely on OSM tags + Claude Vision instead.
+// ---------------------------------------------------------------------------
+
+const detectionSchema = z.object({
+  id: z.union([z.string(), z.number()]).transform((v) => String(v)),
+  object_value: z.string(),
+  object_type: z.string().optional(),
+  geometry: z
+    .object({
+      type: z.literal("Point").optional(),
+      coordinates: z.tuple([z.number(), z.number()]),
+    })
+    .optional(),
+});
+
+const detectionsResponseSchema = z.object({
+  data: z.array(detectionSchema).optional(),
+});
+
+export type MapillaryDetection = {
+  id: string;
+  /** Object class, e.g. "object--bench", "object--bike-rack", "object--fire-hydrant". */
+  objectClass: string;
+  lat: number;
+  lng: number;
+};
+
+/**
+ * Find Mapillary feature detections matching the requested classes within
+ * a bbox. Cached 14 days because OSM/Mapillary data churns slowly.
+ *
+ * `classes` should be the Mapillary canonical names like
+ * "object--bench", "object--bike-rack", "marking--surface--cobblestone".
+ * We pass the list to the Mapillary API verbatim.
+ */
+export async function findDetectionsInBbox(input: {
+  bboxStr: string; // "minLng,minLat,maxLng,maxLat"
+  classes: ReadonlyArray<string>;
+  limit?: number;
+}): Promise<MapillaryDetection[]> {
+  if (input.classes.length === 0) return [];
+
+  const k = cacheKey("mapillary:image", {
+    kind: "detections",
+    bbox: input.bboxStr,
+    classes: [...input.classes].sort(),
+  });
+  const cached = await cacheGet<MapillaryDetection[]>(k);
+  if (cached) return cached;
+
+  const url = new URL(`${MAPILLARY_BASE}/map_features`);
+  url.searchParams.set("access_token", env.MAPILLARY_TOKEN);
+  url.searchParams.set("bbox", input.bboxStr);
+  url.searchParams.set("fields", "id,object_value,object_type,geometry");
+  url.searchParams.set("object_values", input.classes.join(","));
+  url.searchParams.set("limit", String(input.limit ?? 500));
+
+  let raw: unknown;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(MAPILLARY_TIMEOUT_MS) });
+    if (!res.ok) {
+      logger.warn("mapillary detections http error", { status: res.status });
+      await cacheSet(k, "mapillary:image", [], 14);
+      return [];
+    }
+    raw = await res.json();
+  } catch (err) {
+    logger.warn("mapillary detections fetch failed", { err: String(err) });
+    return [];
+  }
+
+  const parsed = detectionsResponseSchema.safeParse(raw);
+  if (!parsed.success || !parsed.data.data) {
+    await cacheSet(k, "mapillary:image", [], 14);
+    return [];
+  }
+
+  const out: MapillaryDetection[] = [];
+  for (const d of parsed.data.data) {
+    const coords = d.geometry?.coordinates;
+    if (!coords) continue;
+    out.push({
+      id: d.id,
+      objectClass: d.object_value,
+      lat: coords[1],
+      lng: coords[0],
+    });
+  }
+
+  await cacheSet(k, "mapillary:image", out, 14);
+  return out;
+}
+
+/**
+ * Count detections within a small radius of a point. Useful as a free
+ * "are there any benches/bike racks near this candidate?" prefilter.
+ */
+export function countDetectionsNearPoint(
+  detections: ReadonlyArray<MapillaryDetection>,
+  point: { lat: number; lng: number },
+  radiusMeters = 50,
+): number {
+  const radiusDegLat = radiusMeters / 111_320;
+  const radiusDegLng = radiusMeters / (111_320 * Math.cos((point.lat * Math.PI) / 180));
+  let count = 0;
+  for (const d of detections) {
+    if (Math.abs(d.lat - point.lat) > radiusDegLat) continue;
+    if (Math.abs(d.lng - point.lng) > radiusDegLng) continue;
+    count++;
+  }
+  return count;
+}

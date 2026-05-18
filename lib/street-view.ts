@@ -123,6 +123,29 @@ export function buildThumbUrl(
   return `${STREET_VIEW_BASE}?${params.toString()}`;
 }
 
+/**
+ * Probe with a custom heading. Returns the Street View metadata + a
+ * pre-built thumbnail URL pointing in the requested direction.
+ *
+ * Used in the M4+ pipeline: when Mapillary has a high-scoring photo at
+ * (lat, lng) with a known compass_angle, we ask Google Street View for
+ * imagery at the SAME coord pointing the SAME way — usually a
+ * higher-quality version of the matching shot.
+ */
+export async function probeStreetViewWithHeading(
+  lat: number,
+  lng: number,
+  heading: number,
+  searchRadiusMeters = 75,
+): Promise<StreetViewProbe> {
+  const base = await probeStreetView(lat, lng, searchRadiusMeters);
+  if (!base.available) return base;
+  return {
+    ...base,
+    thumbUrl: buildThumbUrl(lat, lng, { heading }),
+  };
+}
+
 function round(n: number): number {
   return Math.round(n * 1e4) / 1e4;
 }

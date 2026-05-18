@@ -52,6 +52,19 @@ export const sceneAnalysisSchema = z.object({
 
   /** Optional interior/exterior/both. */
   interior_exterior: interiorExteriorSchema.nullable(),
+
+  /**
+   * Optional list of Mapillary `object_value` classes implied by the scene.
+   * Used as a free pre-filter signal: "show me coords where the cameras
+   * actually saw a bench / fire hydrant / cobblestone / etc."
+   *
+   * Examples: ["object--bench", "marking--surface--cobblestone",
+   * "object--street-light", "object--bike-rack", "object--fire-hydrant"].
+   *
+   * Empty array means "no specific objects implied"; we won't hit the
+   * Mapillary detections endpoint in that case.
+   */
+  mapillary_classes: z.array(z.string()).default([]),
 });
 
 export type SceneAnalysis = z.infer<typeof sceneAnalysisSchema>;
@@ -74,7 +87,8 @@ Return ONLY a single JSON object, no prose, no code fences. The schema is:
   "visual": "short visual descriptor for matching photos",
   "mood": "string or null",
   "time_of_day": "string or null",
-  "interior_exterior": "interior" | "exterior" | "both" | null
+  "interior_exterior": "interior" | "exterior" | "both" | null,
+  "mapillary_classes": ["string", "..."]
 }
 
 Guidance for fields:
@@ -117,6 +131,23 @@ Guidance for fields:
 - mood: optional one-word vibe ("gritty", "romantic", "noir", ...).
 - time_of_day: optional ("day", "night", "dawn", "dusk", "golden_hour").
 - interior_exterior: pick one if obvious from the scene; null if unclear.
+- mapillary_classes: ZERO to FOUR canonical Mapillary "object_value" strings
+  for objects/materials specifically called out in the scene. Use this ONLY
+  for things Mapillary's car-mounted cameras would actually see at street
+  level — leave empty otherwise.
+
+  Common useful values:
+    "object--bench", "object--bike-rack", "object--fire-hydrant",
+    "object--mailbox", "object--manhole", "object--phone-booth",
+    "object--street-light", "object--trash-can", "object--traffic-cone",
+    "object--parking-meter", "object--catch-basin",
+    "marking--surface--cobblestone", "marking--surface--brick"
+
+  Examples:
+    "cobblestone alley with bike racks" -> ["marking--surface--cobblestone", "object--bike-rack"]
+    "neon-lit diner with phone booth"   -> ["object--phone-booth"]
+    "bench on a wooded path"            -> ["object--bench"]
+    "abandoned brick warehouse"         -> []  (no specific objects)
 
 If the input is ambiguous or unsafe, still return a best-effort JSON object.
 Never refuse and never explain.`;

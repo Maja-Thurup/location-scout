@@ -121,6 +121,16 @@ type EnrichedLocation = {
 type EnrichResponse = {
   locations: EnrichedLocation[];
   visionScoringApplied: boolean;
+  pipelineStats: {
+    inputCandidates: number;
+    afterDedupe: number;
+    afterColorFilter: number;
+    afterDetectionFilter: number;
+    afterVisionFilter: number;
+    finalRendered: number;
+    targetColor: string | null;
+    mapillaryDetectionsFound: number;
+  };
 };
 
 type ApiError = { error: string; message?: string };
@@ -171,9 +181,12 @@ async function enrichLocationsRequest(input: {
     name?: string | null;
   }>;
   searchCenter?: { lat: number; lng: number };
+  searchBbox?: { south: number; west: number; north: number; east: number };
   includeClosed?: boolean;
   sceneDescription: string;
   visionScoreLimit?: number;
+  minVisionScore?: number;
+  mapillaryClasses?: ReadonlyArray<string>;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
     method: "POST",
@@ -411,9 +424,12 @@ export function SceneInputForm({
           name: c.name,
         })),
         searchCenter: osm.center,
+        searchBbox: osm.bbox,
         includeClosed,
         sceneDescription,
         visionScoreLimit: 10,
+        minVisionScore: 30,
+        mapillaryClasses: analysis.mapillary_classes ?? [],
       });
       setEnrichResult(enriched);
       setStage({ kind: "ready" });
@@ -681,11 +697,14 @@ function ResultCardsPanel({
         <h2 className="text-lg font-semibold">Result cards</h2>
         {enriched && (
           <span className="text-xs text-muted-foreground">
-            {enriched.locations.length} enriched · sparse:{" "}
-            {enriched.locations.filter((l) => l.enrichmentSparse).length}
+            {enriched.locations.length} of {enriched.pipelineStats.inputCandidates} candidates kept
           </span>
         )}
       </header>
+
+      {enriched && (
+        <PipelineStatsStrip stats={enriched.pipelineStats} visionApplied={enriched.visionScoringApplied} />
+      )}
 
       {isEnriching && !enriched && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -1088,4 +1107,51 @@ function geolocationErrorMessage(err: GeolocationPositionError): string {
     default:
       return "Couldn't fetch your location.";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline stats — shows the user how their candidate pool got narrowed
+// ---------------------------------------------------------------------------
+
+function PipelineStatsStrip({
+  stats,
+  visionApplied,
+}: {
+  stats: EnrichResponse["pipelineStats"];
+  visionApplied: boolean;
+}) {
+  const steps: ReadonlyArray<{ label: string; value: number; visible: boolean }> = [
+    { label: "input", value: stats.inputCandidates, visible: true },
+    { label: "deduped", value: stats.afterDedupe, visible: stats.afterDedupe < stats.inputCandidates },
+    {
+      label: stats.targetColor ? `${stats.targetColor} match` : "color",
+      value: stats.afterColorFilter,
+      visible: stats.targetColor != null && stats.afterColorFilter < stats.afterDedupe,
+    },
+    {
+      label: "objects",
+      value: stats.afterDetectionFilter,
+      visible: stats.mapillaryDetectionsFound > 0 && stats.afterDetectionFilter < stats.afterColorFilter,
+    },
+    {
+      label: visionApplied ? "vision ≥30" : "no vision",
+      value: stats.afterVisionFilter,
+      visible: visionApplied,
+    },
+    { label: "rendered", value: stats.finalRendered, visible: true },
+  ].filter((s) => s.visible);
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-white/10 bg-black/20 px-3 py-2 text-xs text-muted-foreground">
+      <span className="font-medium tracking-wide text-foreground/70 uppercase">Pipeline</span>
+      {steps.map((s, i) => (
+        <span key={s.label} className="flex items-center gap-1.5">
+          {i > 0 && <span aria-hidden>→</span>}
+          <span className="rounded bg-white/5 px-1.5 py-0.5 font-mono">
+            {s.label}: <span className="text-foreground">{s.value}</span>
+          </span>
+        </span>
+      ))}
+    </div>
+  );
 }

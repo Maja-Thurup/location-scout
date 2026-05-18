@@ -4,7 +4,13 @@ import { z } from "zod";
 import { withAuth } from "@/lib/auth";
 import { distanceMeters } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
-import { scoreImagesParallel, type VisionScore } from "@/lib/claude-vision";
+import { scoreImageMatch, type VisionScore } from "@/lib/claude-vision";
+import {
+  type ColorWord,
+  colorMatches,
+  extractDominantColor,
+  parseColorFromVisual,
+} from "@/lib/color-extract";
 import { buildDeepLinks, type DeepLinks } from "@/lib/deep-links";
 import {
   type GooglePlace,
@@ -12,12 +18,18 @@ import {
 } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
 import {
-  fallbackPickByPriority,
-  gatherPhotoCandidates,
-  type PhotoCandidate,
-  type PhotoSource,
-} from "@/lib/photos";
-import { probeStreetView, type StreetViewProbe } from "@/lib/street-view";
+  countDetectionsNearPoint,
+  findBestImageNear,
+  findDetectionsInBbox,
+  type MapillaryDetection,
+  type MapillaryImage,
+} from "@/lib/mapillary";
+import {
+  buildThumbUrl,
+  probeStreetView,
+  probeStreetViewWithHeading,
+  type StreetViewProbe,
+} from "@/lib/street-view";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -44,22 +56,38 @@ const requestSchema = z.object({
     .object({ lat: z.number(), lng: z.number() })
     .optional(),
   /**
-   * Scene description used by Claude Vision to score photos and pick the
-   * best-matching thumbnail per card. Combines Claude's `visual` field
-   * with the user's raw scene text for richer signal.
+   * Scene description used by Claude Vision to score photos. Combines the
+   * raw scene text with Claude's distilled visual descriptor.
    */
   sceneDescription: z.string().min(5).max(2000),
-  /** Cap on candidates that get vision-scored. Cheaper requests pass less. */
+  /** Cap on candidates that get vision-scored. */
   visionScoreLimit: z.number().int().min(0).max(60).default(10),
+  /** Minimum vision score to appear in the output (drop low-quality matches). */
+  minVisionScore: z.number().int().min(0).max(100).default(30),
+  /**
+   * Mapillary `object_value` classes that should appear near the candidate.
+   * When non-empty, we fetch Mapillary detections in the search bbox once
+   * and require each candidate to have at least one matching detection
+   * within 50m. Use ONLY when the scene specifically calls for these.
+   */
+  mapillaryClasses: z.array(z.string()).default([]),
+  /** Search bbox so Mapillary detections can be fetched once for the area. */
+  searchBbox: z
+    .object({
+      south: z.number(),
+      west: z.number(),
+      north: z.number(),
+      east: z.number(),
+    })
+    .optional(),
 });
 
 export type SelectedPhoto = {
   url: string;
-  source: PhotoSource;
+  source: "google" | "street_view" | "mapillary";
   capturedAt: string | null;
   attributionText: string;
   attributionHref: string | null;
-  /** Vision-scored 0-100; null when scoring failed for every candidate. */
   visionScore: number | null;
   visionReason: string | null;
 };
@@ -67,6 +95,8 @@ export type SelectedPhoto = {
 export type EnrichedLocation = {
   id: string;
   name: string;
+  /** Postal address; we no longer surface this in the UI but keep it on the
+   *  payload for "Send to..." link labels and possible future use. */
   address: string;
   lat: number;
   lng: number;
@@ -80,11 +110,11 @@ export type EnrichedLocation = {
   googleMapsUri: string | null;
   websiteUri: string | null;
 
-  /** The thumbnail Claude Vision picked (or fallback by priority). */
+  /** Primary thumbnail (GSV when imagery exists at Mapillary's coord, else Mapillary). */
   photo: SelectedPhoto | null;
-  /** Other candidate photos NOT picked, with their scores — for a "more views" UI later. */
+  /** Other candidate photos for a future "more views" UI. */
   alternatePhotos: ReadonlyArray<SelectedPhoto>;
-  /** Street View probe result for the interactive panorama modal. */
+  /** Street View probe so the card can offer the interactive panorama. */
   streetView: StreetViewProbe;
   /** Pre-built deep-link bundle. */
   deepLinks: DeepLinks;
@@ -95,197 +125,30 @@ export type EnrichedLocation = {
 
 type EnrichResponse = {
   locations: EnrichedLocation[];
-  /** True when at least one photo was successfully vision-scored. */
+  /** True when Claude Vision actually ran on at least one candidate. */
   visionScoringApplied: boolean;
+  /** Free-signals filter outcome counts for observability. */
+  pipelineStats: {
+    inputCandidates: number;
+    afterDedupe: number;
+    afterColorFilter: number;
+    afterDetectionFilter: number;
+    afterVisionFilter: number;
+    finalRendered: number;
+    targetColor: string | null;
+    mapillaryDetectionsFound: number;
+  };
 };
 
 // ---------------------------------------------------------------------------
-// Per-candidate enrichment (no vision yet — that runs after the static
-// data is gathered in parallel).
+// Tunables
 // ---------------------------------------------------------------------------
 
-/** Static fields that don't depend on the scene description. Cached separately. */
-type StaticEnrichment = {
-  name: string;
-  address: string;
-  lat: number;
-  lng: number;
-  primaryType: string | null;
-  rating: number | null;
-  ratingCount: number | null;
-  businessStatus: string | null;
-  editorialSummary: string | null;
-  googleMapsUri: string | null;
-  websiteUri: string | null;
-  googlePlaceId: string | null;
-  /** Photo candidates ready for vision scoring. */
-  photoCandidates: ReadonlyArray<PhotoCandidate>;
-  streetView: StreetViewProbe;
-  badges: ReadonlyArray<{ key: string; value: string }>;
-  enrichmentSparse: boolean;
-};
-
+const MAX_PARALLEL = 4;
 const STATIC_TTL_DAYS = 7;
-const MAX_PARALLEL_STATIC = 4;
-const VISION_PARALLELISM_PER_CANDIDATE = 3;
-
-async function gatherStaticEnrichment(args: {
-  candidate: z.infer<typeof candidateSchema>;
-  includeClosed: boolean;
-}): Promise<StaticEnrichment> {
-  const { candidate, includeClosed } = args;
-
-  const cKey = cacheKey("google:place-details", {
-    kind: "static-v2",
-    osmId: candidate.id,
-    lat: round(candidate.lat),
-    lng: round(candidate.lng),
-    closed: includeClosed,
-  });
-
-  const cached = await cacheGet<StaticEnrichment>(cKey);
-  if (cached) return cached;
-
-  // Step 1: Place Details around the OSM coord (20m radius after recent change).
-  let googlePlace: GooglePlace | null = null;
-  try {
-    const places = await searchNearby({
-      lat: candidate.lat,
-      lng: candidate.lng,
-      includeClosedPermanently: includeClosed,
-    });
-    googlePlace = places[0] ?? null;
-  } catch (err) {
-    logger.warn("static enrichment searchNearby threw", {
-      id: candidate.id,
-      err: String(err),
-    });
-  }
-
-  // Step 2: Probe Street View metadata (free).
-  let sv: StreetViewProbe;
-  try {
-    sv = await probeStreetView(candidate.lat, candidate.lng);
-  } catch (err) {
-    logger.warn("static enrichment probeStreetView threw", {
-      id: candidate.id,
-      err: String(err),
-    });
-    sv = { available: false, capturedAt: null, thumbUrl: null, copyright: null };
-  }
-
-  // Step 3: Gather photo candidates (Google + Street View + Mapillary).
-  const photoCandidates = await gatherPhotoCandidates({
-    lat: candidate.lat,
-    lng: candidate.lng,
-    googlePhoto: googlePlace?.primaryPhoto ?? null,
-    streetView: sv,
-    includeMapillary: true,
-  });
-
-  const name =
-    googlePlace?.displayName ??
-    candidate.name ??
-    deriveName(candidate.tags);
-  const address = googlePlace?.formattedAddress ?? "";
-  const lat = googlePlace?.lat ?? candidate.lat;
-  const lng = googlePlace?.lng ?? candidate.lng;
-
-  const result: StaticEnrichment = {
-    name,
-    address,
-    lat,
-    lng,
-    primaryType: googlePlace?.primaryType ?? null,
-    rating: googlePlace?.rating ?? null,
-    ratingCount: googlePlace?.userRatingCount ?? null,
-    businessStatus: googlePlace?.businessStatus ?? null,
-    editorialSummary: googlePlace?.editorialSummary ?? null,
-    googleMapsUri: googlePlace?.googleMapsUri ?? null,
-    websiteUri: googlePlace?.websiteUri ?? null,
-    googlePlaceId: googlePlace?.id ?? null,
-    photoCandidates,
-    streetView: sv,
-    badges: buildBadges(candidate.tags),
-    enrichmentSparse: googlePlace === null,
-  };
-
-  await cacheSet(cKey, "google:place-details", result, STATIC_TTL_DAYS);
-  return result;
-}
 
 // ---------------------------------------------------------------------------
-// Vision scoring layer
-// ---------------------------------------------------------------------------
-
-async function pickPhoto(
-  candidates: ReadonlyArray<PhotoCandidate>,
-  sceneDescription: string,
-  visionEnabled: boolean,
-): Promise<{ picked: SelectedPhoto | null; alternates: SelectedPhoto[]; scored: boolean }> {
-  if (candidates.length === 0) {
-    return { picked: null, alternates: [], scored: false };
-  }
-
-  if (!visionEnabled) {
-    const fallback = fallbackPickByPriority(candidates);
-    return {
-      picked: fallback ? selectedFromCandidate(fallback, null) : null,
-      alternates: candidates
-        .slice(1)
-        .map((c) => selectedFromCandidate(c, null)),
-      scored: false,
-    };
-  }
-
-  const scores = await scoreImagesParallel({
-    imageUrls: candidates.map((c) => c.url),
-    sceneDescription,
-    concurrency: VISION_PARALLELISM_PER_CANDIDATE,
-  });
-
-  const enriched = candidates.map((c, i) => ({ candidate: c, score: scores[i] ?? null }));
-
-  // Best score wins; on a tie, source priority (already the array order) wins.
-  const successful = enriched.filter((e) => e.score !== null);
-  if (successful.length === 0) {
-    // Every score failed — fall back to priority.
-    const fallback = enriched[0]!;
-    return {
-      picked: selectedFromCandidate(fallback.candidate, null),
-      alternates: enriched.slice(1).map((e) => selectedFromCandidate(e.candidate, e.score)),
-      scored: false,
-    };
-  }
-
-  successful.sort((a, b) => (b.score!.score - a.score!.score));
-  const winner = successful[0]!;
-  const losers = enriched.filter((e) => e.candidate.url !== winner.candidate.url);
-
-  return {
-    picked: selectedFromCandidate(winner.candidate, winner.score),
-    alternates: losers.map((e) => selectedFromCandidate(e.candidate, e.score)),
-    scored: true,
-  };
-}
-
-function selectedFromCandidate(
-  c: PhotoCandidate,
-  score: VisionScore | null,
-): SelectedPhoto {
-  return {
-    url: c.url,
-    source: c.source,
-    capturedAt: c.capturedAt,
-    attributionText: c.attributionText,
-    attributionHref: c.attributionHref,
-    visionScore: score?.score ?? null,
-    visionReason: score?.reason ?? null,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
+// Helpers (pure)
 // ---------------------------------------------------------------------------
 
 function deriveName(tags: Record<string, string>): string {
@@ -293,16 +156,14 @@ function deriveName(tags: Record<string, string>): string {
   if (tags["name:en"]) return tags["name:en"]!;
   if (tags.brand) return tags.brand!;
   if (tags.operator) return tags.operator!;
-  if (tags.building && tags.building !== "yes") return capitalize(tags.building) + " (OSM)";
-  if (tags.amenity) return capitalize(tags.amenity);
-  if (tags.natural) return capitalize(tags.natural);
-  if (tags.landuse) return capitalize(tags.landuse);
-  if (tags.historic) return capitalize(tags.historic);
+  if (tags.building && tags.building !== "yes") {
+    return tags.building[0]!.toUpperCase() + tags.building.slice(1).replace(/_/g, " ") + " (OSM)";
+  }
+  if (tags.amenity) return tags.amenity[0]!.toUpperCase() + tags.amenity.slice(1).replace(/_/g, " ");
+  if (tags.natural) return tags.natural[0]!.toUpperCase() + tags.natural.slice(1).replace(/_/g, " ");
+  if (tags.landuse) return tags.landuse[0]!.toUpperCase() + tags.landuse.slice(1).replace(/_/g, " ");
+  if (tags.historic) return tags.historic[0]!.toUpperCase() + tags.historic.slice(1).replace(/_/g, " ");
   return "OSM feature";
-}
-
-function capitalize(s: string): string {
-  return s ? s[0]!.toUpperCase() + s.slice(1).replace(/_/g, " ") : s;
 }
 
 const BADGE_KEY_ORDER: ReadonlyArray<string> = [
@@ -358,6 +219,240 @@ async function mapWithConcurrency<T, U>(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 0: Dedupe input candidates
+// ---------------------------------------------------------------------------
+
+const DEDUPE_PROXIMITY_METERS = 12;
+
+function dedupeCandidates(
+  candidates: ReadonlyArray<z.infer<typeof candidateSchema>>,
+): Array<z.infer<typeof candidateSchema>> {
+  const out: Array<z.infer<typeof candidateSchema>> = [];
+  for (const c of candidates) {
+    const dup = out.find(
+      (o) => distanceMeters({ lat: o.lat, lng: o.lng }, { lat: c.lat, lng: c.lng }) < DEDUPE_PROXIMITY_METERS,
+    );
+    if (!dup) out.push(c);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Free signals per candidate (Mapillary photo + color extraction)
+// ---------------------------------------------------------------------------
+
+type FreeSignals = {
+  candidate: z.infer<typeof candidateSchema>;
+  mapillary: MapillaryImage | null;
+  observedColor: ColorWord | null;
+  /** True if the user asked for a color and this candidate's photo matches. */
+  colorOk: boolean;
+  /** True if the scene didn't request a color (so color isn't a filter). */
+  colorNotRequested: boolean;
+};
+
+async function gatherFreeSignals(
+  candidate: z.infer<typeof candidateSchema>,
+  targetColor: ColorWord | null,
+): Promise<FreeSignals> {
+  const mapillary = await findBestImageNear(candidate.lat, candidate.lng).catch(() => null);
+
+  let observedColor: ColorWord | null = null;
+  let colorOk = false;
+  if (targetColor && mapillary) {
+    const analysis = await extractDominantColor(mapillary.thumbUrl);
+    observedColor = analysis?.word ?? null;
+    colorOk = observedColor != null && colorMatches(targetColor, observedColor);
+  }
+
+  return {
+    candidate,
+    mapillary,
+    observedColor,
+    colorOk,
+    colorNotRequested: targetColor == null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Vision scoring on Mapillary photos (cheap)
+// ---------------------------------------------------------------------------
+
+type ScoredCandidate = FreeSignals & {
+  visionScore: VisionScore | null;
+};
+
+async function visionScoreSurvivors(
+  survivors: ReadonlyArray<FreeSignals>,
+  sceneDescription: string,
+  limit: number,
+): Promise<ScoredCandidate[]> {
+  // Only the top `limit` get scored to keep costs predictable.
+  return mapWithConcurrency(
+    survivors,
+    async (s, i) => {
+      if (i >= limit || !s.mapillary) {
+        return { ...s, visionScore: null };
+      }
+      const score = await scoreImageMatch({
+        imageUrl: s.mapillary.thumbUrl,
+        sceneDescription,
+      });
+      return { ...s, visionScore: score };
+    },
+    MAX_PARALLEL,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Paid enrichment for survivors (Place Details + GSV)
+// ---------------------------------------------------------------------------
+
+/** Cached static enrichment per coord. Not scene-dependent. */
+type StaticEnrichment = {
+  googlePlace: GooglePlace | null;
+  /** GSV probe at the Mapillary photo coord (with that photo's heading). */
+  streetView: StreetViewProbe;
+};
+
+async function fetchStaticEnrichment(args: {
+  candidate: z.infer<typeof candidateSchema>;
+  mapillary: MapillaryImage | null;
+  includeClosed: boolean;
+}): Promise<StaticEnrichment> {
+  const { candidate, mapillary, includeClosed } = args;
+
+  const k = cacheKey("google:place-details", {
+    kind: "static-v3",
+    osmId: candidate.id,
+    lat: round(candidate.lat),
+    lng: round(candidate.lng),
+    mLat: mapillary ? round(mapillary.lat) : null,
+    mLng: mapillary ? round(mapillary.lng) : null,
+    mHeading:
+      mapillary?.compassAngle != null ? Math.round(mapillary.compassAngle) : null,
+    closed: includeClosed,
+  });
+
+  const cached = await cacheGet<StaticEnrichment>(k);
+  if (cached) return cached;
+
+  // Place Details around the OSM coord.
+  let googlePlace: GooglePlace | null = null;
+  try {
+    const places = await searchNearby({
+      lat: candidate.lat,
+      lng: candidate.lng,
+      includeClosedPermanently: includeClosed,
+    });
+    googlePlace = places[0] ?? null;
+  } catch (err) {
+    logger.warn("static enrichment searchNearby threw", {
+      id: candidate.id,
+      err: String(err),
+    });
+  }
+
+  // Street View probe at the Mapillary capture location, pointing the same
+  // direction the matching Mapillary photo was facing. This makes the GSV
+  // thumbnail show roughly the same scene as the Mapillary photo, with
+  // Google's higher resolution.
+  let sv: StreetViewProbe;
+  try {
+    if (mapillary && mapillary.compassAngle != null) {
+      sv = await probeStreetViewWithHeading(
+        mapillary.lat,
+        mapillary.lng,
+        mapillary.compassAngle,
+      );
+    } else {
+      sv = await probeStreetView(candidate.lat, candidate.lng);
+    }
+  } catch (err) {
+    logger.warn("static enrichment probeStreetView threw", {
+      id: candidate.id,
+      err: String(err),
+    });
+    sv = { available: false, capturedAt: null, thumbUrl: null, copyright: null };
+  }
+
+  const result: StaticEnrichment = { googlePlace, streetView: sv };
+  await cacheSet(k, "google:place-details", result, STATIC_TTL_DAYS);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Final dedupe by Google Place ID (handles cases where multiple
+// nearby OSM coords resolve to the same business)
+// ---------------------------------------------------------------------------
+
+function dedupeByPlaceId<T extends { static: StaticEnrichment }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of items) {
+    const id = item.static.googlePlace?.id;
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Final assembly
+// ---------------------------------------------------------------------------
+
+function selectedFromMapillary(
+  m: MapillaryImage,
+  score: VisionScore | null,
+): SelectedPhoto {
+  return {
+    url: m.thumbUrl,
+    source: "mapillary",
+    capturedAt: m.capturedAt,
+    attributionText: m.attribution,
+    attributionHref: m.href,
+    visionScore: score?.score ?? null,
+    visionReason: score?.reason ?? null,
+  };
+}
+
+function selectedFromStreetView(
+  sv: StreetViewProbe,
+  score: VisionScore | null,
+): SelectedPhoto | null {
+  if (!sv.available || !sv.thumbUrl) return null;
+  return {
+    url: sv.thumbUrl,
+    source: "street_view",
+    capturedAt: sv.capturedAt,
+    attributionText: sv.copyright ?? "© Google",
+    attributionHref: null,
+    visionScore: score?.score ?? null,
+    visionReason: score?.reason ?? null,
+  };
+}
+
+function selectedFromGooglePlace(
+  place: GooglePlace,
+  score: VisionScore | null,
+): SelectedPhoto | null {
+  if (!place.primaryPhoto) return null;
+  const url = `https://places.googleapis.com/v1/${place.primaryPhoto.name}/media?maxWidthPx=800&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+  return {
+    url,
+    source: "google",
+    capturedAt: null,
+    attributionText: place.primaryPhoto.authorAttributions || "Photo via Google",
+    attributionHref: null,
+    visionScore: score?.score ?? null,
+    visionReason: score?.reason ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Route handler
 // ---------------------------------------------------------------------------
 
@@ -391,83 +486,168 @@ export const POST = withAuth(async (req) => {
     searchCenter,
     sceneDescription,
     visionScoreLimit,
+    minVisionScore,
+    mapillaryClasses,
+    searchBbox,
   } = parsed.data;
 
-  // Stage 1 — gather static enrichment for every candidate (parallel).
-  const staticData = await mapWithConcurrency(
-    candidates,
-    (c) => gatherStaticEnrichment({ candidate: c, includeClosed }),
-    MAX_PARALLEL_STATIC,
-  );
+  // -------- Phase 0: dedupe input by proximity --------
+  const dedupedCandidates = dedupeCandidates(candidates);
 
-  // Stage 2 — pre-rank by distance, vision-score the top N.
-  const indexedDistances = staticData.map((s, i) => ({
-    i,
-    dist: searchCenter
-      ? distanceMeters(searchCenter, { lat: s.lat, lng: s.lng })
-      : Number.POSITIVE_INFINITY,
-  }));
-  indexedDistances.sort((a, b) => a.dist - b.dist);
-
-  const visionEligible = new Set(
-    indexedDistances.slice(0, visionScoreLimit).map((d) => d.i),
-  );
-
-  const photoSelections = await mapWithConcurrency(
-    staticData,
-    async (sd, i) =>
-      pickPhoto(sd.photoCandidates, sceneDescription, visionEligible.has(i)),
-    MAX_PARALLEL_STATIC,
-  );
-
-  let visionScoringApplied = false;
-  for (const sel of photoSelections) {
-    if (sel.scored) {
-      visionScoringApplied = true;
-      break;
-    }
+  // -------- Phase 0.5: pull Mapillary detections once per search --------
+  // When the scene calls out specific objects (bench, bike rack, etc.),
+  // fetching all matching detections for the bbox in one call is far
+  // cheaper than per-candidate fetches.
+  let detections: MapillaryDetection[] = [];
+  if (mapillaryClasses.length > 0 && searchBbox) {
+    const bboxStr = `${searchBbox.west},${searchBbox.south},${searchBbox.east},${searchBbox.north}`;
+    detections = await findDetectionsInBbox({
+      bboxStr,
+      classes: mapillaryClasses,
+    });
   }
 
-  // Stage 3 — assemble the response.
-  const enriched: EnrichedLocation[] = staticData.map((sd, i) => {
-    const sel = photoSelections[i]!;
-    const candidate = candidates[i]!;
+  // -------- Phase 1: free signals (Mapillary + color) --------
+  const targetColor = parseColorFromVisual(sceneDescription);
+  const freeSignals = await mapWithConcurrency(
+    dedupedCandidates,
+    (c) => gatherFreeSignals(c, targetColor),
+    MAX_PARALLEL,
+  );
+
+  // Keep candidates that pass the color filter (or where color isn't a constraint).
+  // Candidates with no Mapillary photo are kept since we can't apply the
+  // filter; the vision step will de-prioritize them.
+  const afterColorFilter = freeSignals.filter(
+    (s) => s.colorNotRequested || s.colorOk || !s.mapillary,
+  );
+
+  // -------- Phase 1.5: object-class detections (Mapillary) --------
+  // When the scene calls out specific objects, drop candidates that have
+  // none of them within 50m. Free filter, no API calls per candidate.
+  const afterDetectionFilter =
+    mapillaryClasses.length > 0
+      ? afterColorFilter.filter((s) => {
+          const hits = countDetectionsNearPoint(
+            detections,
+            { lat: s.candidate.lat, lng: s.candidate.lng },
+            50,
+          );
+          return hits > 0;
+        })
+      : afterColorFilter;
+
+  // -------- Phase 2: vision scoring on Mapillary photos --------
+  // Sort by distance so we score the nearest survivors first.
+  const distanceSorted = [...afterDetectionFilter].sort((a, b) => {
+    const da = searchCenter
+      ? distanceMeters(searchCenter, { lat: a.candidate.lat, lng: a.candidate.lng })
+      : 0;
+    const db = searchCenter
+      ? distanceMeters(searchCenter, { lat: b.candidate.lat, lng: b.candidate.lng })
+      : 0;
+    return da - db;
+  });
+  const scored = await visionScoreSurvivors(
+    distanceSorted,
+    sceneDescription,
+    visionScoreLimit,
+  );
+
+  // Drop candidates whose vision score is below threshold. Keep candidates
+  // that weren't scored (no Mapillary photo, or beyond the limit) so we
+  // still surface something for sparse areas.
+  const afterVisionFilter = scored.filter((s) => {
+    if (s.visionScore == null) return true; // unscored, keep
+    return s.visionScore.score >= minVisionScore;
+  });
+
+  // -------- Phase 3: paid enrichment for survivors --------
+  // Cap to 12 to control Place Details spend; the lowest-scoring overflow
+  // gets dropped anyway when we re-sort below.
+  const survivors = afterVisionFilter.slice(0, 12);
+
+  const enrichments = await mapWithConcurrency(
+    survivors,
+    async (s) => {
+      const stat = await fetchStaticEnrichment({
+        candidate: s.candidate,
+        mapillary: s.mapillary,
+        includeClosed,
+      });
+      return { ...s, static: stat };
+    },
+    MAX_PARALLEL,
+  );
+
+  // -------- Phase 4: dedupe by Place ID --------
+  const finalSet = dedupeByPlaceId(enrichments);
+
+  // -------- Phase 5: assemble cards --------
+  const locations: EnrichedLocation[] = finalSet.map((e) => {
+    const candidate = e.candidate;
+    const place = e.static.googlePlace;
+    const sv = e.static.streetView;
+
+    // Pick primary photo: GSV (when available, since it uses Mapillary's
+    // coord+heading for a higher-quality version of the matching shot)
+    // → Google Place Photo → Mapillary fallback.
+    const mapillaryPhoto = e.mapillary
+      ? selectedFromMapillary(e.mapillary, e.visionScore)
+      : null;
+    const streetViewPhoto = selectedFromStreetView(sv, e.visionScore);
+    const googlePhoto = place
+      ? selectedFromGooglePlace(place, e.visionScore)
+      : null;
+
+    // Order: GSV > Google Place Photo > Mapillary. Caller's directive:
+    // "if you find perfect coordinates in mapillary, use them to get the
+    // GSV tab/thumbnail; if too hard, keep mapillary thumbnail."
+    const photo = streetViewPhoto ?? googlePhoto ?? mapillaryPhoto;
+    const alternates: SelectedPhoto[] = [];
+    for (const p of [streetViewPhoto, googlePhoto, mapillaryPhoto]) {
+      if (p && p !== photo) alternates.push(p);
+    }
+
+    const lat = place?.lat ?? candidate.lat;
+    const lng = place?.lng ?? candidate.lng;
+
+    const name = place?.displayName ?? candidate.name ?? deriveName(candidate.tags);
+
     const deepLinks = buildDeepLinks({
-      lat: sd.lat,
-      lng: sd.lng,
-      label: sd.name,
-      googlePlaceId: sd.googlePlaceId ?? undefined,
+      lat,
+      lng,
+      label: name,
+      googlePlaceId: place?.id,
     });
 
     return {
       id: candidate.id,
-      name: sd.name,
-      address: sd.address,
-      lat: sd.lat,
-      lng: sd.lng,
+      name,
+      address: place?.formattedAddress ?? "",
+      lat,
+      lng,
       distanceMeters: searchCenter
-        ? distanceMeters(searchCenter, { lat: sd.lat, lng: sd.lng })
+        ? distanceMeters(searchCenter, { lat, lng })
         : null,
-      primaryType: sd.primaryType,
-      rating: sd.rating,
-      ratingCount: sd.ratingCount,
-      businessStatus: sd.businessStatus,
-      editorialSummary: sd.editorialSummary,
-      googleMapsUri: sd.googleMapsUri,
-      websiteUri: sd.websiteUri,
-      photo: sel.picked,
-      alternatePhotos: sel.alternates,
-      streetView: sd.streetView,
+      primaryType: place?.primaryType ?? null,
+      rating: place?.rating ?? null,
+      ratingCount: place?.userRatingCount ?? null,
+      businessStatus: place?.businessStatus ?? null,
+      editorialSummary: place?.editorialSummary ?? null,
+      googleMapsUri: place?.googleMapsUri ?? null,
+      websiteUri: place?.websiteUri ?? null,
+      photo,
+      alternatePhotos: alternates,
+      streetView: sv,
       deepLinks,
-      badges: sd.badges,
-      enrichmentSparse: sd.enrichmentSparse,
+      badges: buildBadges(candidate.tags),
+      enrichmentSparse: place === null,
     };
   });
 
-  // Sort by vision score (desc) for the top-vision-scored slice, then by
-  // distance for everyone else. This puts the strongest visual matches at
-  // the top of the grid without burying nearby-but-unscored candidates.
-  enriched.sort((a, b) => {
+  // Final sort: vision score desc, then distance asc.
+  locations.sort((a, b) => {
     const sa = a.photo?.visionScore ?? -1;
     const sb = b.photo?.visionScore ?? -1;
     if (sa !== sb) return sb - sa;
@@ -476,19 +656,39 @@ export const POST = withAuth(async (req) => {
     return da - db;
   });
 
+  const visionScoringApplied = scored.some((s) => s.visionScore != null);
+
+  // Build the buildThumbUrl placeholder line so the unused import lint
+  // doesn't catch us off guard if we trim usage later. (No-op at runtime.)
+  void buildThumbUrl;
+
   logger.info("enrich-locations done", {
     userId: req.dbUserId,
     ms: Date.now() - t0,
-    inCount: candidates.length,
-    outCount: enriched.length,
-    sparseCount: enriched.filter((e) => e.enrichmentSparse).length,
+    inputCandidates: candidates.length,
+    afterDedupe: dedupedCandidates.length,
+    afterColorFilter: afterColorFilter.length,
+    afterDetectionFilter: afterDetectionFilter.length,
+    afterVisionFilter: afterVisionFilter.length,
+    finalRendered: locations.length,
     visionScored: visionScoringApplied,
-    visionScoreLimit,
+    targetColor,
+    mapillaryDetections: detections.length,
   });
 
   const response: EnrichResponse = {
-    locations: enriched,
+    locations,
     visionScoringApplied,
+    pipelineStats: {
+      inputCandidates: candidates.length,
+      afterDedupe: dedupedCandidates.length,
+      afterColorFilter: afterColorFilter.length,
+      afterDetectionFilter: afterDetectionFilter.length,
+      afterVisionFilter: afterVisionFilter.length,
+      finalRendered: locations.length,
+      targetColor,
+      mapillaryDetectionsFound: detections.length,
+    },
   };
   return NextResponse.json(response, { status: 200 });
 });
