@@ -52,11 +52,15 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund --legacy-peer-deps
+        env:
+          # Skip postinstall hook (which runs `prisma generate`) — we run it
+          # explicitly in the next step so we can see the output cleanly.
+          PRISMA_SKIP_POSTINSTALL_GENERATE: "true"
 
       - name: Validate Prisma schema
         run: npx prisma validate
