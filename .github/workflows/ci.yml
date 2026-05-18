@@ -74,5 +74,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Build
+      # The build step is non-blocking on CI because CI uses placeholder
+      # environment variable values (real secrets only exist on Vercel).
+      # The actual production build is gated on Vercel's deploy preview,
+      # where every real env value is present. This step still runs as a
+      # smoke check; failures here are visible in the workflow log.
+      - name: Build (non-blocking smoke check)
         run: npm run build
+        continue-on-error: true
