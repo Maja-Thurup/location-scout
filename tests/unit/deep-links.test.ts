@@ -23,21 +23,30 @@ describe("buildDeepLinks", () => {
     expect(links.waze).toContain("ll=40.678200%2C-73.944200");
   });
 
-  it("URL-encodes the label when supplied", () => {
+  it("uses coords (not label) as Google query when no Place ID — fixes 'all OSM cards link to same address' bug", () => {
+    const links = buildDeepLinks({
+      ...BROOKLYN,
+      label: "Warehouse (OSM)", // generic, would all collide if used as query
+    });
+    expect(links.googleMaps).toContain("query=40.678200%2C-73.944200");
+    expect(links.googleMaps).not.toContain("query=Warehouse");
+  });
+
+  it("Apple Maps still uses the label for the pin tooltip", () => {
     const links = buildDeepLinks({
       ...BROOKLYN,
       label: "Joe's Pizza",
     });
-    expect(links.googleMaps).toContain("query=Joe%27s+Pizza");
     expect(links.appleMaps).toContain("q=Joe%27s+Pizza");
   });
 
-  it("includes Google Place ID when provided", () => {
+  it("Google Maps DOES use the label as query when a Google Place ID is supplied", () => {
     const links = buildDeepLinks({
       ...BROOKLYN,
       label: "Williamsburg Bridge",
       googlePlaceId: "ChIJxyz123",
     });
+    expect(links.googleMaps).toContain("query=Williamsburg+Bridge");
     expect(links.googleMaps).toContain("query_place_id=ChIJxyz123");
     expect(links.directions).toContain("destination_place_id=ChIJxyz123");
     // Apple/Waze don't accept Google Place IDs.

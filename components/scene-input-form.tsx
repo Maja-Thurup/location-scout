@@ -81,6 +81,16 @@ type SearchOsmResponse = {
   mirror: string | null;
 };
 
+type SelectedPhoto = {
+  url: string;
+  source: PhotoSource;
+  capturedAt: string | null;
+  attributionText: string;
+  attributionHref: string | null;
+  visionScore: number | null;
+  visionReason: string | null;
+};
+
 type EnrichedLocation = {
   id: string;
   name: string;
@@ -95,13 +105,8 @@ type EnrichedLocation = {
   editorialSummary: string | null;
   googleMapsUri: string | null;
   websiteUri: string | null;
-  photo: {
-    url: string;
-    source: PhotoSource;
-    capturedAt: string | null;
-    attributionText: string;
-    attributionHref: string | null;
-  } | null;
+  photo: SelectedPhoto | null;
+  alternatePhotos: ReadonlyArray<SelectedPhoto>;
   streetView: {
     available: boolean;
     capturedAt: string | null;
@@ -115,7 +120,7 @@ type EnrichedLocation = {
 
 type EnrichResponse = {
   locations: EnrichedLocation[];
-  cached: boolean;
+  visionScoringApplied: boolean;
 };
 
 type ApiError = { error: string; message?: string };
@@ -167,6 +172,8 @@ async function enrichLocationsRequest(input: {
   }>;
   searchCenter?: { lat: number; lng: number };
   includeClosed?: boolean;
+  sceneDescription: string;
+  visionScoreLimit?: number;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
     method: "POST",
@@ -338,6 +345,7 @@ export function SceneInputForm({
       analysis: initialAnalysis,
       location: initialLocation || undefined,
       radiusMiles,
+      sceneText: initialSceneText,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -349,8 +357,9 @@ export function SceneInputForm({
     analysis: SceneAnalysis;
     location?: string;
     radiusMiles: number | null;
+    sceneText: string;
   }): Promise<void> {
-    const { analysis, location, radiusMiles } = args;
+    const { analysis, location, radiusMiles, sceneText } = args;
 
     setStage({ kind: "searching-osm" });
     setEnrichResult(null);
@@ -385,6 +394,12 @@ export function SceneInputForm({
 
     setStage({ kind: "enriching" });
     const includeClosed = sceneImpliesAbandonment(analysis);
+    // Combine the user's raw scene text with Claude's distilled visual
+    // descriptor — the more signal we hand the vision scorer, the better
+    // it can pick the matching photo.
+    const sceneDescription = [sceneText.trim(), analysis.visual]
+      .filter(Boolean)
+      .join("\n\n");
     try {
       const enriched = await enrichMutation.mutateAsync({
         candidates: osm.candidates.slice(0, MAX_ENRICH_CANDIDATES).map((c) => ({
@@ -397,17 +412,19 @@ export function SceneInputForm({
         })),
         searchCenter: osm.center,
         includeClosed,
+        sceneDescription,
+        visionScoreLimit: 10,
       });
       setEnrichResult(enriched);
       setStage({ kind: "ready" });
       posthog.capture("enrich_completed", {
         candidateCount: enriched.locations.length,
         sparseCount: enriched.locations.filter((l) => l.enrichmentSparse).length,
+        visionScoringApplied: enriched.visionScoringApplied,
         includeClosed,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Enrichment failed.";
-      // We have OSM pins, just no rich cards. Still show the map.
       setStage({ kind: "error", message });
       posthog.capture("enrich_failed", { error: message });
     }
@@ -456,6 +473,7 @@ export function SceneInputForm({
         analysis: parsed.analysis,
         location,
         radiusMiles,
+        sceneText: values.sceneText.trim(),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong.";
@@ -719,6 +737,8 @@ function ResultCardsPanel({
               badges={loc.badges.map((b) => `${b.key}=${b.value}`)}
               isSelected={loc.id === selectedPinId}
               onSelect={onSelectPin}
+              visionScore={loc.photo?.visionScore ?? undefined}
+              visionReason={loc.photo?.visionReason ?? undefined}
             />
           ))}
         </div>

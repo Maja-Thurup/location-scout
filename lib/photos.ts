@@ -3,66 +3,97 @@ import {
   buildPhotoUrl,
 } from "@/lib/google-places";
 import { findBestImageNear, type MapillaryImage } from "@/lib/mapillary";
+import type { StreetViewProbe } from "@/lib/street-view";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
-// Photo aggregator
+// Photo source aggregator
 //
-// Priority order (cheapest + most permissive first):
-//   1. Mapillary near the coordinate (FREE, CC BY-SA)
-//   2. Google Place Photo (paid, ~$0.007 per fetch on Pro tier)
-//   3. null (caller renders a placeholder)
+// Returns one candidate photo per source (Google / Street View / Mapillary).
+// The caller (the enrich endpoint) vision-scores all of them and picks the
+// highest-scored one as the card's primary thumbnail.
 //
-// Wikimedia Commons would slot in as a third tier for landmarks; deferred
-// to v3 since it adds complexity for narrow benefit.
+// Source priority (used only as fallback when all vision-scoring fails):
+//   1. Google Place Photo  (uploaded by Google users — usually building-facing)
+//   2. Street View Static  (Google's car captured imagery from the road)
+//   3. Mapillary           (crowdsourced, often gritty street angles)
+//
+// Mapillary is intentionally last because user feedback found its photos
+// often show the road or a generic street scene rather than the building.
+// We still query it for places Google has no coverage of.
 // ---------------------------------------------------------------------------
 
-export type PhotoSource = "mapillary" | "google";
+export type PhotoSource = "google" | "street_view" | "mapillary";
 
-export type AggregatedPhoto = {
-  url: string;
+export type PhotoCandidate = {
   source: PhotoSource;
+  url: string;
   capturedAt: string | null;
-  /** Plain-text attribution line for the badge below the photo. */
   attributionText: string;
-  /** Optional clickable href back to the original (required by Mapillary CC BY-SA). */
   attributionHref: string | null;
 };
 
-export async function pickBestPhoto(input: {
+export type GatherPhotosInput = {
   lat: number;
   lng: number;
-  /** Optional: a Google Place photo we already fetched alongside the place details. */
-  googlePhotoRef: GooglePhotoRef | null;
-}): Promise<AggregatedPhoto | null> {
-  // Tier 1: Mapillary.
-  let mapillary: MapillaryImage | null = null;
-  try {
-    mapillary = await findBestImageNear(input.lat, input.lng);
-  } catch (err) {
-    logger.warn("mapillary lookup threw", { err: String(err) });
-  }
+  /** First Google Place photo (already returned by Place Details). */
+  googlePhoto: GooglePhotoRef | null;
+  /** Street View probe result (already executed). */
+  streetView: StreetViewProbe;
+  /** Whether to also fetch Mapillary (skip when Google sources are guaranteed). */
+  includeMapillary?: boolean;
+};
 
-  if (mapillary) {
-    return {
-      url: mapillary.thumbUrl,
-      source: "mapillary",
-      capturedAt: mapillary.capturedAt,
-      attributionText: mapillary.attribution,
-      attributionHref: mapillary.href,
-    };
-  }
+export async function gatherPhotoCandidates(
+  input: GatherPhotosInput,
+): Promise<PhotoCandidate[]> {
+  const out: PhotoCandidate[] = [];
 
-  // Tier 2: Google Place Photo (only when Place Details supplied a photo ref).
-  if (input.googlePhotoRef) {
-    return {
-      url: buildPhotoUrl(input.googlePhotoRef, { maxWidthPx: 800 }),
+  if (input.googlePhoto) {
+    out.push({
       source: "google",
-      capturedAt: null, // Google doesn't expose photo capture date on this endpoint
-      attributionText: input.googlePhotoRef.authorAttributions || "Photo via Google",
+      url: buildPhotoUrl(input.googlePhoto, { maxWidthPx: 800 }),
+      capturedAt: null,
+      attributionText: input.googlePhoto.authorAttributions || "Photo via Google",
       attributionHref: null,
-    };
+    });
   }
 
-  return null;
+  if (input.streetView.available && input.streetView.thumbUrl) {
+    out.push({
+      source: "street_view",
+      url: input.streetView.thumbUrl,
+      capturedAt: input.streetView.capturedAt,
+      attributionText: input.streetView.copyright ?? "© Google",
+      attributionHref: null,
+    });
+  }
+
+  if (input.includeMapillary !== false) {
+    let mapillary: MapillaryImage | null = null;
+    try {
+      mapillary = await findBestImageNear(input.lat, input.lng);
+    } catch (err) {
+      logger.warn("photos: mapillary lookup threw", { err: String(err) });
+    }
+    if (mapillary) {
+      out.push({
+        source: "mapillary",
+        url: mapillary.thumbUrl,
+        capturedAt: mapillary.capturedAt,
+        attributionText: mapillary.attribution,
+        attributionHref: mapillary.href,
+      });
+    }
+  }
+
+  return out;
+}
+
+/** Pick the highest-priority candidate as a fallback when vision scoring fails. */
+export function fallbackPickByPriority(
+  candidates: ReadonlyArray<PhotoCandidate>,
+): PhotoCandidate | null {
+  // Already in priority order from gatherPhotoCandidates; just take the first.
+  return candidates[0] ?? null;
 }

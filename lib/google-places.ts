@@ -39,7 +39,13 @@ export type GooglePlace = {
   websiteUri: string | null;
   googleMapsUri: string | null;
   editorialSummary: string | null;
-  /** First photo reference, if present. Use buildPhotoUrl() to fetch the bytes. */
+  /**
+   * All photos Google returned (up to 10). The first is the "primary"; we
+   * expose all of them so the vision scorer can pick the best match for
+   * the scene description rather than always taking [0].
+   */
+  photos: GooglePhotoRef[];
+  /** Convenience: photos[0] when present, null otherwise. */
   primaryPhoto: GooglePhotoRef | null;
 };
 
@@ -127,7 +133,14 @@ function shapeAttribution(
 
 function shapePlace(p: z.infer<typeof placeSchema>): GooglePlace | null {
   if (!p.location) return null; // unusable without coords
-  const photo = p.photos?.[0];
+
+  const photos: GooglePhotoRef[] = (p.photos ?? []).map((photo) => ({
+    name: photo.name,
+    widthPx: photo.widthPx ?? 1600,
+    heightPx: photo.heightPx ?? 1200,
+    authorAttributions: shapeAttribution(photo.authorAttributions),
+  }));
+
   return {
     id: p.id,
     displayName: p.displayName?.text ?? null,
@@ -142,14 +155,8 @@ function shapePlace(p: z.infer<typeof placeSchema>): GooglePlace | null {
     websiteUri: p.websiteUri ?? null,
     googleMapsUri: p.googleMapsUri ?? null,
     editorialSummary: p.editorialSummary?.text ?? null,
-    primaryPhoto: photo
-      ? {
-          name: photo.name,
-          widthPx: photo.widthPx ?? 1600,
-          heightPx: photo.heightPx ?? 1200,
-          authorAttributions: shapeAttribution(photo.authorAttributions),
-        }
-      : null,
+    photos,
+    primaryPhoto: photos[0] ?? null,
   };
 }
 
@@ -189,7 +196,10 @@ async function callPlaces(
 // searchNearby — used to enrich an OSM coord into a named place
 // ---------------------------------------------------------------------------
 
-const NEARBY_RADIUS_METERS = 60; // tight; we already know the OSM coord
+// Tight radius — we already have the OSM coord. Wider radii cause cross-
+// street wrong matches (warehouse coord matches the cafe across the road).
+// 20m is roughly "same building or its sidewalk".
+const NEARBY_RADIUS_METERS = 20;
 const NEARBY_RESULT_LIMIT = 5;
 
 export type SearchNearbyInput = {

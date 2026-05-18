@@ -35,12 +35,19 @@ export function buildDeepLinks(input: DeepLinkInput): DeepLinks {
 
   // Google Maps
   // Reference: https://developers.google.com/maps/documentation/urls/get-started
-  const googleParams = new URLSearchParams({
-    api: "1",
-    query: input.label ?? ll,
-  });
+  //
+  // CRITICAL: when there's no Google Place ID, we MUST query by coordinates,
+  // not by label. Querying by label does a text search on Google's whole
+  // index, which means generic OSM labels ("Warehouse (OSM)") all resolve
+  // to the same useless top result. Coords always open at the right pin.
+  const googleParams = new URLSearchParams({ api: "1" });
   if (input.googlePlaceId) {
+    // We have a real place — show its rich card. Label is just for display.
+    googleParams.set("query", input.label ?? ll);
     googleParams.set("query_place_id", input.googlePlaceId);
+  } else {
+    // No place ID — use coords as the query so Google opens at the actual pin.
+    googleParams.set("query", ll);
   }
   const googleMaps = `https://www.google.com/maps/search/?${googleParams.toString()}`;
 
@@ -55,7 +62,9 @@ export function buildDeepLinks(input: DeepLinkInput): DeepLinks {
 
   // Apple Maps
   // Reference: https://developer.apple.com/library/archive/featuredarticles/iPhoneURLScheme_Reference/MapLinks/MapLinks.html
-  // Universal links use `https://maps.apple.com/?q=`. On iOS this opens the app.
+  // ll= centers the map at the coords; q= is the label to display on the pin.
+  // When no useful label is available, fall back to coords so the pin renders
+  // with a meaningful tooltip rather than the empty string.
   const appleParams = new URLSearchParams({
     ll,
     q: input.label ?? ll,
