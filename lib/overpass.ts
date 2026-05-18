@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { type Bbox, bboxToOverpass } from "@/lib/bbox";
+import { type Bbox, bboxToOverpass, expandBbox } from "@/lib/bbox";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
@@ -22,12 +22,14 @@ export type OsmCandidate = {
 };
 
 export type MatchMode =
-  /** All osmTags ANDed together matched at least one feature. */
+  /** All osmTags ANDed together matched ≥ THRESHOLD features in the requested bbox. */
   | "strict"
-  /** Strict match returned 0; we re-queried with only the primary classifier. */
+  /** Strict match was sparse; re-queried with only the primary classifier. */
   | "primary_only"
-  /** Both attempts returned 0. */
-  | "empty";
+  /** Primary-tag-only was still sparse; expanded the bbox 2× or 4× to find more. */
+  | "primary_only_expanded"
+  /** Every tier returned below threshold; we ship whatever we got (may be 0). */
+  | "best_effort";
 
 export type OverpassSearchResult = {
   candidates: OsmCandidate[];
@@ -39,8 +41,12 @@ export type OverpassSearchResult = {
   elapsedMs: number;
   /** How strict the matching was (set by `searchOsm`, not `executeOverpass`). */
   matchMode: MatchMode;
-  /** When matchMode === "primary_only", the single tag we matched on. */
+  /** When matchMode is a primary-only variant, the single tag we matched on. */
   primaryTag: { key: string; value: string } | null;
+  /** Multiplier applied to the user's bbox (1 = unchanged, 2 = 2x, 4 = 4x). */
+  expansionMultiplier: 1 | 2 | 4;
+  /** The bbox actually queried after any expansion. Same as input if multiplier=1. */
+  effectiveBbox: Bbox;
 };
 
 // ---------------------------------------------------------------------------
@@ -267,10 +273,12 @@ export async function executeOverpass(query: string): Promise<OverpassSearchResu
         mirror,
         elapsedMs: Date.now() - t0,
         // executeOverpass doesn't know about matching strategy — searchOsm
-        // wraps and assigns matchMode. We default to "strict" here so single-
-        // call use of executeOverpass still satisfies the type.
+        // wraps it and assigns matchMode/expansion. Defaults below let
+        // single-call use of executeOverpass still satisfy the type.
         matchMode: "strict",
         primaryTag: null,
+        expansionMultiplier: 1,
+        effectiveBbox: { south: 0, west: 0, north: 0, east: 0 }, // overwritten by searchOsm
       };
     } catch (err) {
       logger.warn("overpass mirror threw", {
@@ -333,53 +341,154 @@ export function pickPrimaryTag(
 }
 
 /**
+ * Below this many candidates a tier is considered "sparse" and we escalate
+ * to the next, looser tier. Above it, we ship the result as-is.
+ *
+ * Industry pattern: Elasticsearch's "min_should_match" + e-commerce search
+ * tier-relaxation literature both use a small fixed minimum (typically
+ * 3-10). Five gives the user a real shortlist without forcing
+ * over-expansion in dense areas.
+ */
+const SPARSE_THRESHOLD = 5;
+
+/** Multipliers applied progressively when ring-expanding the bbox. */
+const EXPANSION_RING: ReadonlyArray<2 | 4> = [2, 4];
+
+/**
  * High-level helper: build query from inputs, execute, return candidates.
  *
- * If the strict ALL-tag query returns no results AND multiple tags were
- * provided, we automatically retry once with just the primary classifier
- * tag (e.g. "building=warehouse") so the user always gets a starting set
- * to scan. The result's `matchMode` indicates which path returned data.
+ * Implements the industry-standard tier-relaxation + expanding-ring
+ * pattern so the user "always gets a result, the closest possible":
+ *
+ *   Tier 1: strict ALL-tag match in the requested bbox.
+ *           If >= SPARSE_THRESHOLD, return.
+ *   Tier 2: primary classifier tag only, same bbox.
+ *           If >= SPARSE_THRESHOLD, return.
+ *   Tier 3: primary classifier tag only, expand bbox 2× then 4×.
+ *           First expansion that yields >= SPARSE_THRESHOLD wins.
+ *   Tier 4: best-effort — return whatever the largest expansion got
+ *           (may be 0 in genuinely empty parts of the map).
  */
 export async function searchOsm(input: {
   bbox: Bbox;
   osmTags: OsmTags;
   limit?: number;
 }): Promise<OverpassSearchResult> {
-  // Try strict first.
+  // Tier 1: strict.
   const strictQuery = buildOverpassQuery(input);
   const strictResult = await executeOverpass(strictQuery);
 
-  if (strictResult.candidates.length > 0) {
-    return { ...strictResult, matchMode: "strict", primaryTag: null };
+  if (strictResult.candidates.length >= SPARSE_THRESHOLD) {
+    return {
+      ...strictResult,
+      matchMode: "strict",
+      primaryTag: null,
+      expansionMultiplier: 1,
+      effectiveBbox: input.bbox,
+    };
   }
 
   const tagCount = Object.keys(input.osmTags).length;
-  if (tagCount <= 1) {
-    // Already tried with just one tag; nothing looser available.
-    return { ...strictResult, matchMode: "empty", primaryTag: null };
+  const primary = tagCount > 1 ? pickPrimaryTag(input.osmTags) : null;
+
+  // Tier 2: primary tag only, same bbox. Skipped when only one tag was sent.
+  let primaryResult: OverpassSearchResult | null = null;
+  if (primary) {
+    logger.info("overpass strict sparse, retrying with primary tag only", {
+      primaryKey: primary.key,
+      primaryValue: primary.value,
+      strictCount: strictResult.candidates.length,
+    });
+    primaryResult = await executeOverpass(
+      buildOverpassQuery({
+        bbox: input.bbox,
+        osmTags: { [primary.key]: primary.value },
+        limit: input.limit,
+      }),
+    );
+
+    if (primaryResult.candidates.length >= SPARSE_THRESHOLD) {
+      return {
+        ...primaryResult,
+        matchMode: "primary_only",
+        primaryTag: primary,
+        expansionMultiplier: 1,
+        effectiveBbox: input.bbox,
+      };
+    }
   }
 
-  const primary = pickPrimaryTag(input.osmTags);
-  if (!primary) {
-    return { ...strictResult, matchMode: "empty", primaryTag: null };
+  // Tier 3: expanding ring on the primary tag only. (Skipped when no
+  // primary tag could be picked.)
+  const baselineForBestEffort = primaryResult ?? strictResult;
+  const tagsForExpansion: OsmTags = primary
+    ? { [primary.key]: primary.value }
+    : input.osmTags;
+
+  let lastExpanded: OverpassSearchResult = baselineForBestEffort;
+  let lastBbox = input.bbox;
+  let lastMultiplier: 1 | 2 | 4 = 1;
+
+  for (const multiplier of EXPANSION_RING) {
+    const expandedBbox = expandBbox(input.bbox, multiplier);
+    logger.info("overpass expanding bbox", {
+      multiplier,
+      threshold: SPARSE_THRESHOLD,
+    });
+
+    const expanded = await executeOverpass(
+      buildOverpassQuery({
+        bbox: expandedBbox,
+        osmTags: tagsForExpansion,
+        limit: input.limit,
+      }),
+    );
+    lastExpanded = expanded;
+    lastBbox = expandedBbox;
+    lastMultiplier = multiplier;
+
+    if (expanded.candidates.length >= SPARSE_THRESHOLD) {
+      return {
+        ...expanded,
+        matchMode: "primary_only_expanded",
+        primaryTag: primary,
+        expansionMultiplier: multiplier,
+        effectiveBbox: expandedBbox,
+      };
+    }
   }
 
-  logger.info("overpass strict match empty, falling back to primary tag only", {
-    primaryKey: primary.key,
-    primaryValue: primary.value,
-    droppedCount: tagCount - 1,
-  });
+  // Tier 4: best-effort. Return whichever attempt produced the most
+  // candidates (or just the last one if all empty).
+  const candidatePool: ReadonlyArray<{
+    result: OverpassSearchResult;
+    bbox: Bbox;
+    multiplier: 1 | 2 | 4;
+    primaryUsed: boolean;
+  }> = [
+    { result: strictResult, bbox: input.bbox, multiplier: 1, primaryUsed: false },
+    ...(primaryResult
+      ? [
+          {
+            result: primaryResult,
+            bbox: input.bbox,
+            multiplier: 1 as const,
+            primaryUsed: true,
+          },
+        ]
+      : []),
+    { result: lastExpanded, bbox: lastBbox, multiplier: lastMultiplier, primaryUsed: !!primary },
+  ];
 
-  const looseQuery = buildOverpassQuery({
-    bbox: input.bbox,
-    osmTags: { [primary.key]: primary.value },
-    limit: input.limit,
-  });
-  const looseResult = await executeOverpass(looseQuery);
+  const winner = candidatePool.reduce((acc, entry) =>
+    entry.result.candidates.length > acc.result.candidates.length ? entry : acc,
+  );
 
   return {
-    ...looseResult,
-    matchMode: looseResult.candidates.length > 0 ? "primary_only" : "empty",
-    primaryTag: primary,
+    ...winner.result,
+    matchMode: "best_effort",
+    primaryTag: winner.primaryUsed ? primary : null,
+    expansionMultiplier: winner.multiplier,
+    effectiveBbox: winner.bbox,
   };
 }

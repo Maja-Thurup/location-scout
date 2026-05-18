@@ -75,3 +75,52 @@ export function clampBbox(bbox: Bbox, maxRadiusMiles: number): Bbox {
   }
   return bboxFromRadius(bboxCenter(bbox), maxRadiusMiles);
 }
+
+/**
+ * Expand a bbox by a multiplier around its centroid. Used for the
+ * expanding-ring fallback when an initial search is sparse.
+ *
+ * `multiplier=2` doubles each dimension (so search area grows ~4x).
+ * The result is clamped to `maxRadiusMiles` so a `multiplier=4` request
+ * on a 100-mile bbox doesn't try to query the entire continent.
+ */
+export function expandBbox(
+  bbox: Bbox,
+  multiplier: number,
+  maxRadiusMiles = 100,
+): Bbox {
+  const center = bboxCenter(bbox);
+  const dLat = (bbox.north - bbox.south) / 2;
+  const dLng = (bbox.east - bbox.west) / 2;
+  const expanded: Bbox = {
+    south: center.lat - dLat * multiplier,
+    north: center.lat + dLat * multiplier,
+    west: center.lng - dLng * multiplier,
+    east: center.lng + dLng * multiplier,
+  };
+  return clampBbox(expanded, maxRadiusMiles);
+}
+
+/**
+ * Approximate distance between two lat/lng points, in meters.
+ * Haversine formula, WGS-84 mean radius.
+ */
+export function distanceMeters(a: LatLng, b: LatLng): number {
+  const R = 6371008.8; // Earth mean radius (m)
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLng = Math.sin(dLng / 2);
+  const h =
+    sinDLat * sinDLat +
+    Math.cos(lat1) * Math.cos(lat2) * sinDLng * sinDLng;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+export function metersToMiles(m: number): number {
+  return m / 1609.344;
+}

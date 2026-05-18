@@ -54,14 +54,18 @@ type ParseSceneResponse = {
   rateLimit: { used: number; limit: number; remaining: number; resetAt: string };
 };
 
+type RankedCandidate = OsmCandidate & { distanceMeters: number };
+
 type SearchOsmResponse = {
   bbox: Bbox;
+  requestedBbox: Bbox;
   center: { lat: number; lng: number };
-  candidates: OsmCandidate[];
+  candidates: RankedCandidate[];
   cached: boolean;
   bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
-  matchMode: "strict" | "primary_only" | "empty";
+  matchMode: "strict" | "primary_only" | "primary_only_expanded" | "best_effort";
   primaryTag: { key: string; value: string } | null;
+  expansionMultiplier: 1 | 2 | 4;
   mirror: string | null;
 };
 
@@ -525,12 +529,12 @@ function ResultsMapPanel({
             {osm.cached ? "cached" : "live"}
           </span>
         )}
-        {osm?.matchMode === "primary_only" && (
+        {osm && osm.matchMode !== "strict" && (
           <span
-            title="Strict match (all tags) returned no results, so we relaxed to the primary classifier."
+            title={matchModeTooltip(osm.matchMode)}
             className="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300"
           >
-            loose match
+            {matchModeLabel(osm.matchMode, osm.expansionMultiplier)}
           </span>
         )}
         {osm && (
@@ -545,15 +549,8 @@ function ResultsMapPanel({
         )}
       </header>
 
-      {osm?.matchMode === "primary_only" && osm.primaryTag && (
-        <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
-          No exact matches for all OSM tags Claude returned. Showing results that match{" "}
-          <span className="font-mono">
-            {osm.primaryTag.key}={osm.primaryTag.value}
-          </span>{" "}
-          alone. Other tags (e.g. material, abandonment) are sparsely populated in
-          OpenStreetMap and would have left this map empty.
-        </p>
+      {osm && osm.matchMode !== "strict" && (
+        <RelaxationExplainer osm={osm} />
       )}
 
       <div className="h-[400px]">
@@ -586,10 +583,11 @@ function ResultsMapPanel({
 function SelectedCandidateInline({
   candidate,
 }: {
-  candidate: OsmCandidate | undefined;
+  candidate: RankedCandidate | undefined;
 }) {
   if (!candidate) return null;
   const tagPairs = Object.entries(candidate.tags).slice(0, 8);
+  const miles = candidate.distanceMeters / 1609.344;
   return (
     <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-4">
       <div className="flex items-baseline justify-between gap-3">
@@ -599,7 +597,10 @@ function SelectedCandidateInline({
         <span className="font-mono text-[10px] text-muted-foreground">{candidate.id}</span>
       </div>
       <p className="font-mono text-xs text-muted-foreground">
-        {candidate.lat.toFixed(5)}, {candidate.lng.toFixed(5)}
+        {candidate.lat.toFixed(5)}, {candidate.lng.toFixed(5)} ·{" "}
+        {miles < 0.1
+          ? `${Math.round(candidate.distanceMeters)} m from search center`
+          : `${miles.toFixed(1)} mi from search center`}
       </p>
       <div className="flex flex-wrap gap-1.5">
         {tagPairs.map(([k, v]) => (
@@ -616,6 +617,72 @@ function SelectedCandidateInline({
       </p>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Match-mode badge + explainer
+// ---------------------------------------------------------------------------
+
+function matchModeLabel(
+  mode: SearchOsmResponse["matchMode"],
+  expansionMultiplier: 1 | 2 | 4,
+): string {
+  if (mode === "primary_only_expanded") {
+    return `expanded ${expansionMultiplier}×`;
+  }
+  if (mode === "primary_only") return "loose match";
+  if (mode === "best_effort") return "best effort";
+  return "strict";
+}
+
+function matchModeTooltip(mode: SearchOsmResponse["matchMode"]): string {
+  switch (mode) {
+    case "primary_only":
+      return "Strict match (all tags) was sparse, so we relaxed to the primary classifier tag.";
+    case "primary_only_expanded":
+      return "Same primary tag, but the search bbox was expanded outward to find enough nearby candidates.";
+    case "best_effort":
+      return "Every tier returned below the result threshold. Showing the most populous attempt.";
+    default:
+      return "All requested tags matched at least 5 features in the original bbox.";
+  }
+}
+
+function RelaxationExplainer({ osm }: { osm: SearchOsmResponse }) {
+  const tagSpan = osm.primaryTag ? (
+    <span className="font-mono">
+      {osm.primaryTag.key}={osm.primaryTag.value}
+    </span>
+  ) : null;
+
+  if (osm.matchMode === "primary_only") {
+    return (
+      <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+        Strict match for all OSM tags was sparse. Showing results that match {tagSpan}{" "}
+        alone. Other tags (e.g. material, abandonment) are sparsely populated in
+        OpenStreetMap and would have left this map empty.
+      </p>
+    );
+  }
+  if (osm.matchMode === "primary_only_expanded") {
+    return (
+      <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+        Not enough matches inside your requested area, so we expanded the search bbox by{" "}
+        <span className="font-mono">{osm.expansionMultiplier}×</span> on the primary tag{" "}
+        {tagSpan}. Results are sorted by distance from your search center.
+      </p>
+    );
+  }
+  if (osm.matchMode === "best_effort") {
+    return (
+      <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+        Every relaxation tier returned below the result threshold. Showing the most
+        populous attempt {tagSpan ? <>(matched on {tagSpan})</> : null} so you have
+        somewhere to start. Try a different scene or a wider radius for stronger matches.
+      </p>
+    );
+  }
+  return null;
 }
 
 function toFriendlyTagName(tags: Record<string, string>): string {

@@ -2,7 +2,14 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { withAuth } from "@/lib/auth";
-import { type Bbox, bboxFromRadius, bboxCenter, clampBbox, isReasonableBbox } from "@/lib/bbox";
+import {
+  type Bbox,
+  bboxFromRadius,
+  bboxCenter,
+  clampBbox,
+  distanceMeters,
+  isReasonableBbox,
+} from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { forwardGeocode } from "@/lib/geocode";
 import { logger } from "@/lib/logger";
@@ -50,25 +57,38 @@ const requestSchema = z.object({
     .optional(),
 });
 
+/** Candidate enriched with distance from the search center. */
+type RankedCandidate = OsmCandidate & {
+  /** Approximate distance (meters) from the search center. */
+  distanceMeters: number;
+};
+
 type SearchOsmResponse = {
+  /** Bbox actually queried (post-expansion if any). */
   bbox: Bbox;
+  /** Bbox the user originally requested, before any ring expansion. */
+  requestedBbox: Bbox;
   center: { lat: number; lng: number };
-  candidates: OsmCandidate[];
+  candidates: RankedCandidate[];
   cached: boolean;
-  /** Where the bbox came from: forward-geocoded location, custom radius, or supplied bbox. */
+  /** Where the original bbox came from. */
   bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
-  /** Whether all tags matched together, or only the primary classifier. */
+  /** Tier that supplied the result: strict / loose / expanded / best-effort. */
   matchMode: MatchMode;
-  /** Tag the loose-match path used (when matchMode = "primary_only"). */
+  /** Tag the loose path used (non-null for primary_only* and possibly best_effort). */
   primaryTag: { key: string; value: string } | null;
+  /** Multiplier applied to the user's bbox: 1 | 2 | 4. */
+  expansionMultiplier: 1 | 2 | 4;
   /** Mirror that served the live query (null on cache hit). */
   mirror: string | null;
 };
 
 type CachedSearchValue = {
-  candidates: OsmCandidate[];
+  candidates: RankedCandidate[];
+  effectiveBbox: Bbox;
   matchMode: MatchMode;
   primaryTag: { key: string; value: string } | null;
+  expansionMultiplier: 1 | 2 | 4;
 };
 
 const MAX_BBOX_RADIUS_MILES = 100;
@@ -157,15 +177,19 @@ export const POST = withAuth(async (req) => {
       ms: Date.now() - t0,
       candidateCount: cached.candidates.length,
       matchMode: cached.matchMode,
+      expansionMultiplier: cached.expansionMultiplier,
     });
+    const effective = cached.effectiveBbox ?? bbox;
     const response: SearchOsmResponse = {
-      bbox,
-      center: bboxCenter(bbox),
+      bbox: effective,
+      requestedBbox: bbox,
+      center: bboxCenter(effective),
       candidates: cached.candidates,
       cached: true,
       bboxSource,
       matchMode: cached.matchMode,
       primaryTag: cached.primaryTag,
+      expansionMultiplier: cached.expansionMultiplier ?? 1,
       mirror: null,
     };
     return NextResponse.json(response, { status: 200 });
@@ -190,31 +214,48 @@ export const POST = withAuth(async (req) => {
     );
   }
 
-  // 4) Cache.
+  // 4) Sort candidates by distance from the *effective* bbox center, so
+  //    the closest possible matches surface first regardless of how much
+  //    we expanded.
+  const effectiveBbox = result.effectiveBbox;
+  const center = bboxCenter(effectiveBbox);
+  const ranked: RankedCandidate[] = result.candidates
+    .map((c) => ({
+      ...c,
+      distanceMeters: distanceMeters(center, { lat: c.lat, lng: c.lng }),
+    }))
+    .sort((a, b) => a.distanceMeters - b.distanceMeters);
+
+  // 5) Cache.
   const toCache: CachedSearchValue = {
-    candidates: result.candidates,
+    candidates: ranked,
+    effectiveBbox,
     matchMode: result.matchMode,
     primaryTag: result.primaryTag,
+    expansionMultiplier: result.expansionMultiplier,
   };
   await cacheSet(key, "overpass:v2", toCache, 14);
 
   logger.info("search-osm success", {
     userId: req.dbUserId,
     ms: Date.now() - t0,
-    candidateCount: result.candidates.length,
+    candidateCount: ranked.length,
     rawCount: result.rawCount,
     mirror: result.mirror,
     matchMode: result.matchMode,
+    expansionMultiplier: result.expansionMultiplier,
   });
 
   const response: SearchOsmResponse = {
-    bbox,
-    center: bboxCenter(bbox),
-    candidates: result.candidates,
+    bbox: effectiveBbox,
+    requestedBbox: bbox,
+    center,
+    candidates: ranked,
     cached: false,
     bboxSource,
     matchMode: result.matchMode,
     primaryTag: result.primaryTag,
+    expansionMultiplier: result.expansionMultiplier,
     mirror: result.mirror,
   };
   return NextResponse.json(response, { status: 200 });
