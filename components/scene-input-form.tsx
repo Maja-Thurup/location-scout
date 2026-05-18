@@ -10,8 +10,15 @@ import posthog from "posthog-js";
 import type { Bbox } from "@/lib/bbox";
 import type { SceneAnalysis } from "@/lib/claude";
 import type { OsmCandidate } from "@/lib/overpass";
-import type { LocationMapPin, MapType } from "@/components/contracts";
+import type {
+  DeepLinks,
+  LocationMapPin,
+  MapType,
+  PhotoAttribution,
+  PhotoSource,
+} from "@/components/contracts";
 import { LocationMap } from "@/components/location-map";
+import { LocationCard } from "@/components/location-card";
 
 // ---------------------------------------------------------------------------
 // Form schema (client-side validation; mirrors the server's stricter check).
@@ -63,10 +70,52 @@ type SearchOsmResponse = {
   candidates: RankedCandidate[];
   cached: boolean;
   bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
-  matchMode: "strict" | "primary_only" | "primary_only_expanded" | "best_effort";
+  matchMode:
+    | "strict"
+    | "primary_only"
+    | "primary_only_expanded"
+    | "best_effort"
+    | "google_text_fallback";
   primaryTag: { key: string; value: string } | null;
   expansionMultiplier: 1 | 2 | 4;
   mirror: string | null;
+};
+
+type EnrichedLocation = {
+  id: string;
+  name: string;
+  address: string;
+  lat: number;
+  lng: number;
+  distanceMeters: number | null;
+  primaryType: string | null;
+  rating: number | null;
+  ratingCount: number | null;
+  businessStatus: string | null;
+  editorialSummary: string | null;
+  googleMapsUri: string | null;
+  websiteUri: string | null;
+  photo: {
+    url: string;
+    source: PhotoSource;
+    capturedAt: string | null;
+    attributionText: string;
+    attributionHref: string | null;
+  } | null;
+  streetView: {
+    available: boolean;
+    capturedAt: string | null;
+    thumbUrl: string | null;
+    copyright: string | null;
+  };
+  deepLinks: DeepLinks;
+  badges: ReadonlyArray<{ key: string; value: string }>;
+  enrichmentSparse: boolean;
+};
+
+type EnrichResponse = {
+  locations: EnrichedLocation[];
+  cached: boolean;
 };
 
 type ApiError = { error: string; message?: string };
@@ -90,6 +139,8 @@ async function parseSceneRequest(input: {
 
 async function searchOsmRequest(input: {
   osmTags: Record<string, string>;
+  googleTypes?: string[];
+  googleQuery?: string;
   location?: string;
   radiusMiles: number | null;
 }): Promise<SearchOsmResponse> {
@@ -103,6 +154,30 @@ async function searchOsmRequest(input: {
     throw new Error(err?.message ?? err?.error ?? `HTTP ${res.status}`);
   }
   return (await res.json()) as SearchOsmResponse;
+}
+
+async function enrichLocationsRequest(input: {
+  candidates: ReadonlyArray<{
+    id: string;
+    type: "node" | "way" | "relation";
+    lat: number;
+    lng: number;
+    tags: Record<string, string>;
+    name?: string | null;
+  }>;
+  searchCenter?: { lat: number; lng: number };
+  includeClosed?: boolean;
+}): Promise<EnrichResponse> {
+  const res = await fetch("/api/enrich-locations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => null)) as ApiError | null;
+    throw new Error(err?.message ?? err?.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as EnrichResponse;
 }
 
 type ReverseGeocodeResponse = {
@@ -193,8 +268,11 @@ type Stage =
   | { kind: "idle" }
   | { kind: "analyzing" }
   | { kind: "searching-osm" }
+  | { kind: "enriching" }
   | { kind: "ready" }
   | { kind: "error"; message: string };
+
+const MAX_ENRICH_CANDIDATES = 15;
 
 export function SceneInputForm({
   initialSceneText = "",
@@ -222,6 +300,7 @@ export function SceneInputForm({
       : null,
   );
   const [osmResult, setOsmResult] = useState<SearchOsmResponse | null>(null);
+  const [enrichResult, setEnrichResult] = useState<EnrichResponse | null>(null);
   const [mapType, setMapType] = useState<MapType>("roadmap");
   const [selectedPinId, setSelectedPinId] = useState<string | undefined>(undefined);
   const isFromHistory = initialAnalysis !== null && parseResult?.analysis === initialAnalysis;
@@ -246,16 +325,17 @@ export function SceneInputForm({
 
   const parseMutation = useMutation({ mutationFn: parseSceneRequest });
   const osmMutation = useMutation({ mutationFn: searchOsmRequest });
+  const enrichMutation = useMutation({ mutationFn: enrichLocationsRequest });
 
-  // If we hydrated from history with prior analysis, auto-fire OSM search
-  // so the user immediately sees the same map.
+  // If we hydrated from history with prior analysis, auto-fire OSM + enrich
+  // so the user immediately sees the same map and result cards.
   useEffect(() => {
     if (!isFromHistory || !initialAnalysis) return;
     if (osmResult || osmMutation.isPending) return;
     const radiusMiles =
       typeof initialRadius === "number" ? (initialRadius as number) : null;
-    void runOsmSearch({
-      osmTags: initialAnalysis.osm_tags,
+    void runOsmAndEnrich({
+      analysis: initialAnalysis,
       location: initialLocation || undefined,
       radiusMiles,
     });
@@ -265,27 +345,87 @@ export function SceneInputForm({
   const sceneText = watch("sceneText");
   const charCount = sceneText?.length ?? 0;
 
-  async function runOsmSearch(args: {
-    osmTags: Record<string, string>;
+  async function runOsmAndEnrich(args: {
+    analysis: SceneAnalysis;
     location?: string;
     radiusMiles: number | null;
   }): Promise<void> {
+    const { analysis, location, radiusMiles } = args;
+
     setStage({ kind: "searching-osm" });
+    setEnrichResult(null);
+    let osm: SearchOsmResponse;
     try {
-      const osm = await osmMutation.mutateAsync(args);
+      osm = await osmMutation.mutateAsync({
+        osmTags: analysis.osm_tags,
+        googleTypes: analysis.google_types,
+        googleQuery: analysis.google_query,
+        location,
+        radiusMiles,
+      });
       setOsmResult(osm);
-      setStage({ kind: "ready" });
       posthog.capture("osm_search_completed", {
         cached: osm.cached,
         candidateCount: osm.candidates.length,
         bboxSource: osm.bboxSource,
+        matchMode: osm.matchMode,
         mirror: osm.mirror,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "OSM search failed.";
       setStage({ kind: "error", message });
       posthog.capture("osm_search_failed", { error: message });
+      return;
     }
+
+    if (osm.candidates.length === 0) {
+      setStage({ kind: "ready" });
+      return;
+    }
+
+    setStage({ kind: "enriching" });
+    const includeClosed = sceneImpliesAbandonment(analysis);
+    try {
+      const enriched = await enrichMutation.mutateAsync({
+        candidates: osm.candidates.slice(0, MAX_ENRICH_CANDIDATES).map((c) => ({
+          id: c.id,
+          type: c.type,
+          lat: c.lat,
+          lng: c.lng,
+          tags: c.tags,
+          name: c.name,
+        })),
+        searchCenter: osm.center,
+        includeClosed,
+      });
+      setEnrichResult(enriched);
+      setStage({ kind: "ready" });
+      posthog.capture("enrich_completed", {
+        candidateCount: enriched.locations.length,
+        sparseCount: enriched.locations.filter((l) => l.enrichmentSparse).length,
+        includeClosed,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Enrichment failed.";
+      // We have OSM pins, just no rich cards. Still show the map.
+      setStage({ kind: "error", message });
+      posthog.capture("enrich_failed", { error: message });
+    }
+  }
+
+  function sceneImpliesAbandonment(analysis: SceneAnalysis): boolean {
+    const ABANDONED_RE = /\b(abandoned|disused|ruined|ruins|derelict|boarded[- ]up|decayed|deserted|crumbling)\b/i;
+    if (
+      analysis.osm_tags.abandoned ||
+      analysis.osm_tags.ruins ||
+      analysis.osm_tags.disused
+    ) {
+      return true;
+    }
+    return (
+      ABANDONED_RE.test(analysis.visual ?? "") ||
+      ABANDONED_RE.test(analysis.google_query ?? "")
+    );
   }
 
   const onSubmit = handleSubmit(async (values) => {
@@ -293,6 +433,7 @@ export function SceneInputForm({
     const radiusMiles = values.radius === "any" ? null : Number(values.radius);
 
     setOsmResult(null);
+    setEnrichResult(null);
     setSelectedPinId(undefined);
     setStage({ kind: "analyzing" });
 
@@ -310,9 +451,9 @@ export function SceneInputForm({
         rateLimitRemaining: parsed.rateLimit.remaining,
       });
 
-      // Chain straight into OSM so the user sees pins on the same click.
-      await runOsmSearch({
-        osmTags: parsed.analysis.osm_tags,
+      // Chain straight into OSM + enrichment.
+      await runOsmAndEnrich({
+        analysis: parsed.analysis,
         location,
         radiusMiles,
       });
@@ -357,13 +498,18 @@ export function SceneInputForm({
     }
   }
 
-  const isBusy = stage.kind === "analyzing" || stage.kind === "searching-osm";
+  const isBusy =
+    stage.kind === "analyzing" ||
+    stage.kind === "searching-osm" ||
+    stage.kind === "enriching";
   const buttonLabel =
     stage.kind === "analyzing"
       ? "Analyzing scene…"
       : stage.kind === "searching-osm"
         ? "Searching OpenStreetMap…"
-        : "Find locations";
+        : stage.kind === "enriching"
+          ? "Enriching with photos…"
+          : "Find locations";
 
   return (
     <div className="space-y-8">
@@ -475,6 +621,15 @@ export function SceneInputForm({
         />
       )}
 
+      {(enrichResult ?? (stage.kind === "enriching" && osmResult)) && (
+        <ResultCardsPanel
+          enriched={enrichResult}
+          isEnriching={stage.kind === "enriching"}
+          selectedPinId={selectedPinId}
+          onSelectPin={setSelectedPinId}
+        />
+      )}
+
       {parseResult && (
         <AnalysisResultPanel
           result={parseResult}
@@ -482,6 +637,93 @@ export function SceneInputForm({
         />
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cards grid (M4 result UI)
+// ---------------------------------------------------------------------------
+
+function ResultCardsPanel({
+  enriched,
+  isEnriching,
+  selectedPinId,
+  onSelectPin,
+}: {
+  enriched: EnrichResponse | null;
+  isEnriching: boolean;
+  selectedPinId: string | undefined;
+  onSelectPin: (id: string) => void;
+}) {
+  if (!enriched && !isEnriching) return null;
+
+  return (
+    <section className="space-y-4 rounded-lg border border-white/10 bg-card p-6">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-lg font-semibold">Result cards</h2>
+        {enriched && (
+          <span className="text-xs text-muted-foreground">
+            {enriched.locations.length} enriched · sparse:{" "}
+            {enriched.locations.filter((l) => l.enrichmentSparse).length}
+          </span>
+        )}
+      </header>
+
+      {isEnriching && !enriched && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div
+              key={i}
+              className="flex animate-pulse flex-col gap-2 rounded-lg border border-white/10 bg-black/30 p-4"
+            >
+              <div className="aspect-video rounded-md bg-white/5" />
+              <div className="h-3 w-3/4 rounded bg-white/5" />
+              <div className="h-3 w-1/2 rounded bg-white/5" />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {enriched && enriched.locations.length === 0 && (
+        <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm text-amber-300">
+          No enriched results — every candidate failed to match a Google Place.
+        </p>
+      )}
+
+      {enriched && enriched.locations.length > 0 && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {enriched.locations.map((loc) => (
+            <LocationCard
+              key={loc.id}
+              id={loc.id}
+              name={loc.name}
+              address={loc.address}
+              lat={loc.lat}
+              lng={loc.lng}
+              rating={loc.rating ?? undefined}
+              photoUrl={loc.photo?.url}
+              photoSource={loc.photo?.source ?? null}
+              photoCapturedAt={loc.photo?.capturedAt ?? undefined}
+              photoAttribution={
+                loc.photo
+                  ? ({
+                      source: loc.photo.source,
+                      text: loc.photo.attributionText,
+                      href: loc.photo.attributionHref ?? undefined,
+                    } satisfies PhotoAttribution)
+                  : undefined
+              }
+              streetViewThumbUrl={loc.streetView.thumbUrl ?? undefined}
+              hasInteractiveStreetView={loc.streetView.available}
+              deepLinks={loc.deepLinks}
+              badges={loc.badges.map((b) => `${b.key}=${b.value}`)}
+              isSelected={loc.id === selectedPinId}
+              onSelect={onSelectPin}
+            />
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -627,11 +869,10 @@ function matchModeLabel(
   mode: SearchOsmResponse["matchMode"],
   expansionMultiplier: 1 | 2 | 4,
 ): string {
-  if (mode === "primary_only_expanded") {
-    return `expanded ${expansionMultiplier}×`;
-  }
+  if (mode === "primary_only_expanded") return `expanded ${expansionMultiplier}×`;
   if (mode === "primary_only") return "loose match";
   if (mode === "best_effort") return "best effort";
+  if (mode === "google_text_fallback") return "Google Places";
   return "strict";
 }
 
@@ -643,6 +884,8 @@ function matchModeTooltip(mode: SearchOsmResponse["matchMode"]): string {
       return "Same primary tag, but the search bbox was expanded outward to find enough nearby candidates.";
     case "best_effort":
       return "Every tier returned below the result threshold. Showing the most populous attempt.";
+    case "google_text_fallback":
+      return "OpenStreetMap had no matches even after expansion. Results come from Google Places text search instead.";
     default:
       return "All requested tags matched at least 5 features in the original bbox.";
   }
@@ -679,6 +922,15 @@ function RelaxationExplainer({ osm }: { osm: SearchOsmResponse }) {
         Every relaxation tier returned below the result threshold. Showing the most
         populous attempt {tagSpan ? <>(matched on {tagSpan})</> : null} so you have
         somewhere to start. Try a different scene or a wider radius for stronger matches.
+      </p>
+    );
+  }
+  if (osm.matchMode === "google_text_fallback") {
+    return (
+      <p className="rounded-md border border-blue-500/20 bg-blue-500/5 px-3 py-2 text-xs text-blue-200">
+        OpenStreetMap had no matches in this area even after expanding the bbox, so we
+        fell back to Google Places text search. Results may include businesses by name
+        rather than physical attributes.
       </p>
     );
   }
