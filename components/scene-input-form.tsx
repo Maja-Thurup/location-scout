@@ -12,12 +12,9 @@ import type { SceneAnalysis } from "@/lib/claude";
 import type { OsmCandidate } from "@/lib/overpass";
 import type {
   DeepLinks,
-  LocationMapPin,
-  MapType,
   PhotoAttribution,
   PhotoSource,
 } from "@/components/contracts";
-import { LocationMap } from "@/components/location-map";
 import { LocationCard } from "@/components/location-card";
 
 // ---------------------------------------------------------------------------
@@ -156,6 +153,7 @@ async function searchOsmRequest(input: {
   osmTags: Record<string, string>;
   googleTypes?: string[];
   googleQuery?: string;
+  mapillaryClasses?: string[];
   location?: string;
   radiusMiles: number | null;
 }): Promise<SearchOsmResponse> {
@@ -321,8 +319,6 @@ export function SceneInputForm({
   );
   const [osmResult, setOsmResult] = useState<SearchOsmResponse | null>(null);
   const [enrichResult, setEnrichResult] = useState<EnrichResponse | null>(null);
-  const [mapType, setMapType] = useState<MapType>("roadmap");
-  const [selectedPinId, setSelectedPinId] = useState<string | undefined>(undefined);
   const isFromHistory = initialAnalysis !== null && parseResult?.analysis === initialAnalysis;
 
   const {
@@ -382,6 +378,7 @@ export function SceneInputForm({
         osmTags: analysis.osm_tags,
         googleTypes: analysis.google_types,
         googleQuery: analysis.google_query,
+        mapillaryClasses: analysis.mapillary_classes,
         location,
         radiusMiles,
       });
@@ -467,7 +464,6 @@ export function SceneInputForm({
 
     setOsmResult(null);
     setEnrichResult(null);
-    setSelectedPinId(undefined);
     setStage({ kind: "analyzing" });
 
     try {
@@ -644,13 +640,10 @@ export function SceneInputForm({
         )}
       </form>
 
-      {(osmResult ?? (isBusy && parseResult)) && (
-        <ResultsMapPanel
+      {osmResult && (
+        <SearchSummaryPanel
           osm={osmResult}
-          mapType={mapType}
-          onMapTypeChange={setMapType}
-          selectedPinId={selectedPinId}
-          onPinClick={setSelectedPinId}
+          analysis={parseResult?.analysis ?? null}
           isSearching={stage.kind === "searching-osm"}
         />
       )}
@@ -659,8 +652,6 @@ export function SceneInputForm({
         <ResultCardsPanel
           enriched={enrichResult}
           isEnriching={stage.kind === "enriching"}
-          selectedPinId={selectedPinId}
-          onSelectPin={setSelectedPinId}
         />
       )}
 
@@ -675,19 +666,85 @@ export function SceneInputForm({
 }
 
 // ---------------------------------------------------------------------------
+// Search summary — replaces the embedded map. Shows match-mode badge,
+// candidate count, and a "View all on Google Maps" CTA.
+// ---------------------------------------------------------------------------
+
+function SearchSummaryPanel({
+  osm,
+  analysis,
+  isSearching,
+}: {
+  osm: SearchOsmResponse;
+  analysis: SceneAnalysis | null;
+  isSearching: boolean;
+}) {
+  // Build a "View all on Google Maps" URL using Claude's google_query (when
+  // available) so users can browse the same conceptual search on Google's
+  // own map. Fallback to the bbox center coordinates.
+  const fallbackQuery =
+    analysis?.google_query ??
+    `${osm.center.lat.toFixed(5)},${osm.center.lng.toFixed(5)}`;
+  const viewAllHref = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(fallbackQuery)}`;
+
+  return (
+    <section className="space-y-3 rounded-lg border border-white/10 bg-card p-5">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="text-base font-semibold">Search</h2>
+          <span
+            className={
+              "rounded-full px-2 py-0.5 text-xs font-medium " +
+              (osm.cached
+                ? "bg-emerald-500/15 text-emerald-300"
+                : "bg-blue-500/15 text-blue-300")
+            }
+          >
+            {osm.cached ? "cached" : "live"}
+          </span>
+          {osm.matchMode !== "strict" && (
+            <span
+              title={matchModeTooltip(osm.matchMode)}
+              className="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300"
+            >
+              {matchModeLabel(osm.matchMode, osm.expansionMultiplier)}
+            </span>
+          )}
+          <span className="text-xs text-muted-foreground">
+            {osm.candidates.length} candidate
+            {osm.candidates.length === 1 ? "" : "s"}
+            {" · "}
+            bbox: {osm.bboxSource.replace("_", " ")}
+          </span>
+          {isSearching && (
+            <span className="text-xs text-muted-foreground">Querying OpenStreetMap…</span>
+          )}
+        </div>
+        <a
+          href={viewAllHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition hover:opacity-90"
+        >
+          View all on Google Maps ↗
+        </a>
+      </header>
+
+      {osm.matchMode !== "strict" && <RelaxationExplainer osm={osm} />}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Cards grid (M4 result UI)
 // ---------------------------------------------------------------------------
 
 function ResultCardsPanel({
   enriched,
   isEnriching,
-  selectedPinId,
-  onSelectPin,
 }: {
   enriched: EnrichResponse | null;
   isEnriching: boolean;
-  selectedPinId: string | undefined;
-  onSelectPin: (id: string) => void;
 }) {
   if (!enriched && !isEnriching) return null;
 
@@ -754,8 +811,6 @@ function ResultCardsPanel({
               hasInteractiveStreetView={loc.streetView.available}
               deepLinks={loc.deepLinks}
               badges={loc.badges.map((b) => `${b.key}=${b.value}`)}
-              isSelected={loc.id === selectedPinId}
-              onSelect={onSelectPin}
               visionScore={loc.photo?.visionScore ?? undefined}
               visionReason={loc.photo?.visionReason ?? undefined}
             />
@@ -763,140 +818,6 @@ function ResultCardsPanel({
         </div>
       )}
     </section>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Results: map + pin summary
-// ---------------------------------------------------------------------------
-
-function ResultsMapPanel({
-  osm,
-  mapType,
-  onMapTypeChange,
-  selectedPinId,
-  onPinClick,
-  isSearching,
-}: {
-  osm: SearchOsmResponse | null;
-  mapType: MapType;
-  onMapTypeChange: (m: MapType) => void;
-  selectedPinId: string | undefined;
-  onPinClick: (id: string) => void;
-  isSearching: boolean;
-}) {
-  const pins: LocationMapPin[] = osm
-    ? osm.candidates.map((c) => ({
-        id: c.id,
-        lat: c.lat,
-        lng: c.lng,
-        name: c.name ?? toFriendlyTagName(c.tags),
-      }))
-    : [];
-
-  return (
-    <section className="space-y-4 rounded-lg border border-white/10 bg-card p-6">
-      <header className="flex flex-wrap items-center gap-3">
-        <h2 className="text-lg font-semibold">Locations on the map</h2>
-        {osm && (
-          <span
-            className={
-              "rounded-full px-2 py-0.5 text-xs font-medium " +
-              (osm.cached
-                ? "bg-emerald-500/15 text-emerald-300"
-                : "bg-blue-500/15 text-blue-300")
-            }
-          >
-            {osm.cached ? "cached" : "live"}
-          </span>
-        )}
-        {osm && osm.matchMode !== "strict" && (
-          <span
-            title={matchModeTooltip(osm.matchMode)}
-            className="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300"
-          >
-            {matchModeLabel(osm.matchMode, osm.expansionMultiplier)}
-          </span>
-        )}
-        {osm && (
-          <span className="text-xs text-muted-foreground">
-            {osm.candidates.length} candidate{osm.candidates.length === 1 ? "" : "s"}
-            {" · "}
-            bbox: {osm.bboxSource.replace("_", " ")}
-          </span>
-        )}
-        {isSearching && (
-          <span className="text-xs text-muted-foreground">Querying OpenStreetMap…</span>
-        )}
-      </header>
-
-      {osm && osm.matchMode !== "strict" && (
-        <RelaxationExplainer osm={osm} />
-      )}
-
-      <div className="h-[400px]">
-        <LocationMap
-          pins={pins}
-          bbox={osm?.bbox}
-          mapType={mapType}
-          onMapTypeChange={onMapTypeChange}
-          selectedId={selectedPinId}
-          onPinClick={onPinClick}
-        />
-      </div>
-
-      {osm && osm.candidates.length === 0 && (
-        <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm text-amber-300">
-          No OSM features matched in this area, even after relaxing to the primary tag.
-          M4 will fall back to Google Places text search to fill the gap.
-        </p>
-      )}
-
-      {osm && selectedPinId && (
-        <SelectedCandidateInline
-          candidate={osm.candidates.find((c) => c.id === selectedPinId)}
-        />
-      )}
-    </section>
-  );
-}
-
-function SelectedCandidateInline({
-  candidate,
-}: {
-  candidate: RankedCandidate | undefined;
-}) {
-  if (!candidate) return null;
-  const tagPairs = Object.entries(candidate.tags).slice(0, 8);
-  const miles = candidate.distanceMeters / 1609.344;
-  return (
-    <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-4">
-      <div className="flex items-baseline justify-between gap-3">
-        <h3 className="font-medium">
-          {candidate.name ?? toFriendlyTagName(candidate.tags)}
-        </h3>
-        <span className="font-mono text-[10px] text-muted-foreground">{candidate.id}</span>
-      </div>
-      <p className="font-mono text-xs text-muted-foreground">
-        {candidate.lat.toFixed(5)}, {candidate.lng.toFixed(5)} ·{" "}
-        {miles < 0.1
-          ? `${Math.round(candidate.distanceMeters)} m from search center`
-          : `${miles.toFixed(1)} mi from search center`}
-      </p>
-      <div className="flex flex-wrap gap-1.5">
-        {tagPairs.map(([k, v]) => (
-          <span
-            key={k}
-            className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-[10px]"
-          >
-            {k}={v}
-          </span>
-        ))}
-      </div>
-      <p className="text-xs text-muted-foreground">
-        Name and photos arrive in M4 (Google Places + Mapillary enrichment).
-      </p>
-    </div>
   );
 }
 
@@ -974,18 +895,6 @@ function RelaxationExplainer({ osm }: { osm: SearchOsmResponse }) {
     );
   }
   return null;
-}
-
-function toFriendlyTagName(tags: Record<string, string>): string {
-  if (tags.building) return capitalize(tags.building) + " (OSM)";
-  if (tags.amenity) return capitalize(tags.amenity);
-  if (tags.natural) return capitalize(tags.natural);
-  if (tags.landuse) return capitalize(tags.landuse);
-  return "OSM feature";
-}
-
-function capitalize(s: string): string {
-  return s.length > 0 ? s[0]!.toUpperCase() + s.slice(1).replace(/_/g, " ") : s;
 }
 
 // ---------------------------------------------------------------------------

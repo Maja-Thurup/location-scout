@@ -7,16 +7,19 @@ import { PhotoAttributionBadge } from "@/components/photo-attribution";
 import { StreetViewModal } from "@/components/street-view-modal";
 
 // ---------------------------------------------------------------------------
-// Result card v2
+// Result card v3 — minimalist
 //
-// Top-left tab toggle: vision-matched thumbnail ↔ "Open Street View"
-//   - When a photo URL exists, the default view is the matched thumbnail
-//     with its source badge ("Google" / "Mapillary" / "Street View").
-//   - Clicking the "Street View" tab opens the interactive panorama modal
-//     (google.maps.StreetViewPanorama) when imagery is available.
+// Filmmakers don't care about business names, ratings, or addresses on
+// the scout card. They care about WHAT IT LOOKS LIKE and HOW TO GET
+// THERE. So the card is now:
 //
-// Identifier strip: monospaced lat/lng is the primary, address (when known)
-// is a secondary line. Filmmakers paste coords; addresses are nice-to-have.
+//   [ photo ]
+//   [ tag pills + distance pill + Match score pill ]
+//   [ Open Street View | Google Maps | Directions | Apple Maps | Waze ]
+//
+// Coordinates are encoded into the deep links but no longer rendered as
+// visible text. Name (kept on the prop for contract stability) is used
+// only for accessibility (alt text + Street View modal title).
 // ---------------------------------------------------------------------------
 
 export type LocationCardExtraProps = {
@@ -30,13 +33,12 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
   const {
     id,
     name,
-    // address is intentionally received and ignored — the card no longer
-    // shows it, but the prop stays in the LocationCardProps contract for
-    // when designed components want it back.
+    // Intentionally received and ignored — kept on the contract so designed
+    // components can opt back in if they want to surface them later.
     address: _address,
+    rating: _rating,
     lat,
     lng,
-    rating,
     photoUrl,
     photoSource,
     photoCapturedAt,
@@ -77,7 +79,7 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
             <NoPhotoPlaceholder />
           )}
 
-          {/* Top-left: source badge for the matched photo + "Street View" toggle. */}
+          {/* Top-left: source badge + Open Street View button + match badge */}
           <div className="absolute top-2 left-2 flex max-w-[calc(100%-1rem)] flex-wrap gap-1">
             {photoUrl && (
               <span className="rounded-md bg-black/70 px-2 py-0.5 text-[10px] font-medium tracking-wide text-white uppercase backdrop-blur">
@@ -109,14 +111,14 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
             )}
           </div>
 
-          {/* Bottom-left: photo attribution overlay (CC BY-SA + Google reqs). */}
+          {/* Bottom-left: photo attribution overlay */}
           {photoAttribution && (
             <div className="absolute bottom-2 left-2 max-w-[80%]">
               <PhotoAttributionBadge {...photoAttribution} />
             </div>
           )}
 
-          {/* Bottom-right: capture date + driving distance pill. */}
+          {/* Bottom-right: capture date + driving distance pill */}
           <div className="absolute right-2 bottom-2 flex flex-col items-end gap-1">
             {photoCapturedAt && (
               <span className="rounded bg-black/70 px-1.5 py-0.5 text-[10px] text-white/80 backdrop-blur">
@@ -131,33 +133,22 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
           </div>
         </div>
 
-        <div className="flex flex-1 flex-col gap-2 p-4">
-          {/* Coordinates as the primary location identifier (no street address). */}
-          <p className="font-mono text-xs leading-tight text-foreground">
-            {lat.toFixed(5)}, {lng.toFixed(5)}
-          </p>
-
-          <header className="flex items-start justify-between gap-2">
-            <h3 className="text-sm font-semibold leading-snug">{name}</h3>
-            {rating != null && (
-              <span className="shrink-0 text-xs text-muted-foreground">
-                ★ {rating.toFixed(1)}
-              </span>
-            )}
-          </header>
-
-          {badges && badges.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {badges.map((b, i) => (
+        <div className="flex flex-1 flex-col gap-3 p-4">
+          {/* Tags + distance row */}
+          <div className="flex flex-wrap gap-1">
+            {badges && badges.length > 0 ? (
+              badges.map((b, i) => (
                 <span
                   key={i}
                   className="rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
                 >
                   {b}
                 </span>
-              ))}
-            </div>
-          )}
+              ))
+            ) : (
+              <span className="text-[10px] text-muted-foreground">no tags</span>
+            )}
+          </div>
 
           <SendToRow deepLinks={deepLinks} />
         </div>
@@ -239,9 +230,7 @@ function sourceLabel(source: LocationCardProps["photoSource"]): string {
 
 function formatPhotoDate(iso: string): string {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) {
-    return iso; // pass-through "YYYY-MM" form Street View sometimes returns
-  }
+  if (Number.isNaN(d.getTime())) return iso;
   const year = d.getFullYear();
   const month = d.toLocaleString(undefined, { month: "short" });
   return `${month} ${year}`;

@@ -14,6 +14,7 @@ import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { forwardGeocode } from "@/lib/geocode";
 import { type GooglePlace, searchText } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
+import { findDetectionsInBbox } from "@/lib/mapillary";
 import { type MatchMode, type OsmCandidate, searchOsm } from "@/lib/overpass";
 
 export const runtime = "nodejs";
@@ -38,6 +39,15 @@ const requestSchema = z.object({
    * empty even after ring expansion. e.g. "warehouse Brooklyn industrial".
    */
   googleQuery: z.string().min(1).max(200).optional(),
+
+  /**
+   * Optional Mapillary `object_value` classes specified by Claude. When
+   * present, we fetch detections in the bbox and ADD them as candidates
+   * alongside OSM results. Especially useful for object-rich scenes
+   * where OSM is sparse (e.g. "bench on a wooded path" — OSM returns
+   * the park polygon centroid; Mapillary returns 50+ actual bench coords).
+   */
+  mapillaryClasses: z.array(z.string()).optional(),
 
   /**
    * Free-text location string to geocode (city, neighborhood, address).
@@ -177,6 +187,7 @@ export const POST = withAuth(async (req) => {
     osmTags,
     googleTypes,
     googleQuery,
+    mapillaryClasses,
     location,
     radiusMiles,
     bbox: suppliedBbox,
@@ -233,7 +244,13 @@ export const POST = withAuth(async (req) => {
   }
 
   // 2) Cache lookup (14-day TTL).
-  const key = cacheKey("overpass:v2", { bbox, osmTags });
+  // v3 namespace: candidate set now also includes Mapillary detections when
+  // mapillaryClasses is non-empty, so the key must include that signal.
+  const key = cacheKey("overpass:v2", {
+    bbox,
+    osmTags,
+    mapillaryClasses: mapillaryClasses ? [...mapillaryClasses].sort() : null,
+  });
   const cached = await cacheGet<CachedSearchValue>(key);
   if (cached?.candidates) {
     logger.info("search-osm cache hit", {
@@ -283,6 +300,53 @@ export const POST = withAuth(async (req) => {
   let finalMatchMode: ExtendedMatchMode = result.matchMode;
   let finalExpansion: 1 | 2 | 4 = result.expansionMultiplier;
   let finalPrimaryTag = result.primaryTag;
+
+  // 3.5) Mapillary detections as additional candidates.
+  //
+  // For object-rich scenes (bench, fire hydrant, bike rack, cobblestone),
+  // Mapillary's pre-computed detections often locate filmable spots more
+  // precisely than OSM does. We fetch them in parallel with the OSM result
+  // and merge — each detection becomes its own candidate at the exact
+  // coord where the camera saw the object.
+  if (mapillaryClasses && mapillaryClasses.length > 0) {
+    const bboxStr = `${effectiveBbox.west},${effectiveBbox.south},${effectiveBbox.east},${effectiveBbox.north}`;
+    try {
+      const detections = await findDetectionsInBbox({
+        bboxStr,
+        classes: mapillaryClasses,
+        limit: 80,
+      });
+
+      if (detections.length > 0) {
+        const before = candidatesRaw.length;
+        const seen = new Set(candidatesRaw.map((c) => c.id));
+        for (const d of detections) {
+          const id = `mapillary/${d.id}`;
+          if (seen.has(id)) continue;
+          seen.add(id);
+          candidatesRaw.push({
+            id,
+            type: "node",
+            osmId: 0,
+            lat: d.lat,
+            lng: d.lng,
+            tags: { [`mapillary:${d.objectClass}`]: "yes" },
+            name: null,
+          });
+        }
+        logger.info("search-osm Mapillary detections merged in", {
+          userId: req.dbUserId,
+          osmCount: before,
+          detectionCount: detections.length,
+          afterMerge: candidatesRaw.length,
+        });
+      }
+    } catch (err) {
+      logger.warn("search-osm Mapillary detections threw (non-fatal)", {
+        err: String(err),
+      });
+    }
+  }
 
   // 4) B2 — Google Places text-search fallback. Triggered when Overpass came
   //    back empty even after ring expansion. Filmmakers' "diner" / "old
