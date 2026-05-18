@@ -118,7 +118,7 @@ export default async function HomePage() {
               )}
             </div>
             <p className="mt-6 text-xs text-muted-foreground">
-              Free tier: 5 scene analyses per day, 3 saved projects. No credit card required.
+              Free tier: 25 scene analyses per day, 3 saved projects. No credit card required.
             </p>
           </div>
         </section>

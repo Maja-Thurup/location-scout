@@ -13,9 +13,16 @@ export type RateLimitedAction =
   | "search_locations"
   | "vision_score";
 
+/**
+ * Per-day caps on free-tier usage. Cache hits do NOT consume quota; only
+ * fresh upstream calls (Claude / Google / Mapillary / etc.) tick the
+ * counter. The values are tuned to give a recruiter / curious visitor
+ * enough headroom to genuinely play with the tool while still signalling
+ * that the product has paid tiers.
+ */
 const DEFAULT_LIMITS: Record<RateLimitedAction, number> = {
-  parse_scene: 5,
-  search_locations: 5,
+  parse_scene: 25,
+  search_locations: 25,
   vision_score: 0, // Phase 2 only.
 };
 
