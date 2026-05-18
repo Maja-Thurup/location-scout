@@ -1,13 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { z } from "zod";
 import posthog from "posthog-js";
 
+import type { Bbox } from "@/lib/bbox";
 import type { SceneAnalysis } from "@/lib/claude";
+import type { OsmCandidate } from "@/lib/overpass";
+import type { LocationMapPin, MapType } from "@/components/contracts";
+import { LocationMap } from "@/components/location-map";
 
 // ---------------------------------------------------------------------------
 // Form schema (client-side validation; mirrors the server's stricter check).
@@ -39,14 +43,24 @@ const formSchema = z.object({
 type FormValues = z.input<typeof formSchema>;
 
 // ---------------------------------------------------------------------------
-// Server response shape (mirror of /api/parse-scene).
+// API contracts
 // ---------------------------------------------------------------------------
 
 type ParseSceneResponse = {
   analysis: SceneAnalysis;
   cached: boolean;
   attempts: number;
+  echo?: { location: string | null; radiusMiles: number | null };
   rateLimit: { used: number; limit: number; remaining: number; resetAt: string };
+};
+
+type SearchOsmResponse = {
+  bbox: Bbox;
+  center: { lat: number; lng: number };
+  candidates: OsmCandidate[];
+  cached: boolean;
+  bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
+  mirror: string | null;
 };
 
 type ApiError = { error: string; message?: string };
@@ -66,6 +80,23 @@ async function parseSceneRequest(input: {
     throw new Error(err?.message ?? err?.error ?? `HTTP ${res.status}`);
   }
   return (await res.json()) as ParseSceneResponse;
+}
+
+async function searchOsmRequest(input: {
+  osmTags: Record<string, string>;
+  location?: string;
+  radiusMiles: number | null;
+}): Promise<SearchOsmResponse> {
+  const res = await fetch("/api/search-osm", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => null)) as ApiError | null;
+    throw new Error(err?.message ?? err?.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as SearchOsmResponse;
 }
 
 type ReverseGeocodeResponse = {
@@ -105,7 +136,7 @@ function browserGeolocate(): Promise<GeolocationPosition> {
 }
 
 // ---------------------------------------------------------------------------
-// Sample prompts (also exercises caching on second click of the same one).
+// Sample prompts
 // ---------------------------------------------------------------------------
 
 const SAMPLES: ReadonlyArray<{
@@ -152,20 +183,24 @@ export type SceneInputFormProps = {
   initialAnalysis?: SceneAnalysis | null;
 };
 
+type Stage =
+  | { kind: "idle" }
+  | { kind: "analyzing" }
+  | { kind: "searching-osm" }
+  | { kind: "ready" }
+  | { kind: "error"; message: string };
+
 export function SceneInputForm({
   initialSceneText = "",
   initialLocation = "",
   initialRadius = "any",
   initialAnalysis = null,
 }: SceneInputFormProps) {
-  const [serverError, setServerError] = useState<string | null>(null);
   const [geoStatus, setGeoStatus] = useState<"idle" | "locating" | "error">("idle");
   const [geoError, setGeoError] = useState<string | null>(null);
+  const [stage, setStage] = useState<Stage>({ kind: "idle" });
 
-  // If we hydrated with a previous analysis, surface it as the initial
-  // result panel state. Once the user runs a fresh search the mutation's
-  // own data takes over.
-  const [initialResult] = useState<ParseSceneResponse | null>(() =>
+  const [parseResult, setParseResult] = useState<ParseSceneResponse | null>(
     initialAnalysis
       ? {
           analysis: initialAnalysis,
@@ -175,13 +210,15 @@ export function SceneInputForm({
             used: 0,
             limit: 5,
             remaining: 5,
-            resetAt: new Date(
-              new Date().setUTCHours(24, 0, 0, 0),
-            ).toISOString(),
+            resetAt: new Date(new Date().setUTCHours(24, 0, 0, 0)).toISOString(),
           },
         }
       : null,
   );
+  const [osmResult, setOsmResult] = useState<SearchOsmResponse | null>(null);
+  const [mapType, setMapType] = useState<MapType>("roadmap");
+  const [selectedPinId, setSelectedPinId] = useState<string | undefined>(undefined);
+  const isFromHistory = initialAnalysis !== null && parseResult?.analysis === initialAnalysis;
 
   const {
     register,
@@ -194,38 +231,90 @@ export function SceneInputForm({
     defaultValues: {
       sceneText: initialSceneText,
       location: initialLocation,
-      radius: typeof initialRadius === "number" ? (String(initialRadius) as FormValues["radius"]) : "any",
+      radius:
+        typeof initialRadius === "number"
+          ? (String(initialRadius) as FormValues["radius"])
+          : "any",
     },
   });
 
-  const mutation = useMutation({
-    mutationFn: parseSceneRequest,
-    onMutate: () => setServerError(null),
-    onSuccess: (data) => {
-      posthog.capture("scene_parsed", {
-        cached: data.cached,
-        attempts: data.attempts,
-        city: data.analysis.city,
-        rateLimitRemaining: data.rateLimit.remaining,
-      });
-    },
-    onError: (err: Error) => {
-      setServerError(err.message);
-      posthog.capture("scene_parse_failed", { error: err.message });
-    },
-  });
+  const parseMutation = useMutation({ mutationFn: parseSceneRequest });
+  const osmMutation = useMutation({ mutationFn: searchOsmRequest });
+
+  // If we hydrated from history with prior analysis, auto-fire OSM search
+  // so the user immediately sees the same map.
+  useEffect(() => {
+    if (!isFromHistory || !initialAnalysis) return;
+    if (osmResult || osmMutation.isPending) return;
+    const radiusMiles =
+      typeof initialRadius === "number" ? (initialRadius as number) : null;
+    void runOsmSearch({
+      osmTags: initialAnalysis.osm_tags,
+      location: initialLocation || undefined,
+      radiusMiles,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const sceneText = watch("sceneText");
   const charCount = sceneText?.length ?? 0;
 
-  const onSubmit = handleSubmit((values) => {
-    const location = values.location?.trim();
+  async function runOsmSearch(args: {
+    osmTags: Record<string, string>;
+    location?: string;
+    radiusMiles: number | null;
+  }): Promise<void> {
+    setStage({ kind: "searching-osm" });
+    try {
+      const osm = await osmMutation.mutateAsync(args);
+      setOsmResult(osm);
+      setStage({ kind: "ready" });
+      posthog.capture("osm_search_completed", {
+        cached: osm.cached,
+        candidateCount: osm.candidates.length,
+        bboxSource: osm.bboxSource,
+        mirror: osm.mirror,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "OSM search failed.";
+      setStage({ kind: "error", message });
+      posthog.capture("osm_search_failed", { error: message });
+    }
+  }
+
+  const onSubmit = handleSubmit(async (values) => {
+    const location = values.location?.trim() || undefined;
     const radiusMiles = values.radius === "any" ? null : Number(values.radius);
-    mutation.mutate({
-      sceneText: values.sceneText.trim(),
-      location: location || undefined,
-      radiusMiles,
-    });
+
+    setOsmResult(null);
+    setSelectedPinId(undefined);
+    setStage({ kind: "analyzing" });
+
+    try {
+      const parsed = await parseMutation.mutateAsync({
+        sceneText: values.sceneText.trim(),
+        location,
+        radiusMiles,
+      });
+      setParseResult(parsed);
+      posthog.capture("scene_parsed", {
+        cached: parsed.cached,
+        attempts: parsed.attempts,
+        city: parsed.analysis.city,
+        rateLimitRemaining: parsed.rateLimit.remaining,
+      });
+
+      // Chain straight into OSM so the user sees pins on the same click.
+      await runOsmSearch({
+        osmTags: parsed.analysis.osm_tags,
+        location,
+        radiusMiles,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Something went wrong.";
+      setStage({ kind: "error", message });
+      posthog.capture("scene_parse_failed", { error: message });
+    }
   });
 
   function loadSample(sample: (typeof SAMPLES)[number]) {
@@ -261,6 +350,14 @@ export function SceneInputForm({
       posthog.capture("geolocation_failed", { error: message });
     }
   }
+
+  const isBusy = stage.kind === "analyzing" || stage.kind === "searching-osm";
+  const buttonLabel =
+    stage.kind === "analyzing"
+      ? "Analyzing scene…"
+      : stage.kind === "searching-osm"
+        ? "Searching OpenStreetMap…"
+        : "Find locations";
 
   return (
     <div className="space-y-8">
@@ -335,15 +432,13 @@ export function SceneInputForm({
         <div className="flex flex-wrap items-center gap-3">
           <button
             type="submit"
-            disabled={mutation.isPending}
+            disabled={isBusy}
             className="rounded-md bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {mutation.isPending ? "Analyzing…" : "Analyze scene"}
+            {buttonLabel}
           </button>
 
-          <span className="text-xs text-muted-foreground">
-            Try a sample:
-          </span>
+          <span className="text-xs text-muted-foreground">Try a sample:</span>
           {SAMPLES.map((s) => (
             <button
               key={s.label}
@@ -356,17 +451,28 @@ export function SceneInputForm({
           ))}
         </div>
 
-        {serverError && (
+        {stage.kind === "error" && (
           <p className="rounded-md border border-red-500/20 bg-red-500/5 px-3 py-2 text-sm text-red-400">
-            {serverError}
+            {stage.message}
           </p>
         )}
       </form>
 
-      {(mutation.data ?? initialResult) && (
+      {(osmResult ?? (isBusy && parseResult)) && (
+        <ResultsMapPanel
+          osm={osmResult}
+          mapType={mapType}
+          onMapTypeChange={setMapType}
+          selectedPinId={selectedPinId}
+          onPinClick={setSelectedPinId}
+          isSearching={stage.kind === "searching-osm"}
+        />
+      )}
+
+      {parseResult && (
         <AnalysisResultPanel
-          result={mutation.data ?? (initialResult as ParseSceneResponse)}
-          isLoadedFromHistory={!mutation.data && initialResult !== null}
+          result={parseResult}
+          isLoadedFromHistory={isFromHistory && stage.kind !== "ready"}
         />
       )}
     </div>
@@ -374,7 +480,137 @@ export function SceneInputForm({
 }
 
 // ---------------------------------------------------------------------------
-// Result preview (placeholder — replaced by real result UI in M3/M4).
+// Results: map + pin summary
+// ---------------------------------------------------------------------------
+
+function ResultsMapPanel({
+  osm,
+  mapType,
+  onMapTypeChange,
+  selectedPinId,
+  onPinClick,
+  isSearching,
+}: {
+  osm: SearchOsmResponse | null;
+  mapType: MapType;
+  onMapTypeChange: (m: MapType) => void;
+  selectedPinId: string | undefined;
+  onPinClick: (id: string) => void;
+  isSearching: boolean;
+}) {
+  const pins: LocationMapPin[] = osm
+    ? osm.candidates.map((c) => ({
+        id: c.id,
+        lat: c.lat,
+        lng: c.lng,
+        name: c.name ?? toFriendlyTagName(c.tags),
+      }))
+    : [];
+
+  return (
+    <section className="space-y-4 rounded-lg border border-white/10 bg-card p-6">
+      <header className="flex flex-wrap items-center gap-3">
+        <h2 className="text-lg font-semibold">Locations on the map</h2>
+        {osm && (
+          <span
+            className={
+              "rounded-full px-2 py-0.5 text-xs font-medium " +
+              (osm.cached
+                ? "bg-emerald-500/15 text-emerald-300"
+                : "bg-blue-500/15 text-blue-300")
+            }
+          >
+            {osm.cached ? "cached" : "live"}
+          </span>
+        )}
+        {osm && (
+          <span className="text-xs text-muted-foreground">
+            {osm.candidates.length} candidate{osm.candidates.length === 1 ? "" : "s"}
+            {" · "}
+            bbox: {osm.bboxSource.replace("_", " ")}
+          </span>
+        )}
+        {isSearching && (
+          <span className="text-xs text-muted-foreground">Querying OpenStreetMap…</span>
+        )}
+      </header>
+
+      <div className="h-[400px]">
+        <LocationMap
+          pins={pins}
+          bbox={osm?.bbox}
+          mapType={mapType}
+          onMapTypeChange={onMapTypeChange}
+          selectedId={selectedPinId}
+          onPinClick={onPinClick}
+        />
+      </div>
+
+      {osm && osm.candidates.length === 0 && (
+        <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm text-amber-300">
+          No OSM features matched these tags inside the bbox. M4 will fall back to
+          Google Places text search to fill the gap.
+        </p>
+      )}
+
+      {osm && selectedPinId && (
+        <SelectedCandidateInline
+          candidate={osm.candidates.find((c) => c.id === selectedPinId)}
+        />
+      )}
+    </section>
+  );
+}
+
+function SelectedCandidateInline({
+  candidate,
+}: {
+  candidate: OsmCandidate | undefined;
+}) {
+  if (!candidate) return null;
+  const tagPairs = Object.entries(candidate.tags).slice(0, 8);
+  return (
+    <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-4">
+      <div className="flex items-baseline justify-between gap-3">
+        <h3 className="font-medium">
+          {candidate.name ?? toFriendlyTagName(candidate.tags)}
+        </h3>
+        <span className="font-mono text-[10px] text-muted-foreground">{candidate.id}</span>
+      </div>
+      <p className="font-mono text-xs text-muted-foreground">
+        {candidate.lat.toFixed(5)}, {candidate.lng.toFixed(5)}
+      </p>
+      <div className="flex flex-wrap gap-1.5">
+        {tagPairs.map(([k, v]) => (
+          <span
+            key={k}
+            className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-[10px]"
+          >
+            {k}={v}
+          </span>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Name and photos arrive in M4 (Google Places + Mapillary enrichment).
+      </p>
+    </div>
+  );
+}
+
+function toFriendlyTagName(tags: Record<string, string>): string {
+  if (tags.building) return capitalize(tags.building) + " (OSM)";
+  if (tags.amenity) return capitalize(tags.amenity);
+  if (tags.natural) return capitalize(tags.natural);
+  if (tags.landuse) return capitalize(tags.landuse);
+  return "OSM feature";
+}
+
+function capitalize(s: string): string {
+  return s.length > 0 ? s[0]!.toUpperCase() + s.slice(1).replace(/_/g, " ") : s;
+}
+
+// ---------------------------------------------------------------------------
+// Analysis (Claude output) panel
 // ---------------------------------------------------------------------------
 
 function AnalysisResultPanel({
@@ -387,83 +623,86 @@ function AnalysisResultPanel({
   const { analysis, cached, attempts, rateLimit } = result;
 
   return (
-    <section className="space-y-4 rounded-lg border border-white/10 bg-card p-6">
-      <header className="flex flex-wrap items-center gap-3">
-        <h2 className="text-lg font-semibold">Claude analysis</h2>
-        {isLoadedFromHistory ? (
-          <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
-            from history
-          </span>
-        ) : (
-          <span
-            className={
-              "rounded-full px-2 py-0.5 text-xs font-medium " +
-              (cached
-                ? "bg-emerald-500/15 text-emerald-300"
-                : "bg-blue-500/15 text-blue-300")
-            }
-          >
-            {cached ? "cached" : `live · ${attempts} attempt${attempts === 1 ? "" : "s"}`}
-          </span>
-        )}
-        {!isLoadedFromHistory && (
-          <span className="text-xs text-muted-foreground">
-            {rateLimit.used} / {rateLimit.limit} scenes today · resets{" "}
-            {new Date(rateLimit.resetAt).toLocaleTimeString()}
-          </span>
-        )}
-      </header>
-
-      <dl className="grid gap-3 text-sm md:grid-cols-2">
-        <Field label="City" value={analysis.city} />
-        <Field label="Visual" value={analysis.visual} />
-        <Field label="Mood" value={analysis.mood ?? "—"} />
-        <Field label="Time of day" value={analysis.time_of_day ?? "—"} />
-        <Field label="Interior / exterior" value={analysis.interior_exterior ?? "—"} />
-        <Field label="Google query" value={analysis.google_query} />
-      </dl>
-
-      <div className="space-y-1">
-        <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          OSM tags (will drive the Overpass query in M3)
-        </p>
-        <div className="flex flex-wrap gap-1.5">
-          {Object.entries(analysis.osm_tags).map(([k, v]) => (
-            <span
-              key={k}
-              className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
-            >
-              {k}={v}
+    <details className="rounded-lg border border-white/10 bg-card">
+      <summary className="cursor-pointer select-none px-6 py-4 text-sm font-medium">
+        <span className="text-foreground">Claude analysis (scene parse)</span>
+        <span className="ml-3 inline-flex items-center gap-2">
+          {isLoadedFromHistory ? (
+            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-300">
+              from history
             </span>
-          ))}
-        </div>
-      </div>
+          ) : (
+            <span
+              className={
+                "rounded-full px-2 py-0.5 text-xs font-medium " +
+                (cached
+                  ? "bg-emerald-500/15 text-emerald-300"
+                  : "bg-blue-500/15 text-blue-300")
+              }
+            >
+              {cached ? "cached" : `live · ${attempts} attempt${attempts === 1 ? "" : "s"}`}
+            </span>
+          )}
+          {!isLoadedFromHistory && (
+            <span className="text-xs text-muted-foreground">
+              {rateLimit.used} / {rateLimit.limit} today
+            </span>
+          )}
+        </span>
+      </summary>
 
-      {analysis.google_types.length > 0 && (
+      <div className="space-y-4 border-t border-white/5 px-6 py-5">
+        <dl className="grid gap-3 text-sm md:grid-cols-2">
+          <Field label="City" value={analysis.city} />
+          <Field label="Visual" value={analysis.visual} />
+          <Field label="Mood" value={analysis.mood ?? "—"} />
+          <Field label="Time of day" value={analysis.time_of_day ?? "—"} />
+          <Field label="Interior / exterior" value={analysis.interior_exterior ?? "—"} />
+          <Field label="Google query" value={analysis.google_query} />
+        </dl>
+
         <div className="space-y-1">
           <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Google Places types
+            OSM tags (drove the Overpass query)
           </p>
           <div className="flex flex-wrap gap-1.5">
-            {analysis.google_types.map((t) => (
+            {Object.entries(analysis.osm_tags).map(([k, v]) => (
               <span
-                key={t}
+                key={k}
                 className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
               >
-                {t}
+                {k}={v}
               </span>
             ))}
           </div>
         </div>
-      )}
 
-      <details className="text-xs text-muted-foreground">
-        <summary className="cursor-pointer select-none">Raw JSON</summary>
-        <pre className="mt-2 overflow-auto rounded-md bg-black/40 p-3 font-mono text-xs">
-          {JSON.stringify(analysis, null, 2)}
-        </pre>
-      </details>
-    </section>
+        {analysis.google_types.length > 0 && (
+          <div className="space-y-1">
+            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              Google Places types (used in M4)
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {analysis.google_types.map((t) => (
+                <span
+                  key={t}
+                  className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <details className="text-xs text-muted-foreground">
+          <summary className="cursor-pointer select-none">Raw JSON</summary>
+          <pre className="mt-2 overflow-auto rounded-md bg-black/40 p-3 font-mono text-xs">
+            {JSON.stringify(analysis, null, 2)}
+          </pre>
+        </details>
+      </div>
+    </details>
   );
 }
 
