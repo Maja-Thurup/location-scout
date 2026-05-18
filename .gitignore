@@ -71,3 +71,6 @@ prisma/*.db-journal
 
 # --- Plan + skill files (workspace-local research, not for repo) ---
 *.plan.md
+
+# --- Local one-shot scripts (not for repo) ---
+vercel-env-import.ps1
