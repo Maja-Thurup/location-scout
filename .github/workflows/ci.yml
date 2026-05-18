@@ -74,11 +74,5 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      # Build step is intentionally OUT of CI gating right now. The real
-      # production build runs on Vercel against real env values. CI's job
-      # is to catch regressions in code, types, schema, and lint.
-      # When we can pipe real (non-placeholder) Sentry secrets in, we'll
-      # restore this as a real gate.
-      - name: Build (allowed to fail)
+      - name: Build
         run: npm run build
-        continue-on-error: true
