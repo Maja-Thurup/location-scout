@@ -75,4 +75,22 @@ jobs:
         run: npm run typecheck
 
       - name: Build
+        id: build
         run: npm run build
+
+      - name: Capture build failure context
+        if: failure() && steps.build.conclusion == 'failure'
+        run: |
+          echo "::group::Node + npm versions"
+          node --version
+          npm --version
+          echo "::endgroup::"
+          echo "::group::Environment summary"
+          env | grep -E '^(NEXT_PUBLIC|NODE_ENV|CI)=' | sort
+          echo "::endgroup::"
+          echo "::group::package.json scripts"
+          cat package.json | head -40
+          echo "::endgroup::"
+          echo "::group::Last 200 lines of npm debug log (if any)"
+          find $HOME/.npm/_logs -type f -name '*.log' -mtime -1 | head -3 | xargs -I {} tail -200 {}
+          echo "::endgroup::"
