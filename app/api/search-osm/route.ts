@@ -6,7 +6,7 @@ import { type Bbox, bboxFromRadius, bboxCenter, clampBbox, isReasonableBbox } fr
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { forwardGeocode } from "@/lib/geocode";
 import { logger } from "@/lib/logger";
-import { type OsmCandidate, searchOsm } from "@/lib/overpass";
+import { type MatchMode, type OsmCandidate, searchOsm } from "@/lib/overpass";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -57,8 +57,18 @@ type SearchOsmResponse = {
   cached: boolean;
   /** Where the bbox came from: forward-geocoded location, custom radius, or supplied bbox. */
   bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
+  /** Whether all tags matched together, or only the primary classifier. */
+  matchMode: MatchMode;
+  /** Tag the loose-match path used (when matchMode = "primary_only"). */
+  primaryTag: { key: string; value: string } | null;
   /** Mirror that served the live query (null on cache hit). */
   mirror: string | null;
+};
+
+type CachedSearchValue = {
+  candidates: OsmCandidate[];
+  matchMode: MatchMode;
+  primaryTag: { key: string; value: string } | null;
 };
 
 const MAX_BBOX_RADIUS_MILES = 100;
@@ -139,13 +149,14 @@ export const POST = withAuth(async (req) => {
   }
 
   // 2) Cache lookup (14-day TTL).
-  const key = cacheKey("overpass", { bbox, osmTags });
-  const cached = await cacheGet<{ candidates: OsmCandidate[] }>(key);
-  if (cached) {
+  const key = cacheKey("overpass:v2", { bbox, osmTags });
+  const cached = await cacheGet<CachedSearchValue>(key);
+  if (cached?.candidates) {
     logger.info("search-osm cache hit", {
       userId: req.dbUserId,
       ms: Date.now() - t0,
       candidateCount: cached.candidates.length,
+      matchMode: cached.matchMode,
     });
     const response: SearchOsmResponse = {
       bbox,
@@ -153,6 +164,8 @@ export const POST = withAuth(async (req) => {
       candidates: cached.candidates,
       cached: true,
       bboxSource,
+      matchMode: cached.matchMode,
+      primaryTag: cached.primaryTag,
       mirror: null,
     };
     return NextResponse.json(response, { status: 200 });
@@ -178,12 +191,12 @@ export const POST = withAuth(async (req) => {
   }
 
   // 4) Cache.
-  await cacheSet(
-    key,
-    "overpass",
-    { candidates: result.candidates },
-    14,
-  );
+  const toCache: CachedSearchValue = {
+    candidates: result.candidates,
+    matchMode: result.matchMode,
+    primaryTag: result.primaryTag,
+  };
+  await cacheSet(key, "overpass:v2", toCache, 14);
 
   logger.info("search-osm success", {
     userId: req.dbUserId,
@@ -191,6 +204,7 @@ export const POST = withAuth(async (req) => {
     candidateCount: result.candidates.length,
     rawCount: result.rawCount,
     mirror: result.mirror,
+    matchMode: result.matchMode,
   });
 
   const response: SearchOsmResponse = {
@@ -199,6 +213,8 @@ export const POST = withAuth(async (req) => {
     candidates: result.candidates,
     cached: false,
     bboxSource,
+    matchMode: result.matchMode,
+    primaryTag: result.primaryTag,
     mirror: result.mirror,
   };
   return NextResponse.json(response, { status: 200 });

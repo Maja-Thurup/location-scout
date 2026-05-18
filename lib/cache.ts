@@ -11,7 +11,8 @@ export type CacheNamespace =
   | "claude:parse-scene"
   | "claude:vision-score"
   | "geocode"
-  | "overpass"
+  /** Bumped to v2 with the M3+ tiered fallback (strict -> primary-only). */
+  | "overpass:v2"
   | "google:place-details"
   | "google:place-photo"
   | "mapillary:image"

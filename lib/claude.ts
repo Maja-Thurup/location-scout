@@ -79,9 +79,27 @@ Return ONLY a single JSON object, no prose, no code fences. The schema is:
 
 Guidance for fields:
 
-- osm_tags: pick the most diagnostic 1-4 tags. Common useful keys:
-  building, building:material, building:colour, building:levels, abandoned,
-  ruins, historic, amenity, landuse, natural, surface, leisure.
+- osm_tags: pick the 1-2 MOST DIAGNOSTIC tags. Fewer tags = more results.
+  ALWAYS include exactly one classifier (building=*, amenity=*, landuse=*,
+  natural=*, historic=*, leisure=*, shop=*, etc.) as the FIRST entry. Then,
+  ONLY add a second tag if it is essential to the visual brief AND is
+  commonly tagged in OpenStreetMap.
+
+  Common keys: building, amenity, landuse, natural, leisure, historic,
+  shop, tourism, building:material, building:colour, building:levels,
+  abandoned, ruins, surface.
+
+  AVOID adding tags like "abandoned=yes" or "building:material=brick"
+  unless they are absolutely central to the scene. They are sparsely
+  tagged in OSM and will collapse the result set to zero.
+
+  Examples:
+    Scene "abandoned brick warehouse" -> { "building": "warehouse" }
+    Scene "Victorian row house"       -> { "building": "house" }
+    Scene "diner"                     -> { "amenity": "restaurant" }
+    Scene "old stone church"          -> { "building": "church" }
+    Scene "forest with a stream"      -> { "natural": "wood" }
+
   Values must be lowercase, single-word OSM-canonical values
   ("brick" not "Bricks", "warehouse" not "old warehouse").
 - google_query: a short text query a film scout would type, including the city.

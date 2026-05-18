@@ -21,6 +21,14 @@ export type OsmCandidate = {
   name: string | null;
 };
 
+export type MatchMode =
+  /** All osmTags ANDed together matched at least one feature. */
+  | "strict"
+  /** Strict match returned 0; we re-queried with only the primary classifier. */
+  | "primary_only"
+  /** Both attempts returned 0. */
+  | "empty";
+
 export type OverpassSearchResult = {
   candidates: OsmCandidate[];
   /** Total returned by Overpass (may be larger than `candidates.length` if we cap). */
@@ -29,6 +37,10 @@ export type OverpassSearchResult = {
   mirror: string;
   /** Wall-clock ms spent talking to Overpass. */
   elapsedMs: number;
+  /** How strict the matching was (set by `searchOsm`, not `executeOverpass`). */
+  matchMode: MatchMode;
+  /** When matchMode === "primary_only", the single tag we matched on. */
+  primaryTag: { key: string; value: string } | null;
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +266,11 @@ export async function executeOverpass(query: string): Promise<OverpassSearchResu
         rawCount: parsed.data.elements.length,
         mirror,
         elapsedMs: Date.now() - t0,
+        // executeOverpass doesn't know about matching strategy — searchOsm
+        // wraps and assigns matchMode. We default to "strict" here so single-
+        // call use of executeOverpass still satisfies the type.
+        matchMode: "strict",
+        primaryTag: null,
       };
     } catch (err) {
       logger.warn("overpass mirror threw", {
@@ -272,14 +289,97 @@ export async function executeOverpass(query: string): Promise<OverpassSearchResu
   );
 }
 
+// ---------------------------------------------------------------------------
+// Tiered fallback: prefer the strict ALL-tag match; if zero, retry with just
+// the most diagnostic tag so the user always sees *something* relevant.
+// ---------------------------------------------------------------------------
+
+/**
+ * Priority order for picking the "primary" classifier tag when falling back
+ * to a loose match. The first key in this list that appears in `osmTags`
+ * is treated as the primary classifier — usually one of these answers
+ * "what kind of thing is this?".
+ */
+const PRIMARY_KEY_ORDER: ReadonlyArray<string> = [
+  "building",
+  "amenity",
+  "shop",
+  "tourism",
+  "historic",
+  "leisure",
+  "landuse",
+  "natural",
+  "man_made",
+  "highway",
+  "railway",
+  "waterway",
+  "aeroway",
+  "office",
+];
+
+export function pickPrimaryTag(
+  osmTags: OsmTags,
+): { key: string; value: string } | null {
+  for (const k of PRIMARY_KEY_ORDER) {
+    if (k in osmTags && osmTags[k]) {
+      return { key: k, value: osmTags[k]! };
+    }
+  }
+  // Fallback to the first non-empty tag in declaration order.
+  for (const [k, v] of Object.entries(osmTags)) {
+    if (v) return { key: k, value: v };
+  }
+  return null;
+}
+
 /**
  * High-level helper: build query from inputs, execute, return candidates.
+ *
+ * If the strict ALL-tag query returns no results AND multiple tags were
+ * provided, we automatically retry once with just the primary classifier
+ * tag (e.g. "building=warehouse") so the user always gets a starting set
+ * to scan. The result's `matchMode` indicates which path returned data.
  */
 export async function searchOsm(input: {
   bbox: Bbox;
   osmTags: OsmTags;
   limit?: number;
 }): Promise<OverpassSearchResult> {
-  const query = buildOverpassQuery(input);
-  return executeOverpass(query);
+  // Try strict first.
+  const strictQuery = buildOverpassQuery(input);
+  const strictResult = await executeOverpass(strictQuery);
+
+  if (strictResult.candidates.length > 0) {
+    return { ...strictResult, matchMode: "strict", primaryTag: null };
+  }
+
+  const tagCount = Object.keys(input.osmTags).length;
+  if (tagCount <= 1) {
+    // Already tried with just one tag; nothing looser available.
+    return { ...strictResult, matchMode: "empty", primaryTag: null };
+  }
+
+  const primary = pickPrimaryTag(input.osmTags);
+  if (!primary) {
+    return { ...strictResult, matchMode: "empty", primaryTag: null };
+  }
+
+  logger.info("overpass strict match empty, falling back to primary tag only", {
+    primaryKey: primary.key,
+    primaryValue: primary.value,
+    droppedCount: tagCount - 1,
+  });
+
+  const looseQuery = buildOverpassQuery({
+    bbox: input.bbox,
+    osmTags: { [primary.key]: primary.value },
+    limit: input.limit,
+  });
+  const looseResult = await executeOverpass(looseQuery);
+
+  return {
+    ...looseResult,
+    matchMode: looseResult.candidates.length > 0 ? "primary_only" : "empty",
+    primaryTag: primary,
+  };
 }

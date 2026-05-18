@@ -60,6 +60,8 @@ type SearchOsmResponse = {
   candidates: OsmCandidate[];
   cached: boolean;
   bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
+  matchMode: "strict" | "primary_only" | "empty";
+  primaryTag: { key: string; value: string } | null;
   mirror: string | null;
 };
 
@@ -523,6 +525,14 @@ function ResultsMapPanel({
             {osm.cached ? "cached" : "live"}
           </span>
         )}
+        {osm?.matchMode === "primary_only" && (
+          <span
+            title="Strict match (all tags) returned no results, so we relaxed to the primary classifier."
+            className="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300"
+          >
+            loose match
+          </span>
+        )}
         {osm && (
           <span className="text-xs text-muted-foreground">
             {osm.candidates.length} candidate{osm.candidates.length === 1 ? "" : "s"}
@@ -534,6 +544,17 @@ function ResultsMapPanel({
           <span className="text-xs text-muted-foreground">Querying OpenStreetMap…</span>
         )}
       </header>
+
+      {osm?.matchMode === "primary_only" && osm.primaryTag && (
+        <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-200">
+          No exact matches for all OSM tags Claude returned. Showing results that match{" "}
+          <span className="font-mono">
+            {osm.primaryTag.key}={osm.primaryTag.value}
+          </span>{" "}
+          alone. Other tags (e.g. material, abandonment) are sparsely populated in
+          OpenStreetMap and would have left this map empty.
+        </p>
+      )}
 
       <div className="h-[400px]">
         <LocationMap
@@ -548,8 +569,8 @@ function ResultsMapPanel({
 
       {osm && osm.candidates.length === 0 && (
         <p className="rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm text-amber-300">
-          No OSM features matched these tags inside the bbox. M4 will fall back to
-          Google Places text search to fill the gap.
+          No OSM features matched in this area, even after relaxing to the primary tag.
+          M4 will fall back to Google Places text search to fill the gap.
         </p>
       )}
 
