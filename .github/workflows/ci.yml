@@ -74,6 +74,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Unit tests
+        run: npm test
+
       # The build step is non-blocking on CI because CI uses placeholder
       # environment variable values (real secrets only exist on Vercel).
       # The actual production build is gated on Vercel's deploy preview,
