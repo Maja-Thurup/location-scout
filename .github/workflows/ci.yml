@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint, typecheck, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Build-time environment. Real secrets only needed in production.
+      # CI uses synthetic placeholders so the build can complete the env
+      # validation step without exposing real keys.
+      ANTHROPIC_API_KEY: "sk-ant-ci-placeholder"
+      GOOGLE_MAPS_API_KEY: "AIza-ci-placeholder"
+      NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: "AIza-ci-placeholder"
+      MAPILLARY_TOKEN: "MLY|ci|placeholder"
+      DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci"
+      DIRECT_URL: "postgresql://ci:ci@localhost:5432/ci"
+      NEXT_PUBLIC_SUPABASE_URL: "https://ci.supabase.co"
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_ci_placeholder"
+      SUPABASE_SERVICE_ROLE_KEY: "sb_secret_ci_placeholder"
+      CLERK_SECRET_KEY: "sk_test_ci_placeholder"
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_ci_placeholder"
+      NEXT_PUBLIC_CLERK_SIGN_IN_URL: "/sign-in"
+      NEXT_PUBLIC_CLERK_SIGN_UP_URL: "/sign-up"
+      NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL: "/dashboard"
+      NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL: "/dashboard"
+      NEXT_PUBLIC_POSTHOG_KEY: "phc_ci_placeholder"
+      NEXT_PUBLIC_POSTHOG_HOST: "https://us.posthog.com"
+      # Source map upload to Sentry only on real pushes from this repo.
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate Prisma schema
+        run: npx prisma validate
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

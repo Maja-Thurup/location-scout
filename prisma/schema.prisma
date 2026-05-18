@@ -1,0 +1,105 @@
+// LocationScout database schema
+// (c) 2026 Igor Kirko. All rights reserved.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// Application user, mirrored from Clerk.
+model User {
+  id              String   @id @default(cuid())
+  clerkId         String   @unique
+  email           String
+  // "Crew base" used to compute driving distance to candidate locations.
+  // All four are nullable until the user sets it from the dashboard.
+  crewBaseAddress String?
+  crewBaseLat     Float?
+  crewBaseLng     Float?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  projects  Project[]
+  usageLogs UsageLog[]
+
+  @@index([clerkId])
+}
+
+/// A saved scouting session.
+model Project {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  sceneText String   @db.Text
+  city      String
+  /// Claude's structured analysis (osm_tags, google_query, bbox, visual, etc.).
+  analysis  Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  locations SavedLocation[]
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+/// One picked location inside a Project.
+model SavedLocation {
+  id            String   @id @default(cuid())
+  projectId     String
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  // Source-of-truth identifiers
+  googlePlaceId String?
+  osmId         String?
+  // Display data
+  name          String
+  address       String
+  lat           Float
+  lng           Float
+  rating        Float?
+  // Photo metadata (URL only; image bytes are not cached in v1)
+  photoUrl      String?
+  photoSource   String? // "mapillary" | "google" | "wikimedia"
+  photoAttr     String?
+  // Has Street View imagery available
+  hasStreetView Boolean  @default(false)
+  // Free-form user notes
+  notes         String?  @db.Text
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+/// Generic key/value cache with TTL. Keyed by SHA-256 of the request inputs.
+/// Used for Claude scene parsing, Overpass results, Google Places enrichment,
+/// Mapillary photo lookups, Routes API distances.
+model Cache {
+  key       String   @id
+  namespace String
+  value     Json
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([namespace, expiresAt])
+}
+
+/// Per-user, per-day usage counter for rate-limiting on the free tier.
+model UsageLog {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action    String // "parse_scene" | "search_locations" | ...
+  day       String // ISO date (YYYY-MM-DD), used for daily caps
+  count     Int      @default(1)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, action, day])
+  @@index([userId, day])
+}

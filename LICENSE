@@ -1,0 +1,106 @@
+PROPRIETARY SOFTWARE LICENSE
+
+Copyright (c) 2026 Igor Kirko. All Rights Reserved.
+
+================================================================================
+
+This software, including its source code, documentation, design,
+architecture, configuration files, build artifacts, and any associated
+materials (collectively, the "Software"), is the proprietary and
+confidential property of Igor Kirko (the "Author").
+
+NO LICENSE GRANTED
+
+No license, express or implied, is granted by the Author to any party.
+The Software is made publicly viewable on a source-hosting platform
+solely for the purposes of:
+
+    (a) demonstrating the Author's professional capabilities to
+        prospective employers, recruiters, and collaborators; and
+    (b) allowing private code review by such parties.
+
+Public visibility on a hosting platform does not constitute a grant of
+any license, permission, or right to use, copy, reproduce, modify,
+publish, distribute, sublicense, sell, lease, transmit, host, or
+otherwise exploit the Software in any manner or for any purpose.
+
+PROHIBITED USES
+
+Without prior, express, written permission from the Author, you may NOT:
+
+    1.  Copy, clone, fork, mirror, archive, or otherwise reproduce
+        the Software, in whole or in part, except as automatically and
+        ephemerally performed by your web browser when viewing the
+        repository for the permitted review purposes above.
+
+    2.  Modify, adapt, translate, port, or create derivative works
+        of the Software, in whole or in part.
+
+    3.  Distribute, publish, sublicense, sell, rent, lease, lend, or
+        otherwise transfer the Software or any derivative work thereof
+        to any third party.
+
+    4.  Use the Software, or any portion thereof, for any commercial
+        purpose or for the benefit of any third party.
+
+    5.  Use the Software, or any portion thereof, as training data,
+        fine-tuning data, evaluation data, retrieval data, or any
+        other input to any artificial intelligence, machine learning,
+        large language model, or generative model system.
+
+    6.  Reverse engineer, decompile, disassemble, or otherwise attempt
+        to derive the underlying ideas, algorithms, structure, or
+        organization of the Software beyond what is necessary for the
+        permitted review purposes.
+
+    7.  Remove, alter, or obscure any copyright notice, trademark
+        notice, license notice, or other proprietary marking
+        contained in the Software.
+
+    8.  Use the Author's name, likeness, or trademarks in any
+        promotional or commercial context without prior, express,
+        written consent.
+
+LIMITED PORTFOLIO REVIEW PERMISSION
+
+The Author grants the public a narrow, non-transferable, revocable,
+non-exclusive permission to view the source code of the Software via
+its public source-hosting URL, and to retain temporary local copies
+created automatically by web browsers, source-hosting platform user
+interfaces, and standard developer tooling, solely while reviewing the
+Software for the purposes of (a) and (b) above. This permission does
+not extend to any of the Prohibited Uses enumerated above.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+NONINFRINGEMENT. THE AUTHOR DISCLAIMS ALL LIABILITY FOR ANY DAMAGES,
+DIRECT OR INDIRECT, ARISING FROM ACCESS TO OR USE OF THE SOFTWARE.
+
+LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+
+ENFORCEMENT
+
+The Author reserves all rights not expressly granted herein, including
+without limitation the right to pursue takedowns under the Digital
+Millennium Copyright Act ("DMCA") or analogous laws in any
+jurisdiction, and to seek injunctive relief and damages for any
+violation of this License.
+
+CONTACT
+
+For licensing inquiries, partnership requests, or written permission
+to perform any otherwise prohibited use, please contact:
+
+    Igor Kirko
+    igorkirko@gmail.com
+
+================================================================================
+End of License.
