@@ -89,8 +89,10 @@ Guidance for fields:
   (https://developers.google.com/maps/documentation/places/web-service/place-types).
   Examples: storage, warehouse, restaurant, cafe, bar, lodging,
   movie_theater, museum, library, church, park, parking. Empty array is fine.
-- city: canonical "City, ST" form. If the user provided a city, normalize it
-  (e.g. "brooklyn" -> "Brooklyn, NY"). If no city was given and the scene
+- city: canonical "City, ST" form derived from the user's location hint. The
+  hint may be a city ("Brooklyn"), city+state ("Brooklyn, NY"), neighborhood
+  ("Williamsburg"), or street address. Always normalize to the underlying
+  "City, ST" the location belongs to. If no hint was given and the scene
   text implies one, use it; otherwise fall back to a sensible US city
   matching the mood (LA, NYC, Atlanta, ...).
 - visual: 1-2 short phrases capturing what a candidate photo should show.
@@ -197,7 +199,12 @@ function getClient(): Anthropic {
 
 export type AnalyzeSceneInput = {
   sceneText: string;
-  city?: string;
+  /**
+   * Free-text location hint from the user. Can be a city, "City, State",
+   * neighborhood, or full street address. Claude is told to canonicalize it
+   * into a City, ST form for downstream geocoding.
+   */
+  location?: string;
 };
 
 export type AnalyzeSceneResult = {
@@ -209,8 +216,10 @@ export type AnalyzeSceneResult = {
 const ANALYZE_TIMEOUT_MS = 30_000;
 
 function buildUserMessage(input: AnalyzeSceneInput): string {
-  const cityHint = input.city ? `\n\nCity hint (canonicalize): ${input.city}` : "";
-  return `Scene description:\n${input.sceneText.trim()}${cityHint}`;
+  const locHint = input.location
+    ? `\n\nLocation hint (canonicalize to City, ST): ${input.location}`
+    : "";
+  return `Scene description:\n${input.sceneText.trim()}${locHint}`;
 }
 
 async function callClaude(

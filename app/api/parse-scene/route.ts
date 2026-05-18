@@ -11,15 +11,33 @@ import { checkRateLimit, incrementUsage } from "@/lib/ratelimit";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Allowed radii. `null` (or absent) means "use the location's natural area"
+// (we'll fall back to the geocoded bbox in M3).
+const ALLOWED_RADII = [5, 10, 25, 50, 100] as const;
+
 const requestSchema = z.object({
   sceneText: z.string().min(10, "Scene description is too short").max(20_000),
-  city: z.string().min(2).max(120).optional(),
+  /** Free-text location: city, "neighborhood, state", or street address. */
+  location: z.string().min(2).max(160).optional(),
+  /** Search radius in miles, or null/absent to use the location's bbox. */
+  radiusMiles: z
+    .number()
+    .int()
+    .refine((v) => (ALLOWED_RADII as readonly number[]).includes(v), {
+      message: `radiusMiles must be one of ${ALLOWED_RADII.join(", ")}`,
+    })
+    .nullable()
+    .optional(),
 });
 
 type ParseSceneResponse = {
   analysis: SceneAnalysis;
   cached: boolean;
   attempts: number;
+  echo: {
+    location: string | null;
+    radiusMiles: number | null;
+  };
   rateLimit: {
     used: number;
     limit: number;
@@ -31,7 +49,8 @@ type ParseSceneResponse = {
 async function recordHistory(args: {
   userId: string;
   sceneText: string;
-  city?: string;
+  location?: string;
+  radiusMiles?: number | null;
   analysis: SceneAnalysis;
   fromCache: boolean;
 }): Promise<void> {
@@ -40,7 +59,8 @@ async function recordHistory(args: {
       data: {
         userId: args.userId,
         sceneText: args.sceneText,
-        city: args.city ?? null,
+        city: args.location ?? null,
+        radiusMiles: args.radiusMiles ?? null,
         analysis: args.analysis as never,
         cached: args.fromCache,
       },
@@ -77,10 +97,16 @@ export const POST = withAuth(async (req) => {
       { status: 400 },
     );
   }
-  const { sceneText, city } = parsed.data;
+  const { sceneText, location, radiusMiles } = parsed.data;
 
   // 2) Cache lookup (cache hits do NOT consume the rate-limit quota).
-  const key = cacheKey("claude:parse-scene", { sceneText, city: city ?? "" });
+  // Radius is part of the cache key so radius changes get a fresh analysis;
+  // for now Claude doesn't use it, but future versions may.
+  const key = cacheKey("claude:parse-scene", {
+    sceneText,
+    location: location ?? "",
+    radiusMiles: radiusMiles ?? null,
+  });
   const cached = await cacheGet<{ analysis: SceneAnalysis; attempts: number }>(key);
 
   if (cached) {
@@ -88,19 +114,22 @@ export const POST = withAuth(async (req) => {
     await recordHistory({
       userId: req.dbUserId,
       sceneText,
-      city,
+      location,
+      radiusMiles,
       analysis: cached.analysis,
       fromCache: true,
     });
     logger.info("parse-scene cache hit", {
       userId: req.dbUserId,
       ms: Date.now() - t0,
-      city,
+      location,
+      radiusMiles,
     });
     const response: ParseSceneResponse = {
       analysis: cached.analysis,
       cached: true,
       attempts: cached.attempts,
+      echo: { location: location ?? null, radiusMiles: radiusMiles ?? null },
       rateLimit: {
         used: rl.used,
         limit: rl.limit,
@@ -137,7 +166,7 @@ export const POST = withAuth(async (req) => {
   // 4) Call Claude.
   let analysisResult;
   try {
-    analysisResult = await analyzeScene({ sceneText, city });
+    analysisResult = await analyzeScene({ sceneText, location });
   } catch (err) {
     logger.error("parse-scene Claude call failed", {
       userId: req.dbUserId,
@@ -168,7 +197,8 @@ export const POST = withAuth(async (req) => {
   await recordHistory({
     userId: req.dbUserId,
     sceneText,
-    city,
+    location,
+    radiusMiles,
     analysis: analysisResult.analysis,
     fromCache: false,
   });
@@ -184,6 +214,7 @@ export const POST = withAuth(async (req) => {
     analysis: analysisResult.analysis,
     cached: false,
     attempts: analysisResult.attempts,
+    echo: { location: location ?? null, radiusMiles: radiusMiles ?? null },
     rateLimit: {
       used: post.used,
       limit: post.limit,

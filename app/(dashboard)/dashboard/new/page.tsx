@@ -30,7 +30,9 @@ export default async function NewScoutPage({
       {historyEntry && (
         <div className="flex items-center justify-between gap-4 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm">
           <span className="text-emerald-300">
-            Loaded from your history{historyEntry.city ? ` · ${historyEntry.city}` : ""}.
+            Loaded from your history
+            {historyEntry.location ? ` · ${historyEntry.location}` : ""}
+            {historyEntry.radiusMiles ? ` · within ${historyEntry.radiusMiles} mi` : ""}.
           </span>
           <Link
             href="/dashboard/new"
@@ -43,7 +45,12 @@ export default async function NewScoutPage({
 
       <SceneInputForm
         initialSceneText={historyEntry?.sceneText ?? ""}
-        initialCity={historyEntry?.city ?? ""}
+        initialLocation={historyEntry?.location ?? ""}
+        initialRadius={
+          historyEntry?.radiusMiles == null
+            ? "any"
+            : (historyEntry.radiusMiles as 5 | 10 | 25 | 50 | 100)
+        }
         initialAnalysis={historyEntry?.analysis ?? null}
       />
     </div>
@@ -54,7 +61,12 @@ async function loadHistoryForUser(historyId: string) {
   const { dbUserId } = await requireDbUser();
   const row = await prisma.searchHistory.findFirst({
     where: { id: historyId, userId: dbUserId },
-    select: { sceneText: true, city: true, analysis: true },
+    select: {
+      sceneText: true,
+      city: true,
+      radiusMiles: true,
+      analysis: true,
+    },
   });
   if (!row) return null;
 
@@ -63,7 +75,8 @@ async function loadHistoryForUser(historyId: string) {
   const parsed = sceneAnalysisSchema.safeParse(row.analysis);
   return {
     sceneText: row.sceneText,
-    city: row.city,
+    location: row.city, // column name is `city` for migration continuity; semantically a location string
+    radiusMiles: row.radiusMiles,
     analysis: parsed.success ? parsed.data : null,
   };
 }

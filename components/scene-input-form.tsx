@@ -13,16 +13,27 @@ import type { SceneAnalysis } from "@/lib/claude";
 // Form schema (client-side validation; mirrors the server's stricter check).
 // ---------------------------------------------------------------------------
 
+const RADIUS_OPTIONS = [
+  { value: 5, label: "5 miles" },
+  { value: 10, label: "10 miles" },
+  { value: 25, label: "25 miles" },
+  { value: 50, label: "50 miles" },
+  { value: 100, label: "100 miles" },
+] as const;
+
+type RadiusValue = (typeof RADIUS_OPTIONS)[number]["value"] | "any";
+
 const formSchema = z.object({
   sceneText: z
     .string()
     .min(10, "At least 10 characters please.")
     .max(20_000, "Keep it under 20,000 characters."),
-  city: z
+  location: z
     .string()
-    .max(120, "City is too long.")
+    .max(160, "Location is too long.")
     .optional()
     .transform((v) => (v === "" ? undefined : v)),
+  radius: z.enum(["any", "5", "10", "25", "50", "100"]).default("any"),
 });
 
 type FormValues = z.input<typeof formSchema>;
@@ -40,9 +51,11 @@ type ParseSceneResponse = {
 
 type ApiError = { error: string; message?: string };
 
-async function parseSceneRequest(
-  input: { sceneText: string; city?: string },
-): Promise<ParseSceneResponse> {
+async function parseSceneRequest(input: {
+  sceneText: string;
+  location?: string;
+  radiusMiles: number | null;
+}): Promise<ParseSceneResponse> {
   const res = await fetch("/api/parse-scene", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -55,28 +68,72 @@ async function parseSceneRequest(
   return (await res.json()) as ParseSceneResponse;
 }
 
+type ReverseGeocodeResponse = {
+  label: string;
+  fullLabel: string;
+  lat: number;
+  lng: number;
+};
+
+async function reverseGeocodeRequest(
+  lat: number,
+  lng: number,
+): Promise<ReverseGeocodeResponse> {
+  const res = await fetch("/api/reverse-geocode", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ lat, lng }),
+  });
+  if (!res.ok) {
+    throw new Error(`Couldn't resolve your location (HTTP ${res.status}).`);
+  }
+  return (await res.json()) as ReverseGeocodeResponse;
+}
+
+function browserGeolocate(): Promise<GeolocationPosition> {
+  return new Promise((resolve, reject) => {
+    if (!("geolocation" in navigator)) {
+      reject(new Error("Your browser doesn't support geolocation."));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(resolve, reject, {
+      enableHighAccuracy: false,
+      maximumAge: 60_000,
+      timeout: 10_000,
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Sample prompts (also exercises caching on second click of the same one).
 // ---------------------------------------------------------------------------
 
-const SAMPLES: ReadonlyArray<{ label: string; sceneText: string; city?: string }> = [
+const SAMPLES: ReadonlyArray<{
+  label: string;
+  sceneText: string;
+  location?: string;
+  radius?: RadiusValue;
+}> = [
   {
     label: "Abandoned Brooklyn warehouse",
     sceneText:
       "Late-night fight scene inside an abandoned brick warehouse with broken windows and exposed steel beams. Single overhead practical light, puddles on the floor.",
-    city: "Brooklyn, NY",
+    location: "Brooklyn, NY",
+    radius: 25,
   },
   {
     label: "Diner conversation, NYC",
     sceneText:
       "Two characters in a corner booth of a 24-hour diner. Neon glow from outside, chrome stools at the counter, formica tabletops. Late-night conversation.",
-    city: "New York, NY",
+    location: "New York, NY",
+    radius: 10,
   },
   {
     label: "Atlanta back-porch dusk",
     sceneText:
       "Quiet conversation on the back porch of a small bungalow. Wooden porch swing, peeling white paint, dense overgrown yard, fireflies, golden-hour sky.",
-    city: "Atlanta, GA",
+    location: "Atlanta, GA",
+    radius: 50,
   },
 ];
 
@@ -87,18 +144,23 @@ const SAMPLES: ReadonlyArray<{ label: string; sceneText: string; city?: string }
 export type SceneInputFormProps = {
   /** Optional starting scene text (e.g. when loading from search history). */
   initialSceneText?: string;
-  /** Optional starting city. */
-  initialCity?: string;
+  /** Optional starting location (free text: city, area, or address). */
+  initialLocation?: string;
+  /** Optional starting radius in miles, or "any" for the city's natural bbox. */
+  initialRadius?: RadiusValue;
   /** Optional pre-existing analysis to render below the form on first paint. */
   initialAnalysis?: SceneAnalysis | null;
 };
 
 export function SceneInputForm({
   initialSceneText = "",
-  initialCity = "",
+  initialLocation = "",
+  initialRadius = "any",
   initialAnalysis = null,
 }: SceneInputFormProps) {
   const [serverError, setServerError] = useState<string | null>(null);
+  const [geoStatus, setGeoStatus] = useState<"idle" | "locating" | "error">("idle");
+  const [geoError, setGeoError] = useState<string | null>(null);
 
   // If we hydrated with a previous analysis, surface it as the initial
   // result panel state. Once the user runs a fresh search the mutation's
@@ -129,7 +191,11 @@ export function SceneInputForm({
     formState: { errors },
   } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    defaultValues: { sceneText: initialSceneText, city: initialCity },
+    defaultValues: {
+      sceneText: initialSceneText,
+      location: initialLocation,
+      radius: typeof initialRadius === "number" ? (String(initialRadius) as FormValues["radius"]) : "any",
+    },
   });
 
   const mutation = useMutation({
@@ -153,15 +219,47 @@ export function SceneInputForm({
   const charCount = sceneText?.length ?? 0;
 
   const onSubmit = handleSubmit((values) => {
+    const location = values.location?.trim();
+    const radiusMiles = values.radius === "any" ? null : Number(values.radius);
     mutation.mutate({
       sceneText: values.sceneText.trim(),
-      city: values.city?.trim() ? values.city.trim() : undefined,
+      location: location || undefined,
+      radiusMiles,
     });
   });
 
   function loadSample(sample: (typeof SAMPLES)[number]) {
     setValue("sceneText", sample.sceneText, { shouldValidate: true });
-    setValue("city", sample.city ?? "", { shouldValidate: true });
+    setValue("location", sample.location ?? "", { shouldValidate: true });
+    if (sample.radius !== undefined) {
+      setValue(
+        "radius",
+        sample.radius === "any" ? "any" : (String(sample.radius) as FormValues["radius"]),
+        { shouldValidate: true },
+      );
+    }
+  }
+
+  async function handleUseMyLocation() {
+    setGeoStatus("locating");
+    setGeoError(null);
+    try {
+      const pos = await browserGeolocate();
+      const result = await reverseGeocodeRequest(pos.coords.latitude, pos.coords.longitude);
+      setValue("location", result.label, { shouldValidate: true });
+      setGeoStatus("idle");
+      posthog.capture("geolocation_used", { label: result.label });
+    } catch (err) {
+      const message =
+        err instanceof GeolocationPositionError
+          ? geolocationErrorMessage(err)
+          : err instanceof Error
+            ? err.message
+            : "Couldn't fetch your location.";
+      setGeoError(message);
+      setGeoStatus("error");
+      posthog.capture("geolocation_failed", { error: message });
+    }
   }
 
   return (
@@ -186,18 +284,52 @@ export function SceneInputForm({
           )}
         </div>
 
-        <div className="space-y-2">
-          <label htmlFor="city" className="text-sm font-medium">
-            City <span className="text-muted-foreground">(optional)</span>
-          </label>
-          <input
-            id="city"
-            type="text"
-            placeholder="Brooklyn, NY"
-            className="w-full rounded-md border border-white/10 bg-card px-3 py-2 text-sm shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
-            {...register("city")}
-          />
-          {errors.city && <p className="text-xs text-red-400">{errors.city.message}</p>}
+        <div className="grid gap-4 sm:grid-cols-[1fr_auto]">
+          <div className="space-y-2">
+            <div className="flex items-baseline justify-between">
+              <label htmlFor="location" className="text-sm font-medium">
+                Location <span className="text-muted-foreground">(optional)</span>
+              </label>
+              <button
+                type="button"
+                onClick={handleUseMyLocation}
+                disabled={geoStatus === "locating"}
+                className="text-xs text-primary transition hover:text-primary/80 disabled:opacity-50"
+              >
+                {geoStatus === "locating" ? "Locating…" : "Use my location"}
+              </button>
+            </div>
+            <input
+              id="location"
+              type="text"
+              placeholder="City, state, neighborhood, or address (e.g. Brooklyn, NY)"
+              autoComplete="off"
+              className="w-full rounded-md border border-white/10 bg-card px-3 py-2 text-sm shadow-sm outline-none transition placeholder:text-muted-foreground focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
+              {...register("location")}
+            />
+            {errors.location && (
+              <p className="text-xs text-red-400">{errors.location.message}</p>
+            )}
+            {geoError && <p className="text-xs text-amber-400">{geoError}</p>}
+          </div>
+
+          <div className="space-y-2">
+            <label htmlFor="radius" className="text-sm font-medium">
+              Within
+            </label>
+            <select
+              id="radius"
+              className="w-full rounded-md border border-white/10 bg-card px-3 py-2 text-sm shadow-sm outline-none transition focus:border-primary/50 focus:ring-1 focus:ring-primary/30 sm:w-40"
+              {...register("radius")}
+            >
+              <option value="any">The city/area</option>
+              {RADIUS_OPTIONS.map((opt) => (
+                <option key={opt.value} value={String(opt.value)}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -344,4 +476,17 @@ function Field({ label, value }: { label: string; value: string }) {
       <dd className="mt-0.5 text-sm">{value}</dd>
     </div>
   );
+}
+
+function geolocationErrorMessage(err: GeolocationPositionError): string {
+  switch (err.code) {
+    case err.PERMISSION_DENIED:
+      return "Permission denied. Allow location access in your browser to use this.";
+    case err.POSITION_UNAVAILABLE:
+      return "Couldn't determine your position right now. Try again in a moment.";
+    case err.TIMEOUT:
+      return "Location request timed out. Try again.";
+    default:
+      return "Couldn't fetch your location.";
+  }
 }

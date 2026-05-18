@@ -16,6 +16,7 @@ export default async function DashboardPage() {
       id: true,
       sceneText: true,
       city: true,
+      radiusMiles: true,
       cached: true,
       createdAt: true,
       analysis: true,
@@ -92,10 +93,15 @@ export default async function DashboardPage() {
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">
-                          {s.city ?? extractCityFromAnalysis(s.analysis) ?? "Unspecified city"}
+                          {s.city ?? extractCityFromAnalysis(s.analysis) ?? "Unspecified location"}
                         </span>
+                        {s.radiusMiles != null && (
+                          <span className="rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                            within {s.radiusMiles} mi
+                          </span>
+                        )}
                         {s.cached && (
                           <span className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
                             cached

@@ -96,16 +96,22 @@ model Cache {
 /// dashboard. Distinct from `Project` (M5), which is an explicit save with
 /// a user-chosen title and attached locations.
 model SearchHistory {
-  id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  sceneText String   @db.Text
-  city      String?
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sceneText    String   @db.Text
+  /// Free-text location input from the user (city, "neighborhood, state",
+  /// or street address). Column name kept as `city` for migration
+  /// continuity but treated as a generic location string in the API.
+  city         String?
+  /// Optional search radius around the location, in miles. `null` means
+  /// "use the city/area's natural bounding box" (set by Geocoding API).
+  radiusMiles  Int?
   /// Claude's structured analysis at the time of this search.
-  analysis  Json
+  analysis     Json
   /// Whether this row was served from cache (true) or live Claude call (false).
-  cached    Boolean  @default(false)
-  createdAt DateTime @default(now())
+  cached       Boolean  @default(false)
+  createdAt    DateTime @default(now())
 
   @@index([userId, createdAt])
 }
