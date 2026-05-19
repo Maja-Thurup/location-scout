@@ -74,3 +74,7 @@ prisma/*.db-journal
 
 # --- Local one-shot scripts (not for repo) ---
 vercel-env-import.ps1
+
+# --- Throwaway commit-message scratch files used by Windows shell ---
+.commit-msg.txt
+.commit-message.txt
