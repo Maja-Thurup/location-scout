@@ -157,25 +157,131 @@ function hslToColorWord(h: number, s: number, l: number): ColorWord {
 // Color words found in a scene description
 // ---------------------------------------------------------------------------
 
+/**
+ * Subject-attached color patterns. The color must be adjacent to a SUBJECT
+ * NOUN (building, house, barn, wall, facade, ...) or appear as a "X-painted"
+ * / "X-colored" prefix. This avoids matching background colors like
+ * "framed by green space" or "blue sky".
+ *
+ * The previous implementation matched any color word anywhere in the text,
+ * which produced a green-color filter for any scene that mentioned trees,
+ * grass, or "green space" — exactly the bug that wrecked the
+ * "horse statue in green park" search.
+ */
+const SUBJECT_NOUN_GROUP =
+  "(?:building|buildings|house|houses|home|cottage|cabin|barn|shed|warehouse|factory|farmhouse|townhouse|mansion|chateau|villa|church|chapel|cathedral|tower|wall|walls|facade|fa[çc]ade|roof|door|window|paint|painted|colou?red|brick|bricks|stone|wood|wooden|timber|siding|trim|exterior|tile|tiles|tiled|column|columns|awning|awnings|dome|domes|spire|spires|gate|gates|gateway|fence|fences|mill|silo|lighthouse|pillar|pillars|post|posts)";
+
 const COLOR_PATTERNS: ReadonlyArray<{ word: ColorWord; pattern: RegExp }> = [
-  { word: "red", pattern: /\b(red|crimson|scarlet|burgundy|maroon)\b/i },
-  { word: "orange", pattern: /\b(orange|terracotta|rust|copper)\b/i },
-  { word: "yellow", pattern: /\b(yellow|gold(?:en)?|amber|mustard|cream|beige|tan|sand|sandstone)\b/i },
-  { word: "green", pattern: /\b(green|olive|emerald|sage|forest|mint)\b/i },
-  { word: "blue", pattern: /\b(blue|navy|azure|cobalt|teal)\b/i },
-  { word: "purple", pattern: /\b(purple|violet|lavender|mauve|plum)\b/i },
-  { word: "pink", pattern: /\b(pink|rose|salmon|coral)\b/i },
-  { word: "brown", pattern: /\b(brown|chocolate|tan(?: building)?|wood(?:en)?|brick(?:work)?)\b/i },
-  { word: "grey", pattern: /\b(gr[ae]y|silver|charcoal|ash|stone(?:-grey)?|concrete)\b/i },
-  { word: "black", pattern: /\b(black|jet|onyx)\b/i },
-  { word: "white", pattern: /\b(white|ivory|off-white|cream(?:-?white)?|chalk)\b/i },
+  // Each pattern matches "<color> <subject-noun>" OR "<color>-<adjective>"
+  // (e.g. "red-painted", "blue-walled", "green-roofed").
+  {
+    word: "red",
+    pattern: new RegExp(
+      `\\b(red|crimson|scarlet|burgundy|maroon)(?:[- ]painted|[- ]colou?red|[- ]walled|[- ]roofed|[- ]tiled|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "orange",
+    pattern: new RegExp(
+      `\\b(orange|terracotta|rust|copper)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "yellow",
+    pattern: new RegExp(
+      `\\b(yellow|gold(?:en)?|amber|mustard|cream|beige|tan|sand|sandstone)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "green",
+    pattern: new RegExp(
+      `\\b(green|olive|emerald|sage|mint)(?:[- ]painted|[- ]colou?red|[- ]walled|[- ]roofed|[- ]tiled|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "blue",
+    pattern: new RegExp(
+      `\\b(blue|navy|azure|cobalt|teal)(?:[- ]painted|[- ]colou?red|[- ]walled|[- ]roofed|[- ]tiled|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "purple",
+    pattern: new RegExp(
+      `\\b(purple|violet|lavender|mauve|plum)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "pink",
+    pattern: new RegExp(
+      `\\b(pink|rose|salmon|coral)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "brown",
+    pattern: new RegExp(
+      `\\b(brown|chocolate)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "grey",
+    pattern: new RegExp(
+      `\\b(gr[ae]y|silver|charcoal|ash|concrete)(?:[- ]painted|[- ]colou?red|[- ]walled|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "black",
+    pattern: new RegExp(
+      `\\b(black|jet|onyx)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
+  {
+    word: "white",
+    pattern: new RegExp(
+      `\\b(white|ivory|off-white|chalk)(?:[- ]painted|[- ]colou?red|\\s+${SUBJECT_NOUN_GROUP})`,
+      "i",
+    ),
+  },
 ];
 
-/** Find the first color word mentioned in `text`. Returns null when none. */
+/**
+ * Background phrases that should never trigger a subject-color filter,
+ * even if a color word appears nearby. This is a defense-in-depth
+ * blacklist on top of the subject-attachment requirement above.
+ */
+const BACKGROUND_PHRASE_RE =
+  /\b(green\s+(?:space|grass|lawn|meadow|park|field|landscape|foliage)|blue\s+(?:sky|water|ocean|sea|lake|river)|white\s+(?:snow|sky|clouds?)|forest|trees|woods?|grass|meadow|sky|clouds?|garden|hills?)\b/i;
+
+/**
+ * Find the first SUBJECT color word mentioned in `text`. Returns null when
+ * the text only mentions background colors (sky/grass/trees/...).
+ *
+ * IMPORTANT: callers should pass the user's RAW scene text, NOT Claude's
+ * `visual` prose. Claude tends to weave background colors into its visual
+ * description ("framed by green space"), and that's exactly the false
+ * positive we want to avoid.
+ */
 export function parseColorFromVisual(text: string | null | undefined): ColorWord | null {
   if (!text) return null;
   for (const { word, pattern } of COLOR_PATTERNS) {
-    if (pattern.test(text)) return word;
+    const m = pattern.exec(text);
+    if (!m) continue;
+    // If the match overlaps a known background phrase, skip it.
+    const matchedSlice = text.slice(
+      Math.max(0, m.index - 8),
+      Math.min(text.length, m.index + m[0].length + 8),
+    );
+    if (BACKGROUND_PHRASE_RE.test(matchedSlice)) continue;
+    return word;
   }
   return null;
 }

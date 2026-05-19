@@ -235,6 +235,10 @@ async function enrichLocationsRequest(input: {
   searchBbox?: { south: number; west: number; north: number; east: number };
   includeClosed?: boolean;
   sceneDescription: string;
+  /** Raw user-typed scene text, kept separate from Claude's `visual` so
+   *  the color filter doesn't read background-color words from Claude's
+   *  prose. */
+  sceneText?: string;
   sceneTokens?: ReadonlyArray<string>;
   antiTokens?: ReadonlyArray<string>;
   visionScoreLimit?: number;
@@ -502,6 +506,7 @@ export function SceneInputForm({
         searchBbox: osm.bbox,
         includeClosed,
         sceneDescription,
+        sceneText: sceneText.trim(),
         sceneTokens,
         antiTokens: analysis.anti_tokens ?? [],
         visionScoreLimit: 10,

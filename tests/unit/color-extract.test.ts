@@ -8,6 +8,13 @@ import {
 
 // ---------------------------------------------------------------------------
 // parseColorFromVisual
+//
+// The matcher is INTENTIONALLY strict: a color word must be attached to a
+// subject noun (building, house, wall, paint, ...) OR appear as a hyphenated
+// adjective (`yellow-painted`, `red-walled`). This is the fix for the
+// horse-statue bug where "framed by green space" / "in a green park"
+// triggered a green color filter and threw out every actually-matching
+// candidate.
 // ---------------------------------------------------------------------------
 
 describe("parseColorFromVisual", () => {
@@ -17,38 +24,81 @@ describe("parseColorFromVisual", () => {
     expect(parseColorFromVisual("")).toBeNull();
   });
 
-  it("identifies primary colors", () => {
+  it("identifies subject-attached colors", () => {
     expect(parseColorFromVisual("a yellow building")).toBe("yellow");
     expect(parseColorFromVisual("dark blue facade")).toBe("blue");
-    expect(parseColorFromVisual("vivid red bricks")).toBe("red");
-    expect(parseColorFromVisual("dense green forest")).toBe("green");
-    expect(parseColorFromVisual("violet mood")).toBe("purple");
+    expect(parseColorFromVisual("vivid red brick")).toBe("red");
+    expect(parseColorFromVisual("an old blue house")).toBe("blue");
+    expect(parseColorFromVisual("white-painted cottage")).toBe("white");
+    expect(parseColorFromVisual("a red-roofed church")).toBe("red");
   });
 
-  it("recognizes color synonyms", () => {
+  it("recognizes color synonyms when subject-attached", () => {
     expect(parseColorFromVisual("a golden facade")).toBe("yellow");
     expect(parseColorFromVisual("burgundy door")).toBe("red");
-    expect(parseColorFromVisual("a teal awning")).toBe("blue");
-    expect(parseColorFromVisual("ivory column")).toBe("white");
+    expect(parseColorFromVisual("ivory wall")).toBe("white");
     expect(parseColorFromVisual("charcoal exterior")).toBe("grey");
     expect(parseColorFromVisual("salmon walls")).toBe("pink");
     expect(parseColorFromVisual("mustard paint job")).toBe("yellow");
   });
 
-  it("returns the first color when multiple are mentioned", () => {
-    // Pattern order goes red→orange→yellow→green→blue→purple→pink→brown→grey→black→white
-    // so 'green' beats 'red' would be wrong; 'red' is checked first.
-    expect(parseColorFromVisual("a red and blue building")).toBe("red");
+  // -------------------------------------------------------------------------
+  // BUG REGRESSION TESTS — the cases that were producing junk results
+  // -------------------------------------------------------------------------
+
+  it("does NOT fire on background-color phrases (the horse-statue bug)", () => {
+    // The exact prompt that ate our search results.
+    expect(
+      parseColorFromVisual("A big statue of a horse in the middle of the park"),
+    ).toBeNull();
+    // Claude's "visual" prose for the same prompt.
+    expect(
+      parseColorFromVisual(
+        "Bronze equestrian statue framed by green space and trees",
+      ),
+    ).toBeNull();
+    // Other common background-color phrasings.
+    expect(parseColorFromVisual("framed by green space")).toBeNull();
+    expect(parseColorFromVisual("trees and lush green lawn")).toBeNull();
+    expect(parseColorFromVisual("blue sky overhead")).toBeNull();
+    expect(parseColorFromVisual("white snow on the ground")).toBeNull();
+    expect(parseColorFromVisual("the forest behind it")).toBeNull();
   });
 
-  it("ignores color words inside other words", () => {
-    expect(parseColorFromVisual("Dark Knight")).toBeNull(); // 'Dark' isn't in our list
-    expect(parseColorFromVisual("amber alert")).toBe("yellow"); // 'amber' is a yellow synonym
+  it("does NOT fire on bare color words without a subject", () => {
+    expect(parseColorFromVisual("violet mood")).toBeNull();
+    expect(parseColorFromVisual("amber alert")).toBeNull();
+    expect(parseColorFromVisual("Dark Knight")).toBeNull();
+    // "green park" is just describing the surroundings, not a green subject.
+    expect(parseColorFromVisual("a horse in a green park")).toBeNull();
+  });
+
+  it("DOES fire on subject-attached colors even with background prose nearby", () => {
+    // "old blue building" with "trees in the back" — the user's M3 prompt.
+    expect(
+      parseColorFromVisual(
+        "an old blue building outside of town with trees in the back",
+      ),
+    ).toBe("blue");
+    // Subject takes precedence over background.
+    expect(
+      parseColorFromVisual("yellow farmhouse against blue sky"),
+    ).toBe("yellow");
+    // Even when the background phrase comes first.
+    expect(
+      parseColorFromVisual("trees in front of the red-painted barn"),
+    ).toBe("red");
+  });
+
+  it("returns null for plain prompts with no color intent", () => {
+    expect(parseColorFromVisual("an abandoned warehouse, Brooklyn")).toBeNull();
+    expect(parseColorFromVisual("a diner late at night")).toBeNull();
+    expect(parseColorFromVisual("scenic mountain overlook")).toBeNull();
   });
 });
 
 // ---------------------------------------------------------------------------
-// colorMatches (neighbour-tolerant matching)
+// colorMatches (neighbour-tolerant matching) — unchanged behavior
 // ---------------------------------------------------------------------------
 
 describe("colorMatches", () => {

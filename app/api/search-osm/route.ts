@@ -484,9 +484,47 @@ export const POST = withAuth(async (req) => {
   // 5) Merge by 50m proximity, preferring richer sources.
   const merged = mergeCandidates(rawCandidates);
 
+  // 5.5) Drop low-signal OSM-only candidates.
+  // OSM has tons of un-named polygons (`tourism=attraction` for an empty
+  // park lawn, `building=yes` for a generic shed, ...). When OSM is the
+  // ONLY source for a candidate AND there's no `name` tag AND no
+  // structural keyword the user actually asked about (abandoned/ruins/
+  // material/forest/...), drop it. Cards without curated metadata are
+  // close to useless to filmmakers.
+  const STRUCTURAL_KEEP_TAGS = new Set([
+    "abandoned",
+    "ruins",
+    "disused",
+    "building:material",
+    "building:colour",
+    "natural",
+    "leisure",
+    "historic",
+    "memorial",
+    "tourism",
+  ]);
+  const filteredMerged = merged.filter((c) => {
+    // Multi-source candidates always pass — the OSM signal is augmenting
+    // a curated record (Wikidata, Wikipedia, NYC Scenes, etc.).
+    if (c.sources.length > 1 || c.primarySource !== "osm") return true;
+    // Pure OSM. Keep only when there's a name OR a structural tag.
+    if (c.name && c.name.trim().length > 0) return true;
+    for (const k of Object.keys(c.tags)) {
+      if (STRUCTURAL_KEEP_TAGS.has(k)) return true;
+    }
+    return false;
+  });
+  const droppedOsmNoise = merged.length - filteredMerged.length;
+  if (droppedOsmNoise > 0) {
+    logger.info("search-osm dropped low-signal OSM-only candidates", {
+      droppedOsmNoise,
+      remaining: filteredMerged.length,
+    });
+  }
+
   // 6) Convert merged -> ranked, sort by distance from search center.
   const center = bboxCenter(effectiveBbox);
-  const ranked: RankedCandidate[] = merged
+  const ranked: RankedCandidate[] = filteredMerged
     .map((m) => ({
       id: m.id,
       type: m.primarySource === "osm" ? inferTypeFromId(m.externalIds.osm ?? "") : "node",

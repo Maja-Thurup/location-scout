@@ -97,6 +97,14 @@ const requestSchema = z.object({
    */
   sceneDescription: z.string().min(5).max(2000),
   /**
+   * The user's RAW scene text (no Claude embellishment). Used for the
+   * color filter so background-color phrases Claude might write into the
+   * `visual` field ("framed by green space") don't trigger a subject
+   * color filter. Falls back to `sceneDescription` when not provided
+   * (backwards compat with older clients).
+   */
+  sceneText: z.string().min(1).max(20_000).optional(),
+  /**
    * Discrete visual checklist tokens (color, material, age, setting, ...).
    * Passed straight through to the vision scorer to make scoring more
    * interpretable and grounded.
@@ -681,6 +689,7 @@ export const POST = withAuth(async (req) => {
     includeClosed = false,
     searchCenter,
     sceneDescription,
+    sceneText,
     sceneTokens,
     antiTokens,
     visionScoreLimit,
@@ -707,7 +716,11 @@ export const POST = withAuth(async (req) => {
   }
 
   // -------- Phase 1: free signals (Mapillary + color) --------
-  const targetColor = parseColorFromVisual(sceneDescription);
+  // Use the user's RAW scene text for color extraction so Claude's
+  // background-color phrasing ("framed by green space") doesn't trigger
+  // a subject color filter. Falls back to the combined description for
+  // backwards compat.
+  const targetColor = parseColorFromVisual(sceneText ?? sceneDescription);
   const freeSignals = await mapWithConcurrency(
     dedupedCandidates,
     (c) => gatherFreeSignals(c, targetColor, photosPerCandidate),

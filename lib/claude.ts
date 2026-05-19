@@ -222,7 +222,13 @@ Guidance for fields:
   Common leisure values:     park, garden, playground, pitch, golf_course,
     nature_reserve, marina, sports_centre, swimming_pool, common.
   Common historic values:    house, building, castle, monument, ruins,
-    archaeological_site, memorial, manor, fort.
+    archaeological_site, memorial, manor, fort, wayside_cross,
+    aircraft, ship, boundary_stone, milestone, tomb.
+  Common tourism values:     attraction, viewpoint, museum, artwork,
+    gallery, theme_park, zoo, aquarium, picnic_site, camp_site,
+    hostel, hotel, motel.
+  Common man_made values:    tower, lighthouse, water_tower, bridge,
+    pier, chimney, obelisk, silo, windmill, watermill, observatory.
 
   Values MUST be lowercase, single-word OSM-canonical values.
 
@@ -281,6 +287,25 @@ Guidance for fields:
          { "amenity": "place_of_worship" },
          { "historic": "church" },
          { "building": "chapel" }
+       ]
+
+    Scene: "a big statue of a horse in the middle of the park"
+    -> [
+         { "historic": "monument" },
+         { "historic": "memorial" },
+         { "tourism": "artwork" },
+         { "man_made": "statue" },
+         { "tourism": "attraction" }
+       ]
+    (NOTE: include "leisure=park" only if the prompt is ABOUT a park.
+    Here the subject is the statue; the park is incidental.)
+
+    Scene: "scenic mountain overlook with pine trees"
+    -> [
+         { "tourism": "viewpoint" },
+         { "natural": "peak" },
+         { "natural": "wood" },
+         { "leisure": "nature_reserve" }
        ]
 
   Color, age, material, condition, story-count, and similar visual filters
