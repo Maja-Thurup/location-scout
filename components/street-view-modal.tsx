@@ -66,11 +66,44 @@ export function StreetViewModal({
     let cancelled = false;
 
     loadStreetView()
-      .then((lib) => {
+      .then(async (lib) => {
         if (cancelled || !containerRef.current) return;
         setError(null);
+
+        // Resolve an OUTDOOR-only panorama at this coord BEFORE building
+        // the panorama. Without this, Google's interactive viewer can
+        // pick a user-contributed INDOOR panorama (e.g. inside a deli on
+        // the ground floor of the Woolworth Building) which lands the
+        // user inside a shop instead of looking at the building.
+        const svc = new lib.StreetViewService();
+        let panoId: string | null = null;
+        try {
+          const result = await svc.getPanorama({
+            location: { lat, lng },
+            radius: 75,
+            // OUTDOOR limits to Google's official street-level imagery
+            // (excludes user-contributed indoor "look inside" panoramas).
+            source: lib.StreetViewSource.OUTDOOR,
+            preference: lib.StreetViewPreference.NEAREST,
+          });
+          panoId = result.data.location?.pano ?? null;
+        } catch {
+          // No outdoor pano available within 75m — surface the friendly
+          // empty state rather than falling back to indoor imagery.
+          if (!cancelled) {
+            setError("Street View imagery isn't available at this exact spot.");
+          }
+          return;
+        }
+
+        if (cancelled || !containerRef.current) return;
+
         const sv = new lib.StreetViewPanorama(containerRef.current, {
-          position: { lat, lng },
+          // Use the explicit pano id we resolved with OUTDOOR source.
+          // Setting `position` would re-trigger Google's default picker
+          // and could re-introduce indoor panoramas.
+          pano: panoId ?? undefined,
+          position: panoId ? undefined : { lat, lng },
           pov: { heading: 0, pitch: 0 },
           zoom: 1,
           motionTracking: false,
