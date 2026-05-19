@@ -77,6 +77,7 @@ type SearchOsmResponse = {
   expansionMultiplier: 1 | 2 | 4;
   mirror: string | null;
   alternativesTried: number;
+  alternativesSucceeded: number;
 };
 
 type SelectedPhoto = {
@@ -731,7 +732,10 @@ function SearchSummaryPanel({
               <>
                 {" · "}
                 <span className="font-medium text-emerald-300">
-                  {osm.alternativesTried} tag-set
+                  {osm.alternativesSucceeded < osm.alternativesTried
+                    ? `${osm.alternativesSucceeded}/${osm.alternativesTried}`
+                    : osm.alternativesTried}{" "}
+                  tag-set
                   {osm.alternativesTried === 1 ? "" : "s"} unioned
                 </span>
               </>

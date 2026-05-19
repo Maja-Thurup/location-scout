@@ -550,54 +550,182 @@ export async function searchOsm(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Rich-tag search: UNION over multiple alternative tag-sets with expanding-
-// ring fallback. This is the new primary entry point used when Claude emits
-// `osm_tags_alternatives`. Implements the "candidate generation" stage of
-// the Pinterest-Lens pattern — high recall, the vision scorer handles
-// precision downstream.
+// Rich-tag search: PARALLEL queries over multiple alternative tag-sets with
+// expanding-ring fallback. This is the new primary entry point used when
+// Claude emits `osm_tags_alternatives`. Implements the "candidate
+// generation" stage of the Pinterest-Lens pattern — high recall, the
+// vision scorer handles precision downstream.
+//
+// Why parallel-per-alternative instead of one giant UNION:
+//   - A UNION query with 8 alternatives over a city-sized bbox forces
+//     Overpass to do 8 full geographic scans inside one transaction.
+//     Each transaction has a 25s timeout, so big cities (NYC,
+//     Los Angeles, ...) reliably time out.
+//   - Running each alternative as its own small query is fast (each
+//     completes in 1-3s for typical primary classifiers) and lets us
+//     succeed partially when one alternative is slow or empty.
+//   - Failures of individual alternatives are logged and skipped; the
+//     overall search still returns whatever succeeded.
 // ---------------------------------------------------------------------------
 
 export type RichSearchResult = OverpassSearchResult & {
-  /** How many of the supplied alternatives actually contributed. */
+  /** How many of the supplied alternatives we attempted. */
   alternativesTried: number;
+  /** How many alternatives returned successfully (vs threw). */
+  alternativesSucceeded: number;
 };
 
+/** Element cap per alternative. Total candidate pool is then capped at MAX_CANDIDATES. */
+const RICH_PER_ALT_LIMIT = 30;
+/** How many alternative queries to run concurrently against Overpass. */
+const RICH_CONCURRENCY = 3;
+
 /**
- * Run a UNION Overpass query over `osmTagsAlternatives` in the requested
- * bbox. If sparse, expand the bbox 2× then 4× (same EXPANSION_RING as
- * single-tag search). Always returns whatever the largest expansion got.
+ * Run all alternatives in parallel against Overpass and merge their
+ * candidate lists. Deduplicates by candidate id (`type/osmId`), preserving
+ * insertion order so downstream sorting keeps the closest matches first.
+ *
+ * Throws only when EVERY alternative threw — partial successes return the
+ * accumulated set.
+ */
+async function executeAlternativesParallel(input: {
+  bbox: Bbox;
+  osmTagsAlternatives: ReadonlyArray<OsmTags>;
+  perAltLimit: number;
+  concurrency: number;
+}): Promise<
+  Pick<OverpassSearchResult, "candidates" | "rawCount" | "mirror" | "elapsedMs"> & {
+    successCount: number;
+    failureCount: number;
+    attempted: number;
+  }
+> {
+  const t0 = Date.now();
+
+  const valid = input.osmTagsAlternatives.filter(
+    (alt) => Object.entries(alt).some(([k, v]) => k && v),
+  );
+  if (valid.length === 0) {
+    throw new Error(
+      "executeAlternativesParallel: no non-empty alternatives provided",
+    );
+  }
+
+  const merged: OsmCandidate[] = [];
+  const seen = new Set<string>();
+  let totalRaw = 0;
+  let lastMirror = "(none)";
+  let successCount = 0;
+  let failureCount = 0;
+
+  let idx = 0;
+  const concurrency = Math.min(input.concurrency, valid.length);
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const i = idx++;
+      if (i >= valid.length) return;
+      // Stop early if we've already hit the global candidate cap.
+      if (merged.length >= MAX_CANDIDATES) return;
+
+      const alt = valid[i]!;
+      try {
+        const r = await executeOverpass(
+          buildOverpassQuery({
+            bbox: input.bbox,
+            osmTags: alt,
+            limit: input.perAltLimit,
+          }),
+        );
+        successCount++;
+        lastMirror = r.mirror;
+        totalRaw += r.rawCount;
+        for (const c of r.candidates) {
+          if (seen.has(c.id)) continue;
+          seen.add(c.id);
+          merged.push(c);
+          if (merged.length >= MAX_CANDIDATES) return;
+        }
+      } catch (err) {
+        failureCount++;
+        logger.warn("rich alternative query failed (continuing)", {
+          alt,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: concurrency }, () => worker()),
+  );
+
+  if (successCount === 0) {
+    throw new Error(
+      `All ${failureCount} alternative Overpass queries failed`,
+    );
+  }
+
+  return {
+    candidates: merged,
+    rawCount: totalRaw,
+    mirror: lastMirror,
+    elapsedMs: Date.now() - t0,
+    successCount,
+    failureCount,
+    attempted: valid.length,
+  };
+}
+
+/**
+ * Run parallel queries over `osmTagsAlternatives` in the requested bbox.
+ * If sparse, expand the bbox 2× then 4× (same EXPANSION_RING as single-tag
+ * search). Always returns whatever the largest expansion got.
  *
  * No "primary tag relaxation" tier here — relaxation is implicit because
- * each alternative is already a single-key filter (or close to it), and
- * we run them all in one query. The expanding ring still handles spatial
- * sparsity.
+ * each alternative is already a single-key filter (or close to it). The
+ * expanding ring still handles spatial sparsity.
  */
 export async function searchOsmRich(input: {
   bbox: Bbox;
   osmTagsAlternatives: ReadonlyArray<OsmTags>;
   limit?: number;
 }): Promise<RichSearchResult> {
-  // Tier 1: union query in original bbox.
-  const baseQuery = buildUnionOverpassQuery({
+  const perAltLimit = input.limit ?? RICH_PER_ALT_LIMIT;
+
+  // Tier 1: parallel alternatives in the original bbox.
+  const base = await executeAlternativesParallel({
     bbox: input.bbox,
     osmTagsAlternatives: input.osmTagsAlternatives,
-    limit: input.limit,
+    perAltLimit,
+    concurrency: RICH_CONCURRENCY,
   });
-  const base = await executeOverpass(baseQuery);
+
+  logger.info("overpass rich tier 1 done", {
+    alternatives: base.attempted,
+    success: base.successCount,
+    failure: base.failureCount,
+    candidates: base.candidates.length,
+    ms: base.elapsedMs,
+  });
 
   if (base.candidates.length >= SPARSE_THRESHOLD) {
     return {
-      ...base,
+      candidates: base.candidates,
+      rawCount: base.rawCount,
+      mirror: base.mirror,
+      elapsedMs: base.elapsedMs,
       matchMode: "strict",
       primaryTag: null,
       expansionMultiplier: 1,
       effectiveBbox: input.bbox,
-      alternativesTried: input.osmTagsAlternatives.length,
+      alternativesTried: base.attempted,
+      alternativesSucceeded: base.successCount,
     };
   }
 
-  // Tier 2: expanding ring (same union over all alternatives).
-  let lastExpanded: OverpassSearchResult = base;
+  // Tier 2: expanding ring (same parallel pattern over all alternatives).
+  let lastResult = base;
   let lastBbox = input.bbox;
   let lastMultiplier: 1 | 2 | 4 = 1;
 
@@ -608,36 +736,43 @@ export async function searchOsmRich(input: {
       threshold: SPARSE_THRESHOLD,
       alternatives: input.osmTagsAlternatives.length,
     });
-    const expanded = await executeOverpass(
-      buildUnionOverpassQuery({
-        bbox: expandedBbox,
-        osmTagsAlternatives: input.osmTagsAlternatives,
-        limit: input.limit,
-      }),
-    );
-    lastExpanded = expanded;
+    const expanded = await executeAlternativesParallel({
+      bbox: expandedBbox,
+      osmTagsAlternatives: input.osmTagsAlternatives,
+      perAltLimit,
+      concurrency: RICH_CONCURRENCY,
+    });
+    lastResult = expanded;
     lastBbox = expandedBbox;
     lastMultiplier = multiplier;
 
     if (expanded.candidates.length >= SPARSE_THRESHOLD) {
       return {
-        ...expanded,
+        candidates: expanded.candidates,
+        rawCount: expanded.rawCount,
+        mirror: expanded.mirror,
+        elapsedMs: expanded.elapsedMs,
         matchMode: "primary_only_expanded",
         primaryTag: null,
         expansionMultiplier: multiplier,
         effectiveBbox: expandedBbox,
-        alternativesTried: input.osmTagsAlternatives.length,
+        alternativesTried: expanded.attempted,
+        alternativesSucceeded: expanded.successCount,
       };
     }
   }
 
   // Tier 3: best-effort.
   return {
-    ...lastExpanded,
+    candidates: lastResult.candidates,
+    rawCount: lastResult.rawCount,
+    mirror: lastResult.mirror,
+    elapsedMs: lastResult.elapsedMs,
     matchMode: "best_effort",
     primaryTag: null,
     expansionMultiplier: lastMultiplier,
     effectiveBbox: lastBbox,
-    alternativesTried: input.osmTagsAlternatives.length,
+    alternativesTried: lastResult.attempted,
+    alternativesSucceeded: lastResult.successCount,
   };
 }

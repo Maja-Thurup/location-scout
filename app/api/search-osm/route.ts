@@ -24,6 +24,13 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+/**
+ * Bumped from default (10s on Vercel Hobby, 15s on Pro) so the rich-tag
+ * parallel-alternatives pipeline has headroom on big-city bboxes. Each
+ * alternative caps at ~25s on Overpass; 60s lets a few stragglers fail
+ * over to a backup mirror without aborting the whole request.
+ */
+export const maxDuration = 60;
 
 const ALLOWED_RADII = [5, 10, 25, 50, 100] as const;
 
@@ -123,6 +130,8 @@ type SearchOsmResponse = {
   mirror: string | null;
   /** How many tag-set alternatives the rich-search path tried. 1 = legacy. */
   alternativesTried: number;
+  /** How many alternatives produced results (vs threw). */
+  alternativesSucceeded: number;
 };
 
 type CachedSearchValue = {
@@ -132,6 +141,7 @@ type CachedSearchValue = {
   primaryTag: { key: string; value: string } | null;
   expansionMultiplier: 1 | 2 | 4;
   alternativesTried: number;
+  alternativesSucceeded: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -304,6 +314,7 @@ export const POST = withAuth(async (req) => {
       expansionMultiplier: cached.expansionMultiplier ?? 1,
       mirror: null,
       alternativesTried: cached.alternativesTried ?? 1,
+      alternativesSucceeded: cached.alternativesSucceeded ?? cached.alternativesTried ?? 1,
     };
     return NextResponse.json(response, { status: 200 });
   }
@@ -439,11 +450,16 @@ export const POST = withAuth(async (req) => {
     .sort((a, b) => a.distanceMeters - b.distanceMeters);
 
   // 6) Cache.
-  // `alternativesTried` is only present on RichSearchResult; default to 1
-  // for the legacy single-tag path so old code keeps working.
+  // `alternativesTried` / `alternativesSucceeded` are only present on
+  // RichSearchResult; default to 1 for the legacy single-tag path so old
+  // code keeps working.
   const alternativesTried =
     "alternativesTried" in result
       ? (result as { alternativesTried: number }).alternativesTried
+      : 1;
+  const alternativesSucceeded =
+    "alternativesSucceeded" in result
+      ? (result as { alternativesSucceeded: number }).alternativesSucceeded
       : 1;
 
   const toCache: CachedSearchValue = {
@@ -453,6 +469,7 @@ export const POST = withAuth(async (req) => {
     primaryTag: finalPrimaryTag,
     expansionMultiplier: finalExpansion,
     alternativesTried,
+    alternativesSucceeded,
   };
   await cacheSet(key, "overpass:v3", toCache, 14);
 
@@ -465,6 +482,7 @@ export const POST = withAuth(async (req) => {
     matchMode: finalMatchMode,
     expansionMultiplier: finalExpansion,
     alternativesTried,
+    alternativesSucceeded,
   });
 
   const response: SearchOsmResponse = {
@@ -479,6 +497,7 @@ export const POST = withAuth(async (req) => {
     expansionMultiplier: finalExpansion,
     mirror: result.mirror,
     alternativesTried,
+    alternativesSucceeded,
   };
   return NextResponse.json(response, { status: 200 });
 });

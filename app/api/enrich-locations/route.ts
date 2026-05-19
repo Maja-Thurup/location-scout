@@ -33,6 +33,12 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+/**
+ * The pipeline does Mapillary + color extraction + vision scoring + Google
+ * Place Details + Street View probes for up to 12 candidates. Bump above
+ * the Vercel default so we don't get cut off mid-flight on slow networks.
+ */
+export const maxDuration = 60;
 
 // ---------------------------------------------------------------------------
 // Inputs / outputs
