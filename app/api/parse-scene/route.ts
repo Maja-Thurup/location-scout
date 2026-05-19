@@ -100,9 +100,14 @@ export const POST = withAuth(async (req) => {
   const { sceneText, location, radiusMiles } = parsed.data;
 
   // 2) Cache lookup (cache hits do NOT consume the rate-limit quota).
-  // Radius is part of the cache key so radius changes get a fresh analysis;
-  // for now Claude doesn't use it, but future versions may.
+  // Schema version is part of the key so cache entries from an older
+  // prompt/schema (e.g. before osm_tags_alternatives + scene_tokens +
+  // anti_tokens existed) miss cleanly and trigger a fresh Claude call.
+  // Bump this constant whenever the prompt or output schema changes
+  // materially.
+  const PARSE_SCENE_SCHEMA_VERSION = "v3-tokens-anti";
   const key = cacheKey("claude:parse-scene", {
+    schema: PARSE_SCENE_SCHEMA_VERSION,
     sceneText,
     location: location ?? "",
     radiusMiles: radiusMiles ?? null,

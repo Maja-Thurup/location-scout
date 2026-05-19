@@ -770,17 +770,35 @@ export const POST = withAuth(async (req) => {
 
   // Drop candidates whose vision score is below threshold. Strict mode
   // (the user's stated preference: better to show fewer high-confidence
-  // matches than many marginal ones). Unscored candidates beyond the
-  // visionScoreLimit are kept ONLY when nothing scored well enough; this
-  // ensures sparse-OSM areas still get something.
+  // matches than many marginal ones). When nothing passes, we degrade
+  // gracefully rather than returning zero cards: keep the top-6 BY
+  // SCORE even if all scored below threshold, plus some unscored
+  // candidates as best-effort. Returning empty pages is the worst UX.
   const passedThreshold = scored.filter(
     (s) => s.visionScore != null && s.visionScore.score >= minVisionScore,
   );
-  const afterVisionFilter =
-    passedThreshold.length > 0
-      ? passedThreshold
-      : // Fallback: nothing scored well; keep top-N unscored as best-effort.
-        scored.filter((s) => s.visionScore == null).slice(0, 6);
+  let afterVisionFilter: typeof scored;
+  if (passedThreshold.length > 0) {
+    afterVisionFilter = passedThreshold;
+  } else {
+    // Soft fallback: top-6 by vision score (best-of-the-marginals) +
+    // up to 3 unscored candidates so sparse-OSM rural areas still
+    // surface something.
+    const topMarginal = scored
+      .filter((s): s is typeof s & { visionScore: NonNullable<typeof s.visionScore> } =>
+        s.visionScore != null,
+      )
+      .sort((a, b) => b.visionScore.score - a.visionScore.score)
+      .slice(0, 6);
+    const unscored = scored.filter((s) => s.visionScore == null).slice(0, 3);
+    afterVisionFilter = [...topMarginal, ...unscored];
+    logger.info("enrich-locations: vision soft-fallback (no candidates passed threshold)", {
+      threshold: minVisionScore,
+      scoredCount: scored.length,
+      bestScore: topMarginal[0]?.visionScore.score ?? null,
+      kept: afterVisionFilter.length,
+    });
+  }
 
   // -------- Phase 3: paid enrichment for survivors --------
   // Cap to 12 to control Place Details spend; the lowest-scoring overflow
@@ -845,8 +863,17 @@ export const POST = withAuth(async (req) => {
       if (p && p !== photo) alternates.push(p);
     }
 
-    const lat = place?.lat ?? candidate.lat;
-    const lng = place?.lng ?? candidate.lng;
+    // ALWAYS use the candidate's original coords for user-facing links
+    // and the Street View modal. The matched Google Place's coords often
+    // point at a business pin INSIDE the building (e.g. a deli inside a
+    // historic facade), so opening Street View at those coords lands
+    // the user inside the deli — not what we want.
+    //
+    // The Google Place is still useful for METADATA (name, rating,
+    // editorial summary, photos) — we just don't trust its coords for
+    // navigation.
+    const lat = candidate.lat;
+    const lng = candidate.lng;
 
     // Display-name priority: provider-supplied name (NYC scene title,
     // Wikidata label, Wikipedia article title) > Google Place name >
@@ -854,11 +881,14 @@ export const POST = withAuth(async (req) => {
     const providerName = candidate.name ?? null;
     const name = providerName ?? place?.displayName ?? deriveName(candidate.tags);
 
+    // Don't pass `googlePlaceId` to the deep-link builder either: the
+    // Google Maps "see this place" link would also resolve to the
+    // wrong business pin. Using lat,lng query keeps the user on the
+    // exact coord we surfaced.
     const deepLinks = buildDeepLinks({
       lat,
       lng,
       label: name,
-      googlePlaceId: place?.id,
     });
 
     // Films from the source provider — TMDb posters get filled in below.

@@ -40,6 +40,41 @@ const SPARQL_TIMEOUT_MS = 18_000;
  * - Each film that points at it via P915 (?film, P1476 title, P577 release date)
  * - Optional IMDb id (P345) for fallback joining to TMDb
  */
+/**
+ * Wikidata classes that represent macro / administrative regions —
+ * cities, neighborhoods, boroughs, states, etc. P915 is sometimes set on
+ * THESE entities (e.g. "Brooklyn" itself is the filming location of many
+ * movies), but they're useless as candidates because they're enormous
+ * areas, not specific filmable spots.
+ *
+ * The exact-instance check uses `wdt:P31 ?type` (one level), NOT
+ * `wdt:P31/wdt:P279*` (transitive subclass). We don't want to accidentally
+ * exclude legitimate buildings that happen to be located IN a city.
+ */
+const EXCLUDE_TYPES = [
+  "wd:Q515",       // city
+  "wd:Q1093829",   // city in the United States
+  "wd:Q1549591",   // big city
+  "wd:Q3957",      // town
+  "wd:Q5119",      // capital
+  "wd:Q7930989",   // city/town
+  "wd:Q15284",     // municipality
+  "wd:Q486972",    // human settlement
+  "wd:Q3257686",   // locality
+  "wd:Q44613",     // monastery (oddly broad — exclude)
+  "wd:Q484170",    // commune
+  "wd:Q2074737",   // arrondissement
+  "wd:Q123705",    // neighborhood
+  "wd:Q2983893",   // quarter (urban)
+  "wd:Q3957420",   // borough
+  "wd:Q41535",     // borough of New York City
+  "wd:Q149621",    // district
+  "wd:Q1149652",   // administrative territorial entity
+  "wd:Q56061",     // administrative territorial entity (general)
+  "wd:Q35657",     // U.S. state
+  "wd:Q16464",     // demographic neighborhood
+];
+
 function buildSparqlQuery(bbox: Bbox, limit: number): string {
   const sw = `Point(${bbox.west} ${bbox.south})`;
   const ne = `Point(${bbox.east} ${bbox.north})`;
@@ -54,6 +89,13 @@ WHERE {
     bd:serviceParam wikibase:cornerNorthEast "${ne}"^^geo:wktLiteral .
   }
   ?film wdt:P915 ?location .
+  # Exclude macro entities (cities, neighborhoods, boroughs, ...).
+  # P915 is sometimes set on these because they're "where the movie was
+  # set" — but they're not filmable spots, they're whole regions.
+  FILTER NOT EXISTS {
+    ?location wdt:P31 ?excludedType .
+    VALUES ?excludedType { ${EXCLUDE_TYPES.join(" ")} }
+  }
   OPTIONAL { ?film wdt:P577 ?filmDate . }
   OPTIONAL { ?film wdt:P345 ?filmImdb . }
   OPTIONAL { ?location wdt:P18 ?image . }
@@ -130,7 +172,7 @@ export const wikidataFilmingLocationProvider: CandidateProvider = {
     const t0 = Date.now();
     const { bbox } = input;
 
-    const cKey = cacheKey("wikidata:sparql", { kind: "filming-location-v1", bbox });
+    const cKey = cacheKey("wikidata:sparql", { kind: "filming-location-v2-no-macro", bbox });
     const cached = await cacheGet<RawCandidate[]>(cKey);
     if (cached) {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };

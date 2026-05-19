@@ -68,6 +68,29 @@ const TARGET_CLASSES = [
   "wd:Q108325",
 ];
 
+/**
+ * Same macro-region exclusion list as the filming-location provider.
+ * Even when targeting buildings/heritage, the `wdt:P279*` transitive
+ * subclass walk can pull in a "human settlement" hit when a city
+ * coincidentally has P31=museum (oddly common via redirects).
+ */
+const EXCLUDE_MACRO_TYPES = [
+  "wd:Q515",       // city
+  "wd:Q1093829",   // city in the United States
+  "wd:Q1549591",
+  "wd:Q3957",
+  "wd:Q5119",
+  "wd:Q15284",
+  "wd:Q486972",
+  "wd:Q3257686",
+  "wd:Q484170",
+  "wd:Q123705",    // neighborhood
+  "wd:Q41535",     // NYC borough
+  "wd:Q149621",
+  "wd:Q1149652",
+  "wd:Q35657",     // US state
+];
+
 function buildSparqlQuery(bbox: Bbox, limit: number): string {
   const sw = `Point(${bbox.west} ${bbox.south})`;
   const ne = `Point(${bbox.east} ${bbox.north})`;
@@ -80,6 +103,10 @@ SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coord ?image ?article WHERE {
   }
   VALUES ?type { ${TARGET_CLASSES.join(" ")} }
   ?item wdt:P31/wdt:P279* ?type .
+  FILTER NOT EXISTS {
+    ?item wdt:P31 ?excludedType .
+    VALUES ?excludedType { ${EXCLUDE_MACRO_TYPES.join(" ")} }
+  }
   OPTIONAL { ?item wdt:P18 ?image . }
   OPTIONAL { ?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> . }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
@@ -160,7 +187,7 @@ export const wikidataLandmarkProvider: CandidateProvider = {
     const { bbox } = input;
 
     const cKey = cacheKey("wikidata:sparql", {
-      kind: "landmark-v1",
+      kind: "landmark-v2-no-macro",
       bbox,
       classes: TARGET_CLASSES,
     });
