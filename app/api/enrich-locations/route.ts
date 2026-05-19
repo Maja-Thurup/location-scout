@@ -60,6 +60,12 @@ const requestSchema = z.object({
    * raw scene text with Claude's distilled visual descriptor.
    */
   sceneDescription: z.string().min(5).max(2000),
+  /**
+   * Discrete visual checklist tokens (color, material, age, setting, ...).
+   * Passed straight through to the vision scorer to make scoring more
+   * interpretable and grounded.
+   */
+  sceneTokens: z.array(z.string().min(1).max(40)).max(30).default([]),
   /** Cap on candidates that get vision-scored. */
   visionScoreLimit: z.number().int().min(0).max(60).default(10),
   /** Minimum vision score to appear in the output (drop low-quality matches). */
@@ -285,6 +291,7 @@ type ScoredCandidate = FreeSignals & {
 async function visionScoreSurvivors(
   survivors: ReadonlyArray<FreeSignals>,
   sceneDescription: string,
+  sceneTokens: ReadonlyArray<string>,
   limit: number,
 ): Promise<ScoredCandidate[]> {
   // Only the top `limit` get scored to keep costs predictable.
@@ -297,6 +304,7 @@ async function visionScoreSurvivors(
       const score = await scoreImageMatch({
         imageUrl: s.mapillary.thumbUrl,
         sceneDescription,
+        sceneTokens,
       });
       return { ...s, visionScore: score };
     },
@@ -485,6 +493,7 @@ export const POST = withAuth(async (req) => {
     includeClosed = false,
     searchCenter,
     sceneDescription,
+    sceneTokens,
     visionScoreLimit,
     minVisionScore,
     mapillaryClasses,
@@ -551,6 +560,7 @@ export const POST = withAuth(async (req) => {
   const scored = await visionScoreSurvivors(
     distanceSorted,
     sceneDescription,
+    sceneTokens,
     visionScoreLimit,
   );
 

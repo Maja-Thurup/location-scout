@@ -39,25 +39,27 @@ function getClient(): Anthropic {
 
 const SYSTEM_PROMPT = `You are scoring filming-location photos for a video production scout.
 
-Given a scene description and a single photo, rate from 0-100 how well the photo matches the scene as a potential filming location.
+Given a scene description (with optional discrete tokens for explicit cues) and a single photo, rate from 0-100 how well the photo matches the scene as a potential filming location.
 
-Consider:
-- Building TYPE (warehouse, diner, cathedral, ...) — must match the scene's building type
-- Materials and construction (brick, glass, wood, concrete, ...)
-- Visual mood and lighting
-- Architectural era and style
-- Whether the photo actually SHOWS a building or filming-relevant subject (not just a road, sky, parked car, or tree)
+Consider, in priority order:
+- Discrete TOKENS in the brief (color, material, age, condition, setting, signature objects). Each token directly present in the photo adds confidence; each conspicuously absent token subtracts. Tokens are the strongest signal — match them first, then fill in the prose.
+- Building / subject TYPE (warehouse, diner, cathedral, house, barn, ...) — must match the scene's primary subject
+- Materials (brick, glass, wood, concrete, stone, metal, ...)
+- Color and condition (faded, weathered, peeling, freshly-painted)
+- Setting / surroundings (urban / suburban / rural / wilderness / waterfront)
+- Visual mood, lighting, era
+- Whether the photo actually SHOWS the subject (not just a road, sky, parked car, or unrelated foliage)
 - How prominently the matching elements appear in the frame
 
 Scoring rubric:
-  90-100  exact match of building type + materials + mood
-  70-89   building type matches; some details match
-  50-69   building type matches but mood/era is off, or building is partially visible
-  30-49   subject loosely related (e.g. street near a building of the right type)
-  10-29   wrong building type but adjacent (e.g. asked for warehouse, photo shows nearby store)
-   0-9    completely unrelated (street view of empty road, sky, parking lot)
+  90-100  most tokens visibly match + correct subject type + right setting
+  70-89   subject type matches; majority of tokens visible
+  50-69   subject type matches but several tokens absent or contradicted
+  30-49   subject loosely related (e.g. street near the right kind of building)
+  10-29   wrong subject type but adjacent (e.g. asked for warehouse, photo shows nearby retail)
+   0-9    completely unrelated (empty road, sky-only, parking lot)
 
-Return ONLY a JSON object: { "score": <integer 0-100>, "reason": "<one sentence>" }
+Return ONLY a JSON object: { "score": <integer 0-100>, "reason": "<one sentence — call out which key tokens hit or missed>" }
 No prose, no code fences, no explanation outside the JSON.`;
 
 /**
@@ -72,14 +74,26 @@ No prose, no code fences, no explanation outside the JSON.`;
  *
  * Returns null on any error so callers can fall back to source-priority
  * ordering rather than blowing up the whole search.
+ *
+ * `sceneTokens` (optional) is a list of short discrete words/phrases like
+ * ["blue", "weathered", "rural", "trees"] that the model uses as the
+ * primary checklist when scoring. Encourages tighter, more interpretable
+ * scores than prose alone.
  */
 export async function scoreImageMatch(args: {
   imageUrl: string;
   sceneDescription: string;
+  sceneTokens?: ReadonlyArray<string>;
 }): Promise<VisionScore | null> {
+  // Normalize tokens for cache stability: lowercase, deduped, sorted.
+  const normTokens = Array.from(
+    new Set((args.sceneTokens ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean)),
+  ).sort();
+
   const cKey = cacheKey("claude:vision-score", {
     image: args.imageUrl,
     scene: args.sceneDescription.toLowerCase().trim(),
+    tokens: normTokens,
   });
   const cached = await cacheGet<VisionScore>(cKey);
   if (cached) return cached;
@@ -140,7 +154,7 @@ export async function scoreImageMatch(args: {
               },
               {
                 type: "text",
-                text: `Scene description:\n${args.sceneDescription}\n\nReturn the JSON.`,
+                text: buildVisionPrompt(args.sceneDescription, normTokens),
               },
             ],
           },
@@ -191,6 +205,7 @@ export async function scoreImageMatch(args: {
 export async function scoreImagesParallel(args: {
   imageUrls: ReadonlyArray<string>;
   sceneDescription: string;
+  sceneTokens?: ReadonlyArray<string>;
   concurrency?: number;
 }): Promise<Array<VisionScore | null>> {
   const concurrency = args.concurrency ?? 4;
@@ -203,6 +218,7 @@ export async function scoreImagesParallel(args: {
     out[i] = await scoreImageMatch({
       imageUrl: args.imageUrls[i]!,
       sceneDescription: args.sceneDescription,
+      sceneTokens: args.sceneTokens,
     });
     return worker();
   }
@@ -216,6 +232,25 @@ export async function scoreImagesParallel(args: {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function buildVisionPrompt(
+  description: string,
+  tokens: ReadonlyArray<string>,
+): string {
+  if (tokens.length === 0) {
+    return `Scene description:\n${description}\n\nReturn the JSON.`;
+  }
+  const tokenLines = tokens.map((t) => `  - ${t}`).join("\n");
+  return [
+    "Scene tokens (the explicit visual checklist — match these first):",
+    tokenLines,
+    "",
+    "Scene description (prose):",
+    description,
+    "",
+    "Return the JSON.",
+  ].join("\n");
+}
 
 function pickMediaType(
   contentType: string,

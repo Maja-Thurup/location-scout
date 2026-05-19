@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { withAuth } from "@/lib/auth";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
-import { analyzeScene, type SceneAnalysis } from "@/lib/claude";
+import { analyzeScene, sceneAnalysisSchema, type SceneAnalysis } from "@/lib/claude";
 import { logger } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
 import { checkRateLimit, incrementUsage } from "@/lib/ratelimit";
@@ -110,13 +110,20 @@ export const POST = withAuth(async (req) => {
   const cached = await cacheGet<{ analysis: SceneAnalysis; attempts: number }>(key);
 
   if (cached) {
+    // Defensively re-validate cached entries through the current schema so
+    // newly-added optional fields (e.g. osm_tags_alternatives, scene_tokens,
+    // location_kind) get their default values populated when reading old
+    // cache entries written before those fields existed.
+    const reparsed = sceneAnalysisSchema.safeParse(cached.analysis);
+    const analysis: SceneAnalysis = reparsed.success ? reparsed.data : cached.analysis;
+
     const rl = await checkRateLimit(req.dbUserId, "parse_scene");
     await recordHistory({
       userId: req.dbUserId,
       sceneText,
       location,
       radiusMiles,
-      analysis: cached.analysis,
+      analysis,
       fromCache: true,
     });
     logger.info("parse-scene cache hit", {
@@ -124,9 +131,10 @@ export const POST = withAuth(async (req) => {
       ms: Date.now() - t0,
       location,
       radiusMiles,
+      reparsed: reparsed.success,
     });
     const response: ParseSceneResponse = {
-      analysis: cached.analysis,
+      analysis,
       cached: true,
       attempts: cached.attempts,
       echo: { location: location ?? null, radiusMiles: radiusMiles ?? null },

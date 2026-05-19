@@ -28,11 +28,46 @@ export const CLAUDE_MODELS = {
 
 export const interiorExteriorSchema = z.enum(["interior", "exterior", "both"]);
 
+export const locationKindSchema = z.enum([
+  "urban",
+  "suburban",
+  "rural",
+  "industrial",
+  "wilderness",
+  "waterfront",
+  "mixed",
+]);
+
 export const sceneAnalysisSchema = z.object({
-  /** OSM tag map, e.g. { building: "warehouse", "building:material": "brick" }. */
+  /**
+   * Single primary OSM tag map, e.g. { building: "warehouse" }.
+   * Kept for backwards-compat with cached entries from the M3 era.
+   * The pipeline now reads `osm_tags_alternatives` first; this is the
+   * fallback if alternatives is empty.
+   */
   osm_tags: z.record(z.string(), z.string()),
 
-  /** Free-text Google Places search query. */
+  /**
+   * Multiple alternative OSM tag-sets, ordered most-likely first. Each entry
+   * is a STANDALONE filter that is run as part of a UNION Overpass query.
+   * The pipeline aggregates all matches across alternatives into one
+   * candidate pool, then visual-reranks them.
+   *
+   * Pinterest-Lens style "candidate generation → visual reranking":
+   * generate broadly (high recall), narrow with vision (high precision).
+   *
+   * Common pattern: 4-8 alternatives covering the main classifier (building,
+   * landuse, natural, leisure, ...) plus close synonyms.
+   */
+  osm_tags_alternatives: z
+    .array(z.record(z.string(), z.string()))
+    .default([]),
+
+  /**
+   * Free-text Google Places search query. Used ONLY for the "View all on
+   * Google Maps" link surfaced in the UI and as a B2 fallback when OSM
+   * returns zero. The main retrieval no longer relies on this.
+   */
   google_query: z.string().min(1),
 
   /** Google Places API "types" filter (e.g. ["storage", "warehouse"]). */
@@ -41,8 +76,30 @@ export const sceneAnalysisSchema = z.object({
   /** Canonical city, "City, ST" preferred. */
   city: z.string().min(1),
 
-  /** Visual descriptor, used later for Claude Vision re-ranking. */
+  /** Prose visual descriptor — one or two sentences for the vision scorer. */
   visual: z.string().min(1),
+
+  /**
+   * Discrete visual/setting/mood tokens for vision scoring AND future
+   * embedding-based retrieval. Aim for 5-15 short, concrete words.
+   *
+   * Examples (per scene):
+   *   "old blue building outside of town with trees in the back"
+   *     -> ["blue", "weathered", "old", "rural", "suburban", "wooden",
+   *         "house", "trees", "forest", "outside_town"]
+   *   "abandoned brick warehouse, Brooklyn"
+   *     -> ["brick", "warehouse", "industrial", "abandoned", "weathered",
+   *         "boarded_up", "graffiti", "urban"]
+   *   "neon-lit diner with phone booth"
+   *     -> ["neon", "diner", "chrome", "phone_booth", "retro", "urban"]
+   *
+   * These tokens are NOT OSM tags — they're free-text descriptors used by
+   * the vision scorer to look for specific cues in candidate photos.
+   */
+  scene_tokens: z.array(z.string()).default([]),
+
+  /** Broad setting category — informs the candidate-generation strategy. */
+  location_kind: locationKindSchema.nullable().default(null),
 
   /** Optional mood tag (gritty, romantic, noir, ...). */
   mood: z.string().nullable(),
@@ -68,23 +125,44 @@ export const sceneAnalysisSchema = z.object({
 });
 
 export type SceneAnalysis = z.infer<typeof sceneAnalysisSchema>;
+export type LocationKind = z.infer<typeof locationKindSchema>;
+
+/**
+ * Resolve the final list of OSM tag alternatives the pipeline should run.
+ * Falls back to a single-element list of `osm_tags` when Claude (or a stale
+ * cache) didn't supply alternatives.
+ */
+export function resolveOsmTagAlternatives(
+  analysis: Pick<SceneAnalysis, "osm_tags" | "osm_tags_alternatives">,
+): Array<Record<string, string>> {
+  if (analysis.osm_tags_alternatives.length > 0) {
+    return analysis.osm_tags_alternatives;
+  }
+  if (Object.keys(analysis.osm_tags).length > 0) {
+    return [analysis.osm_tags];
+  }
+  return [];
+}
 
 // ---------------------------------------------------------------------------
 // System prompt
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are a location-scouting assistant for video production.
+const SYSTEM_PROMPT = `You are a location-scouting assistant for film and video production.
 
-Given a scene description (or short script excerpt) and an optional city, extract structured filming requirements as JSON. Be concise and specific. Prefer real OSM tag keys and values that an OpenStreetMap query could match.
+Given a scene description (or short script excerpt) and an optional location hint, decompose the scene into MANY structured retrieval signals as JSON. The downstream pipeline does "candidate generation → visual reranking" (Pinterest Lens style): we generate broadly, then a vision model picks the best matches. So your job is to be EXPANSIVE, not conservative — emit every reasonable variation.
 
 Return ONLY a single JSON object, no prose, no code fences. The schema is:
 
 {
   "osm_tags": { "<osm_key>": "<value>" },
+  "osm_tags_alternatives": [ { "<osm_key>": "<value>" }, ... ],
   "google_query": "string suitable for Google Places text search",
   "google_types": ["string", "..."],
   "city": "City, ST (United States)",
-  "visual": "short visual descriptor for matching photos",
+  "visual": "1-2 sentence visual descriptor",
+  "scene_tokens": ["short", "discrete", "tokens"],
+  "location_kind": "urban|suburban|rural|industrial|wilderness|waterfront|mixed" | null,
   "mood": "string or null",
   "time_of_day": "string or null",
   "interior_exterior": "interior" | "exterior" | "both" | null,
@@ -93,61 +171,175 @@ Return ONLY a single JSON object, no prose, no code fences. The schema is:
 
 Guidance for fields:
 
-- osm_tags: pick the 1-2 MOST DIAGNOSTIC tags. Fewer tags = more results.
-  ALWAYS include exactly one classifier (building=*, amenity=*, landuse=*,
-  natural=*, historic=*, leisure=*, shop=*, etc.) as the FIRST entry. Then,
-  ONLY add a second tag if it is essential to the visual brief AND is
-  commonly tagged in OpenStreetMap.
+- osm_tags: a SINGLE primary classifier — usually the first entry of
+  osm_tags_alternatives. Kept for backwards compatibility.
 
-  Common keys: building, amenity, landuse, natural, leisure, historic,
-  shop, tourism, building:material, building:colour, building:levels,
-  abandoned, ruins, surface.
+- osm_tags_alternatives: THE MAIN RETRIEVAL FIELD. Emit 4-8 alternative
+  tag-sets. Each is run as part of a UNION Overpass query — features
+  matching ANY alternative become a candidate. Order most-likely first.
 
-  AVOID adding tags like "abandoned=yes" or "building:material=brick"
-  unless they are absolutely central to the scene. They are sparsely
-  tagged in OSM and will collapse the result set to zero.
+  Each alternative MUST be a complete, runnable filter that, run alone,
+  would return real-world matches. Do not combine multiple keys unless
+  BOTH are commonly tagged together in OSM (which is rare).
+
+  Available primary classifier keys (use as the first key of an alternative):
+    building, amenity, landuse, natural, leisure, historic, shop, tourism,
+    man_made, highway, waterway, railway, aeroway, office, place, public_transport.
+
+  Common building values:    house, residential, detached, semidetached_house,
+    apartments, terrace, garage, warehouse, industrial, commercial, retail,
+    office, hotel, hospital, school, church, chapel, cathedral, civic,
+    barn, stable, farm_auxiliary, shed, cabin, bungalow, ruins.
+  Common amenity values:     restaurant, cafe, bar, pub, fast_food, food_court,
+    place_of_worship, theatre, cinema, library, school, university, hospital,
+    pharmacy, fuel, parking, post_office, fire_station, police, townhall.
+  Common landuse values:     residential, commercial, industrial, retail,
+    farmland, farmyard, forest, meadow, orchard, vineyard, military, brownfield,
+    cemetery, recreation_ground, allotments, construction, quarry.
+  Common natural values:     wood, tree, tree_row, scrub, heath, grassland,
+    bare_rock, beach, cliff, water, wetland, marsh.
+  Common leisure values:     park, garden, playground, pitch, golf_course,
+    nature_reserve, marina, sports_centre, swimming_pool, common.
+  Common historic values:    house, building, castle, monument, ruins,
+    archaeological_site, memorial, manor, fort.
+
+  Values MUST be lowercase, single-word OSM-canonical values.
+
+  Examples (notice how each alternative is a STANDALONE filter):
+
+    Scene: "an old blue building outside of town with trees in the back"
+    -> [
+         { "building": "house" },
+         { "building": "detached" },
+         { "building": "residential" },
+         { "building": "barn" },
+         { "building": "farm_auxiliary" },
+         { "landuse": "residential" },
+         { "landuse": "farmland" },
+         { "natural": "wood" }
+       ]
+
+    Scene: "abandoned brick warehouse, Brooklyn"
+    -> [
+         { "building": "warehouse" },
+         { "building": "industrial" },
+         { "building": "commercial" },
+         { "landuse": "industrial" },
+         { "landuse": "brownfield" },
+         { "man_made": "works" }
+       ]
+
+    Scene: "diner conversation at night"
+    -> [
+         { "amenity": "restaurant" },
+         { "amenity": "cafe" },
+         { "amenity": "fast_food" },
+         { "shop": "convenience" }
+       ]
+
+    Scene: "neon-lit street corner in Tokyo style"
+    -> [
+         { "shop": "convenience" },
+         { "amenity": "restaurant" },
+         { "amenity": "bar" },
+         { "highway": "primary" },
+         { "highway": "secondary" }
+       ]
+
+    Scene: "bench on a wooded path"
+    -> [
+         { "leisure": "park" },
+         { "natural": "wood" },
+         { "landuse": "forest" },
+         { "leisure": "nature_reserve" }
+       ]
+
+    Scene: "old stone church in a small town"
+    -> [
+         { "building": "church" },
+         { "amenity": "place_of_worship" },
+         { "historic": "church" },
+         { "building": "chapel" }
+       ]
+
+  Color, age, material, condition, story-count, and similar visual filters
+  do NOT belong here — they are sparsely tagged in OSM and would collapse
+  the result set. Encode those in scene_tokens instead; the vision scorer
+  uses them for ranking.
+
+- google_query: a short text query a film scout would type, including the
+  city. Used for the "View all on Google Maps" link in the UI; not for
+  primary retrieval.
+
+- google_types: 0-3 strings from Google Places "types" enum. Empty is fine.
+  Examples: storage, warehouse, restaurant, cafe, bar, lodging,
+  movie_theater, museum, library, church, park, parking, tourist_attraction.
+
+- city: canonical "City, ST" form derived from the location hint. Hint may
+  be a city ("Brooklyn"), city+state ("Brooklyn, NY"), neighborhood
+  ("Williamsburg"), or street address. Always normalize to the underlying
+  "City, ST". If no hint and the scene implies a setting, pick a sensible
+  US city (LA, NYC, Atlanta, Detroit, Miami, ...).
+
+- visual: 1-2 sentences capturing what a candidate photo should show.
+  Concrete and specific — colors, materials, era, framing.
+
+- scene_tokens: 5-15 short, discrete words/phrases for vision matching and
+  future embedding retrieval. Use snake_case for multi-word tokens. Mix:
+  COLORS (blue, navy, red, weathered, faded), MATERIALS (brick, wood,
+  stone, concrete, metal), AGE/CONDITION (old, abandoned, decayed,
+  renovated, modern), SETTING (urban, rural, suburban, wooded,
+  outside_town, roadside), OBJECTS (trees, fence, porch, signage), MOOD
+  (gritty, peaceful, noir).
+
+  Be expansive. 5 is the floor; 10-15 is ideal.
 
   Examples:
-    Scene "abandoned brick warehouse" -> { "building": "warehouse" }
-    Scene "Victorian row house"       -> { "building": "house" }
-    Scene "diner"                     -> { "amenity": "restaurant" }
-    Scene "old stone church"          -> { "building": "church" }
-    Scene "forest with a stream"      -> { "natural": "wood" }
+    "an old blue building outside of town with trees in the back"
+      -> ["blue", "navy", "weathered", "old", "rural", "suburban",
+          "wooden", "house", "barn", "trees", "forest", "outside_town",
+          "roadside", "peeling_paint"]
+    "abandoned brick warehouse, broken windows"
+      -> ["brick", "warehouse", "industrial", "abandoned", "broken_windows",
+          "boarded_up", "graffiti", "weathered", "decayed", "urban", "gritty"]
+    "neon-lit diner with phone booth"
+      -> ["neon", "diner", "chrome", "formica", "booth", "phone_booth",
+          "retro", "70s", "urban", "night"]
 
-  Values must be lowercase, single-word OSM-canonical values
-  ("brick" not "Bricks", "warehouse" not "old warehouse").
-- google_query: a short text query a film scout would type, including the city.
-- google_types: 0-3 strings from Google Places "types" enum
-  (https://developers.google.com/maps/documentation/places/web-service/place-types).
-  Examples: storage, warehouse, restaurant, cafe, bar, lodging,
-  movie_theater, museum, library, church, park, parking. Empty array is fine.
-- city: canonical "City, ST" form derived from the user's location hint. The
-  hint may be a city ("Brooklyn"), city+state ("Brooklyn, NY"), neighborhood
-  ("Williamsburg"), or street address. Always normalize to the underlying
-  "City, ST" the location belongs to. If no hint was given and the scene
-  text implies one, use it; otherwise fall back to a sensible US city
-  matching the mood (LA, NYC, Atlanta, ...).
-- visual: 1-2 short phrases capturing what a candidate photo should show.
+- location_kind: pick one of the enum values that best fits, or null.
+    urban       — city center, dense streets, mid/high-rise
+    suburban    — residential blocks, single-family homes, strip malls
+    rural       — small town, farmland, country roads, isolated buildings
+    industrial  — warehouses, factories, ports, rail yards
+    wilderness  — forests, mountains, deserts, off-grid
+    waterfront  — beach, harbor, river, lakeshore, marsh
+    mixed       — scene crosses categories
+  This signal informs candidate generation strategy.
+
 - mood: optional one-word vibe ("gritty", "romantic", "noir", ...).
 - time_of_day: optional ("day", "night", "dawn", "dusk", "golden_hour").
 - interior_exterior: pick one if obvious from the scene; null if unclear.
-- mapillary_classes: ZERO to FOUR canonical Mapillary "object_value" strings
-  for objects/materials specifically called out in the scene. Use this ONLY
-  for things Mapillary's car-mounted cameras would actually see at street
-  level — leave empty otherwise.
 
-  Common useful values:
+- mapillary_classes: ZERO to FOUR canonical Mapillary "object_value" strings
+  for objects/materials specifically called out in the scene. Use ONLY for
+  things Mapillary's car-mounted cameras actually see at street level.
+
+  Available canonical values (use exactly these, no others):
     "object--bench", "object--bike-rack", "object--fire-hydrant",
     "object--mailbox", "object--manhole", "object--phone-booth",
     "object--street-light", "object--trash-can", "object--traffic-cone",
     "object--parking-meter", "object--catch-basin",
     "marking--surface--cobblestone", "marking--surface--brick"
 
+  Trees, buildings, and most natural features are NOT detected by Mapillary
+  — emit empty array for those.
+
   Examples:
     "cobblestone alley with bike racks" -> ["marking--surface--cobblestone", "object--bike-rack"]
     "neon-lit diner with phone booth"   -> ["object--phone-booth"]
     "bench on a wooded path"            -> ["object--bench"]
-    "abandoned brick warehouse"         -> []  (no specific objects)
+    "abandoned brick warehouse"         -> []
+    "old blue building with trees"      -> []
 
 If the input is ambiguous or unsafe, still return a best-effort JSON object.
 Never refuse and never explain.`;

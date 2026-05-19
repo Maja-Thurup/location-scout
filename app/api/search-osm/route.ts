@@ -15,7 +15,12 @@ import { forwardGeocode } from "@/lib/geocode";
 import { type GooglePlace, searchText } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
 import { findDetectionsInBbox } from "@/lib/mapillary";
-import { type MatchMode, type OsmCandidate, searchOsm } from "@/lib/overpass";
+import {
+  type MatchMode,
+  type OsmCandidate,
+  searchOsm,
+  searchOsmRich,
+} from "@/lib/overpass";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -24,12 +29,24 @@ const ALLOWED_RADII = [5, 10, 25, 50, 100] as const;
 
 const requestSchema = z.object({
   /**
-   * OSM tags to filter by, as Claude returned them.
+   * Single OSM tag-set. Backwards-compat path; if `osmTagsAlternatives` is
+   * non-empty, this is ignored for retrieval. Always required so callers
+   * can fall back when the LLM didn't emit alternatives.
    * Example: { "building": "warehouse", "abandoned": "yes" }
    */
   osmTags: z
     .record(z.string(), z.string())
     .refine((obj) => Object.keys(obj).length > 0, "osmTags must have at least one entry"),
+
+  /**
+   * Multiple alternative tag-sets to UNION at the Overpass layer.
+   * When present, drives the rich-tag candidate-generation path.
+   * Empty/absent triggers the legacy single-tag-set path.
+   */
+  osmTagsAlternatives: z
+    .array(z.record(z.string(), z.string()))
+    .optional()
+    .default([]),
 
   /** Optional Google Places "type" filter for the B2 text-search fallback. */
   googleTypes: z.array(z.string()).optional(),
@@ -104,6 +121,8 @@ type SearchOsmResponse = {
   expansionMultiplier: 1 | 2 | 4;
   /** Mirror that served the live query (null on cache hit). */
   mirror: string | null;
+  /** How many tag-set alternatives the rich-search path tried. 1 = legacy. */
+  alternativesTried: number;
 };
 
 type CachedSearchValue = {
@@ -112,6 +131,7 @@ type CachedSearchValue = {
   matchMode: ExtendedMatchMode;
   primaryTag: { key: string; value: string } | null;
   expansionMultiplier: 1 | 2 | 4;
+  alternativesTried: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -185,6 +205,7 @@ export const POST = withAuth(async (req) => {
   }
   const {
     osmTags,
+    osmTagsAlternatives,
     googleTypes,
     googleQuery,
     mapillaryClasses,
@@ -192,6 +213,14 @@ export const POST = withAuth(async (req) => {
     radiusMiles,
     bbox: suppliedBbox,
   } = parsed.data;
+
+  /**
+   * When the client sends rich alternatives, prefer them. Otherwise fall
+   * back to a single-element list of `osmTags` so downstream code only
+   * deals with one shape.
+   */
+  const effectiveAlternatives: ReadonlyArray<Record<string, string>> =
+    osmTagsAlternatives.length > 0 ? osmTagsAlternatives : [osmTags];
 
   // 1) Resolve bbox: supplied -> custom radius around geocode -> geocoded bbox.
   let bbox: Bbox;
@@ -245,10 +274,12 @@ export const POST = withAuth(async (req) => {
 
   // 2) Cache lookup (14-day TTL).
   // v3 namespace: candidate set now also includes Mapillary detections when
-  // mapillaryClasses is non-empty, so the key must include that signal.
-  const key = cacheKey("overpass:v2", {
+  // mapillaryClasses is non-empty AND a rich-alternatives signal, so the
+  // key must include both.
+  const key = cacheKey("overpass:v3", {
     bbox,
     osmTags,
+    osmTagsAlternatives: effectiveAlternatives,
     mapillaryClasses: mapillaryClasses ? [...mapillaryClasses].sort() : null,
   });
   const cached = await cacheGet<CachedSearchValue>(key);
@@ -272,19 +303,32 @@ export const POST = withAuth(async (req) => {
       primaryTag: cached.primaryTag,
       expansionMultiplier: cached.expansionMultiplier ?? 1,
       mirror: null,
+      alternativesTried: cached.alternativesTried ?? 1,
     };
     return NextResponse.json(response, { status: 200 });
   }
 
-  // 3) Run the Overpass query.
+  // 3) Run the Overpass query. Two paths:
+  //    - Rich UNION query when Claude (or the caller) supplied multiple
+  //      alternatives. Implements Pinterest-Lens "candidate generation":
+  //      generate broadly, the vision step downstream tightens precision.
+  //    - Legacy single-tag-set path with tier-relaxation, kept for
+  //      backwards-compat with old cache entries / non-Claude callers.
   let result;
   try {
-    result = await searchOsm({ bbox, osmTags });
+    result =
+      effectiveAlternatives.length > 1
+        ? await searchOsmRich({
+            bbox,
+            osmTagsAlternatives: effectiveAlternatives,
+          })
+        : await searchOsm({ bbox, osmTags: effectiveAlternatives[0]! });
   } catch (err) {
     logger.error("search-osm overpass failed", {
       userId: req.dbUserId,
       err: String(err),
       ms: Date.now() - t0,
+      alternativesCount: effectiveAlternatives.length,
     });
     return NextResponse.json(
       {
@@ -395,14 +439,22 @@ export const POST = withAuth(async (req) => {
     .sort((a, b) => a.distanceMeters - b.distanceMeters);
 
   // 6) Cache.
+  // `alternativesTried` is only present on RichSearchResult; default to 1
+  // for the legacy single-tag path so old code keeps working.
+  const alternativesTried =
+    "alternativesTried" in result
+      ? (result as { alternativesTried: number }).alternativesTried
+      : 1;
+
   const toCache: CachedSearchValue = {
     candidates: ranked,
     effectiveBbox,
     matchMode: finalMatchMode,
     primaryTag: finalPrimaryTag,
     expansionMultiplier: finalExpansion,
+    alternativesTried,
   };
-  await cacheSet(key, "overpass:v2", toCache, 14);
+  await cacheSet(key, "overpass:v3", toCache, 14);
 
   logger.info("search-osm success", {
     userId: req.dbUserId,
@@ -412,6 +464,7 @@ export const POST = withAuth(async (req) => {
     mirror: result.mirror,
     matchMode: finalMatchMode,
     expansionMultiplier: finalExpansion,
+    alternativesTried,
   });
 
   const response: SearchOsmResponse = {
@@ -425,6 +478,7 @@ export const POST = withAuth(async (req) => {
     primaryTag: finalPrimaryTag,
     expansionMultiplier: finalExpansion,
     mirror: result.mirror,
+    alternativesTried,
   };
   return NextResponse.json(response, { status: 200 });
 });

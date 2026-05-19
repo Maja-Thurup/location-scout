@@ -140,6 +140,62 @@ export function buildOverpassQuery(input: {
   ].join("\n");
 }
 
+/**
+ * Build a UNION Overpass QL query that returns the OR of multiple tag-set
+ * alternatives within `bbox`. Each alternative is run independently — a
+ * feature only needs to match ONE alternative to be returned.
+ *
+ * This is the Pinterest-Lens "candidate generation" stage: cast a wide net
+ * across plausible OSM mappings of the user's visual prompt, then let the
+ * vision scorer narrow precision.
+ *
+ * Example for "old blue building outside of town with trees in the back":
+ *
+ *   alternatives = [
+ *     { building: "house" },
+ *     { building: "detached" },
+ *     { landuse: "residential" },
+ *     { natural: "wood" }
+ *   ]
+ *
+ * produces a single Overpass call that returns the union of all four sets.
+ * Empty alternatives are skipped; throws if all alternatives are empty.
+ */
+export function buildUnionOverpassQuery(input: {
+  bbox: Bbox;
+  osmTagsAlternatives: ReadonlyArray<OsmTags>;
+  /** Cap on total elements returned by Overpass across all alternatives. */
+  limit?: number;
+}): string {
+  const validAlternatives = input.osmTagsAlternatives
+    .map((alt) =>
+      Object.entries(alt)
+        .filter(([k, v]) => k.length > 0 && v.length > 0)
+        .map(([k, v]) => tagFilter(k, v))
+        .join(""),
+    )
+    .filter((s) => s.length > 0);
+
+  if (validAlternatives.length === 0) {
+    throw new Error(
+      "buildUnionOverpassQuery: at least one non-empty alternative is required",
+    );
+  }
+
+  const bboxStr = bboxToOverpass(input.bbox);
+  const limit = input.limit ?? 200;
+
+  const lines: string[] = [`[out:json][timeout:25];`, `(`];
+  for (const filterParts of validAlternatives) {
+    lines.push(`  node${filterParts}${bboxStr};`);
+    lines.push(`  way${filterParts}${bboxStr};`);
+    lines.push(`  relation${filterParts}${bboxStr};`);
+  }
+  lines.push(`);`);
+  lines.push(`out center tags ${limit};`);
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Execute query against Overpass with mirror fallback
 // ---------------------------------------------------------------------------
@@ -490,5 +546,98 @@ export async function searchOsm(input: {
     primaryTag: winner.primaryUsed ? primary : null,
     expansionMultiplier: winner.multiplier,
     effectiveBbox: winner.bbox,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Rich-tag search: UNION over multiple alternative tag-sets with expanding-
+// ring fallback. This is the new primary entry point used when Claude emits
+// `osm_tags_alternatives`. Implements the "candidate generation" stage of
+// the Pinterest-Lens pattern — high recall, the vision scorer handles
+// precision downstream.
+// ---------------------------------------------------------------------------
+
+export type RichSearchResult = OverpassSearchResult & {
+  /** How many of the supplied alternatives actually contributed. */
+  alternativesTried: number;
+};
+
+/**
+ * Run a UNION Overpass query over `osmTagsAlternatives` in the requested
+ * bbox. If sparse, expand the bbox 2× then 4× (same EXPANSION_RING as
+ * single-tag search). Always returns whatever the largest expansion got.
+ *
+ * No "primary tag relaxation" tier here — relaxation is implicit because
+ * each alternative is already a single-key filter (or close to it), and
+ * we run them all in one query. The expanding ring still handles spatial
+ * sparsity.
+ */
+export async function searchOsmRich(input: {
+  bbox: Bbox;
+  osmTagsAlternatives: ReadonlyArray<OsmTags>;
+  limit?: number;
+}): Promise<RichSearchResult> {
+  // Tier 1: union query in original bbox.
+  const baseQuery = buildUnionOverpassQuery({
+    bbox: input.bbox,
+    osmTagsAlternatives: input.osmTagsAlternatives,
+    limit: input.limit,
+  });
+  const base = await executeOverpass(baseQuery);
+
+  if (base.candidates.length >= SPARSE_THRESHOLD) {
+    return {
+      ...base,
+      matchMode: "strict",
+      primaryTag: null,
+      expansionMultiplier: 1,
+      effectiveBbox: input.bbox,
+      alternativesTried: input.osmTagsAlternatives.length,
+    };
+  }
+
+  // Tier 2: expanding ring (same union over all alternatives).
+  let lastExpanded: OverpassSearchResult = base;
+  let lastBbox = input.bbox;
+  let lastMultiplier: 1 | 2 | 4 = 1;
+
+  for (const multiplier of EXPANSION_RING) {
+    const expandedBbox = expandBbox(input.bbox, multiplier);
+    logger.info("overpass rich expanding bbox", {
+      multiplier,
+      threshold: SPARSE_THRESHOLD,
+      alternatives: input.osmTagsAlternatives.length,
+    });
+    const expanded = await executeOverpass(
+      buildUnionOverpassQuery({
+        bbox: expandedBbox,
+        osmTagsAlternatives: input.osmTagsAlternatives,
+        limit: input.limit,
+      }),
+    );
+    lastExpanded = expanded;
+    lastBbox = expandedBbox;
+    lastMultiplier = multiplier;
+
+    if (expanded.candidates.length >= SPARSE_THRESHOLD) {
+      return {
+        ...expanded,
+        matchMode: "primary_only_expanded",
+        primaryTag: null,
+        expansionMultiplier: multiplier,
+        effectiveBbox: expandedBbox,
+        alternativesTried: input.osmTagsAlternatives.length,
+      };
+    }
+  }
+
+  // Tier 3: best-effort.
+  return {
+    ...lastExpanded,
+    matchMode: "best_effort",
+    primaryTag: null,
+    expansionMultiplier: lastMultiplier,
+    effectiveBbox: lastBbox,
+    alternativesTried: input.osmTagsAlternatives.length,
   };
 }

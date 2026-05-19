@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { extractJsonBlock, parseSceneAnalysis } from "@/lib/claude";
+import {
+  extractJsonBlock,
+  parseSceneAnalysis,
+  resolveOsmTagAlternatives,
+} from "@/lib/claude";
 
 // ---------------------------------------------------------------------------
 // Realistic fixtures of what `claude-haiku-4-5` returns for parse-scene.
@@ -86,7 +90,69 @@ describe("parseSceneAnalysis", () => {
       expect(r.value.google_types).toEqual(["storage", "warehouse"]);
       expect(r.value.interior_exterior).toBe("interior");
       expect(r.value.mood).toBe("gritty");
+      // New Path A fields default when absent.
+      expect(r.value.osm_tags_alternatives).toEqual([]);
+      expect(r.value.scene_tokens).toEqual([]);
+      expect(r.value.location_kind).toBeNull();
+      expect(r.value.mapillary_classes).toEqual([]);
     }
+  });
+
+  it("succeeds on rich JSON with osm_tags_alternatives, scene_tokens and location_kind", () => {
+    const richJson = JSON.stringify({
+      osm_tags: { building: "house" },
+      osm_tags_alternatives: [
+        { building: "house" },
+        { building: "detached" },
+        { landuse: "residential" },
+        { natural: "wood" },
+      ],
+      google_query: "old blue house rural NY",
+      google_types: ["lodging"],
+      city: "New York, NY",
+      visual: "weathered blue-painted house, trees in background, rural setting",
+      scene_tokens: [
+        "blue",
+        "weathered",
+        "old",
+        "rural",
+        "wooden",
+        "house",
+        "trees",
+        "outside_town",
+      ],
+      location_kind: "rural",
+      mood: "nostalgic",
+      time_of_day: "day",
+      interior_exterior: "exterior",
+      mapillary_classes: [],
+    });
+    const r = parseSceneAnalysis(richJson);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.osm_tags_alternatives).toHaveLength(4);
+      expect(r.value.osm_tags_alternatives[0]).toEqual({ building: "house" });
+      expect(r.value.scene_tokens).toContain("blue");
+      expect(r.value.scene_tokens).toContain("trees");
+      expect(r.value.location_kind).toBe("rural");
+    }
+  });
+
+  it("rejects an unknown location_kind value", () => {
+    const json = JSON.stringify({
+      osm_tags: { building: "house" },
+      google_query: "house",
+      google_types: [],
+      city: "New York, NY",
+      visual: "a house",
+      location_kind: "moon_base", // not in enum
+      mood: null,
+      time_of_day: null,
+      interior_exterior: null,
+    });
+    const r = parseSceneAnalysis(json);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.failure.reason).toBe("schema_mismatch");
   });
 
   it("succeeds on fenced JSON", () => {
@@ -140,6 +206,38 @@ describe("parseSceneAnalysis", () => {
       expect(r.value.time_of_day).toBeNull();
       expect(r.value.interior_exterior).toBeNull();
     }
+  });
+
+  it("resolveOsmTagAlternatives prefers alternatives when present", () => {
+    const alts = resolveOsmTagAlternatives({
+      osm_tags: { building: "house" },
+      osm_tags_alternatives: [
+        { building: "detached" },
+        { landuse: "residential" },
+      ],
+    });
+    expect(alts).toHaveLength(2);
+    expect(alts[0]).toEqual({ building: "detached" });
+  });
+
+  it("resolveOsmTagAlternatives falls back to osm_tags when alternatives empty", () => {
+    const alts = resolveOsmTagAlternatives({
+      osm_tags: { building: "warehouse", "building:material": "brick" },
+      osm_tags_alternatives: [],
+    });
+    expect(alts).toHaveLength(1);
+    expect(alts[0]).toEqual({
+      building: "warehouse",
+      "building:material": "brick",
+    });
+  });
+
+  it("resolveOsmTagAlternatives returns empty when both empty", () => {
+    const alts = resolveOsmTagAlternatives({
+      osm_tags: {},
+      osm_tags_alternatives: [],
+    });
+    expect(alts).toEqual([]);
   });
 
   it("rejects an unknown interior_exterior value", () => {

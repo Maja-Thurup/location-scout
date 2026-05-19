@@ -13,6 +13,9 @@ export type CacheNamespace =
   | "geocode"
   /** Bumped to v2 with the M3+ tiered fallback (strict -> primary-only). */
   | "overpass:v2"
+  /** Bumped to v3 with Path A: rich osm_tags_alternatives + Mapillary classes
+   *  participate in the cache key. */
+  | "overpass:v3"
   | "google:place-details"
   | "google:place-photo"
   | "mapillary:image"

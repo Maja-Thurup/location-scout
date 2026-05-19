@@ -76,6 +76,7 @@ type SearchOsmResponse = {
   primaryTag: { key: string; value: string } | null;
   expansionMultiplier: 1 | 2 | 4;
   mirror: string | null;
+  alternativesTried: number;
 };
 
 type SelectedPhoto = {
@@ -151,6 +152,7 @@ async function parseSceneRequest(input: {
 
 async function searchOsmRequest(input: {
   osmTags: Record<string, string>;
+  osmTagsAlternatives?: ReadonlyArray<Record<string, string>>;
   googleTypes?: string[];
   googleQuery?: string;
   mapillaryClasses?: string[];
@@ -182,6 +184,7 @@ async function enrichLocationsRequest(input: {
   searchBbox?: { south: number; west: number; north: number; east: number };
   includeClosed?: boolean;
   sceneDescription: string;
+  sceneTokens?: ReadonlyArray<string>;
   visionScoreLimit?: number;
   minVisionScore?: number;
   mapillaryClasses?: ReadonlyArray<string>;
@@ -372,10 +375,19 @@ export function SceneInputForm({
 
     setStage({ kind: "searching-osm" });
     setEnrichResult(null);
+    // Defensive defaults: cached entries from before Path A may not have
+    // these fields. Rich alternatives are sent through when present;
+    // otherwise the server falls back to single `osm_tags`.
+    const osmTagsAlternatives =
+      analysis.osm_tags_alternatives && analysis.osm_tags_alternatives.length > 0
+        ? analysis.osm_tags_alternatives
+        : undefined;
+    const sceneTokens = analysis.scene_tokens ?? [];
     let osm: SearchOsmResponse;
     try {
       osm = await osmMutation.mutateAsync({
         osmTags: analysis.osm_tags,
+        osmTagsAlternatives,
         googleTypes: analysis.google_types,
         googleQuery: analysis.google_query,
         mapillaryClasses: analysis.mapillary_classes,
@@ -389,6 +401,7 @@ export function SceneInputForm({
         bboxSource: osm.bboxSource,
         matchMode: osm.matchMode,
         mirror: osm.mirror,
+        alternativesTried: osm.alternativesTried,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "OSM search failed.";
@@ -424,6 +437,7 @@ export function SceneInputForm({
         searchBbox: osm.bbox,
         includeClosed,
         sceneDescription,
+        sceneTokens,
         visionScoreLimit: 10,
         minVisionScore: 30,
         mapillaryClasses: analysis.mapillary_classes ?? [],
@@ -713,6 +727,15 @@ function SearchSummaryPanel({
           <span className="text-xs text-muted-foreground">
             {osm.candidates.length} candidate
             {osm.candidates.length === 1 ? "" : "s"}
+            {osm.alternativesTried > 1 && (
+              <>
+                {" · "}
+                <span className="font-medium text-emerald-300">
+                  {osm.alternativesTried} tag-set
+                  {osm.alternativesTried === 1 ? "" : "s"} unioned
+                </span>
+              </>
+            )}
             {" · "}
             bbox: {osm.bboxSource.replace("_", " ")}
           </span>
@@ -943,32 +966,75 @@ function AnalysisResultPanel({
         <dl className="grid gap-3 text-sm md:grid-cols-2">
           <Field label="City" value={analysis.city} />
           <Field label="Visual" value={analysis.visual} />
+          <Field
+            label="Setting"
+            value={analysis.location_kind ?? "—"}
+          />
           <Field label="Mood" value={analysis.mood ?? "—"} />
           <Field label="Time of day" value={analysis.time_of_day ?? "—"} />
           <Field label="Interior / exterior" value={analysis.interior_exterior ?? "—"} />
-          <Field label="Google query" value={analysis.google_query} />
         </dl>
 
-        <div className="space-y-1">
-          <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            OSM tags (drove the Overpass query)
-          </p>
-          <div className="flex flex-wrap gap-1.5">
-            {Object.entries(analysis.osm_tags).map(([k, v]) => (
-              <span
-                key={k}
-                className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
-              >
-                {k}={v}
-              </span>
-            ))}
+        {/* Scene tokens drive vision scoring + future embedding retrieval. */}
+        {(analysis.scene_tokens?.length ?? 0) > 0 && (
+          <div className="space-y-1">
+            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              Scene tokens ({analysis.scene_tokens.length} — drove vision scoring)
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {analysis.scene_tokens.map((t) => (
+                <span
+                  key={t}
+                  className="rounded-full border border-emerald-500/20 bg-emerald-500/5 px-2 py-0.5 font-mono text-xs text-emerald-200"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
+
+        {/* OSM tag alternatives: each one is a standalone Overpass filter. */}
+        {(analysis.osm_tags_alternatives?.length ?? 0) > 1 ? (
+          <div className="space-y-1">
+            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              OSM tag alternatives ({analysis.osm_tags_alternatives.length} — UNION drove Overpass)
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {analysis.osm_tags_alternatives.map((alt, i) => (
+                <span
+                  key={i}
+                  className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
+                >
+                  {Object.entries(alt)
+                    .map(([k, v]) => `${k}=${v}`)
+                    .join(" ")}
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-1">
+            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              OSM tags (drove the Overpass query)
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {Object.entries(analysis.osm_tags).map(([k, v]) => (
+                <span
+                  key={k}
+                  className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
+                >
+                  {k}={v}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
 
         {analysis.google_types.length > 0 && (
           <div className="space-y-1">
             <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-              Google Places types (used in M4)
+              Google Places types
             </p>
             <div className="flex flex-wrap gap-1.5">
               {analysis.google_types.map((t) => (
@@ -982,6 +1048,26 @@ function AnalysisResultPanel({
             </div>
           </div>
         )}
+
+        {(analysis.mapillary_classes?.length ?? 0) > 0 && (
+          <div className="space-y-1">
+            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              Mapillary detection classes ({analysis.mapillary_classes.length})
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {analysis.mapillary_classes.map((c) => (
+                <span
+                  key={c}
+                  className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 font-mono text-xs"
+                >
+                  {c}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <Field label="Google Maps query (for the link)" value={analysis.google_query} />
 
         <details className="text-xs text-muted-foreground">
           <summary className="cursor-pointer select-none">Raw JSON</summary>
