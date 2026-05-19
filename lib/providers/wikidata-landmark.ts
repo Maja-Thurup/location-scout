@@ -197,7 +197,12 @@ export const wikidataLandmarkProvider: CandidateProvider = {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
     }
 
-    const query = buildSparqlQuery(bbox, 100);
+    // Bumped from 100 to 300 so famous-but-newer monuments (high Q-id)
+    // make it into the result set. Wikidata returns DISTINCT items in
+    // an unspecified order, so a small LIMIT can cut off legitimate
+    // landmarks in dense bboxes like NYC. SPARQL stays under 5s even
+    // at LIMIT 300.
+    const query = buildSparqlQuery(bbox, 300);
     let raw: unknown;
     try {
       raw = await executeSparql(query);

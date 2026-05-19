@@ -347,14 +347,24 @@ export const POST = withAuth(async (req) => {
   }
 
   // 2) Cache lookup.
-  // v4 namespace: response now includes provider results (Wikidata,
-  // Wikipedia, NYC, SF). Previous cache entries don't have those.
+  // Schema constant captures the SHAPE + RANKING ALGORITHM. Bump it
+  // whenever the cached candidate ordering or the cached fields change
+  // — old entries miss cleanly and trigger a fresh fetch + re-rank.
+  // History: v4-providers (post-providers refactor) → v5-rrf-tag-overlap
+  // (M4 ranking with RRF + tag-overlap + macro-region filter + films-as-
+  // post-add).
+  // The key also includes scene_tokens / anti_tokens / location_kind
+  // because M4's ranking depends on them; the same OSM-tag query with
+  // different scene tokens produces a different ordering and must miss.
   const key = cacheKey("overpass:v3", {
-    schema: "v4-providers",
+    schema: "v5-rrf-tag-overlap",
     bbox,
     osmTags,
     osmTagsAlternatives: effectiveAlternatives,
     mapillaryClasses: mapillaryClasses ? [...mapillaryClasses].sort() : null,
+    sceneTokens: [...sceneTokens].sort(),
+    antiTokens: [...antiTokens].sort(),
+    locationKind: locationKind ?? null,
   });
   const cached = await cacheGet<CachedSearchValue>(key);
   if (cached?.candidates) {

@@ -178,7 +178,11 @@ export const wikidataFilmingLocationProvider: CandidateProvider = {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
     }
 
-    const query = buildSparqlQuery(bbox, 200);
+    // Bumped to 500 so dense-film cities (NYC, LA) capture more
+    // P915-tagged locations. This provider runs as a POST-CARD
+    // enricher only, so an over-broad pool is fine — we filter by
+    // 50 m proximity to actual cards downstream.
+    const query = buildSparqlQuery(bbox, 500);
     let raw: unknown;
     try {
       raw = await executeSparql(query);
