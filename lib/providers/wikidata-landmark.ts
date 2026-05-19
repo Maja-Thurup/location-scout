@@ -29,29 +29,37 @@ const SPARQL_TIMEOUT_MS = 15_000;
 
 /**
  * Wikidata classes we accept as "filming-location-relevant landmarks". Mix
- * of generic buildings and culturally interesting subclasses. The
- * `wdt:P31/wdt:P279*` pattern matches anything that *is an instance of
- * something that is a subclass-of (transitively) one of these classes*,
- * which covers most variants without us having to enumerate.
+ * of generic buildings, monuments, and sculptures. The `wdt:P31/wdt:P279*`
+ * pattern matches anything that *is an instance of something that is a
+ * subclass-of (transitively) one of these classes*, but the transitive
+ * walk through Wikidata's class graph is fragile — many monument items
+ * have a P31 chain that doesn't reach Q386724 (work of art) cleanly.
+ * So we list specific monument/sculpture/memorial classes EXPLICITLY.
  *
  * Q-ID            What it is
  * --------------- --------------------------------
- * wd:Q41176       building
- * wd:Q35112127    architectural structure
- * wd:Q33506       museum
- * wd:Q839954      archaeological site
- * wd:Q15040597    historic site
- * wd:Q386724      work of art / monument (covers monuments, statues)
- * wd:Q57821       fortification (forts, castles)
- * wd:Q16970       church
- * wd:Q3947        house (single-family / townhouse / etc.)
- * wd:Q1248784     railway station
- * wd:Q150784      lighthouse
- * wd:Q108325      hotel
- *
- * We deliberately exclude very generic classes (Q4022 = body of water,
- * Q22698 = park) because the vision pipeline already handles those
- * via OSM and Wikipedia geosearch.
+ * Architectural / structures:
+ *   Q41176        building
+ *   Q35112127     architectural structure
+ *   Q33506        museum
+ *   Q839954       archaeological site
+ *   Q15040597     historic site
+ *   Q57821        fortification (forts, castles)
+ *   Q16970        church
+ *   Q3947         house (single-family / townhouse / etc.)
+ *   Q1248784     railway station
+ *   Q150784       lighthouse
+ *   Q108325       hotel
+ * Monuments / sculpture / public art (added M4.2):
+ *   Q386724       work of art (root class)
+ *   Q179700       monument
+ *   Q860861       sculpture
+ *   Q190619       equestrian statue  <-- direct-match for horse statue prompts
+ *   Q4989906      memorial (sometimes used)
+ *   Q5707594      memorial (alternative class)
+ *   Q1093829      visual artwork
+ *   Q5029076      column / pillar (obelisk class)
+ *   Q12277        obelisk
  */
 const TARGET_CLASSES = [
   "wd:Q41176",
@@ -59,13 +67,21 @@ const TARGET_CLASSES = [
   "wd:Q33506",
   "wd:Q839954",
   "wd:Q15040597",
-  "wd:Q386724",
   "wd:Q57821",
   "wd:Q16970",
   "wd:Q3947",
   "wd:Q1248784",
   "wd:Q150784",
   "wd:Q108325",
+  "wd:Q386724",
+  "wd:Q179700",
+  "wd:Q860861",
+  "wd:Q190619",
+  "wd:Q4989906",
+  "wd:Q5707594",
+  "wd:Q1093829",
+  "wd:Q5029076",
+  "wd:Q12277",
 ];
 
 /**
@@ -94,8 +110,16 @@ const EXCLUDE_MACRO_TYPES = [
 function buildSparqlQuery(bbox: Bbox, limit: number): string {
   const sw = `Point(${bbox.west} ${bbox.south})`;
   const ne = `Point(${bbox.east} ${bbox.north})`;
+  // ORDER BY surfaces FAMOUS items first when we hit LIMIT in dense
+  // bboxes like NYC. Scoring by (image-present, sitelinks) approximates
+  // notability:
+  //   - having a Wikimedia Commons image (P18) means somebody photographed it
+  //   - sitelinks count = how many language Wikipedias have an article
+  // Both correlate strongly with "is this a famous landmark".
   return `
-SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coord ?image ?article WHERE {
+SELECT DISTINCT
+  ?item ?itemLabel ?itemDescription ?coord ?image ?article ?sitelinks
+WHERE {
   SERVICE wikibase:box {
     ?item wdt:P625 ?coord .
     bd:serviceParam wikibase:cornerSouthWest "${sw}"^^geo:wktLiteral .
@@ -109,9 +133,11 @@ SELECT DISTINCT ?item ?itemLabel ?itemDescription ?coord ?image ?article WHERE {
   }
   OPTIONAL { ?item wdt:P18 ?image . }
   OPTIONAL { ?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> . }
+  OPTIONAL { ?item wikibase:sitelinks ?sitelinks . }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
 }
-LIMIT ${Math.max(1, Math.min(limit, 200))}
+ORDER BY DESC(BOUND(?image)) DESC(?sitelinks) ?item
+LIMIT ${Math.max(1, Math.min(limit, 500))}
 `.trim();
 }
 
@@ -187,7 +213,7 @@ export const wikidataLandmarkProvider: CandidateProvider = {
     const { bbox } = input;
 
     const cKey = cacheKey("wikidata:sparql", {
-      kind: "landmark-v2-no-macro",
+      kind: "landmark-v3-monuments-ordered",
       bbox,
       classes: TARGET_CLASSES,
     });
@@ -197,12 +223,11 @@ export const wikidataLandmarkProvider: CandidateProvider = {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
     }
 
-    // Bumped from 100 to 300 so famous-but-newer monuments (high Q-id)
-    // make it into the result set. Wikidata returns DISTINCT items in
-    // an unspecified order, so a small LIMIT can cut off legitimate
-    // landmarks in dense bboxes like NYC. SPARQL stays under 5s even
-    // at LIMIT 300.
-    const query = buildSparqlQuery(bbox, 300);
+    // Bumped to 500 + ORDER BY notability proxy (image-present then
+    // sitelinks DESC). NYC bbox has thousands of items in our class
+    // list; ordering ensures Sherman Monument / Joan of Arc / Bolívar
+    // make it into the response even when the cap kicks in.
+    const query = buildSparqlQuery(bbox, 500);
     let raw: unknown;
     try {
       raw = await executeSparql(query);

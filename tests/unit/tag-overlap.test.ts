@@ -55,7 +55,9 @@ describe("tagOverlapScore", () => {
     expect(o.matched).toContain("monument");
     expect(o.matched).toContain("equestrian");
     expect(o.matched).toContain("park");
-    expect(o.score).toBeGreaterThanOrEqual(4);
+    // IDF-weighted: equestrian=3.0 + statue=1.5 + monument=0.8 + park=0.5
+    // = 5.8 — a strong "this is the horse monument" signal.
+    expect(o.score).toBeGreaterThanOrEqual(5);
   });
 
   it("NYU scores ZERO on the horse-statue prompt", () => {
@@ -84,11 +86,11 @@ describe("tagOverlapScore", () => {
       description: "shiny modern glass office tower with statue at the entrance",
     });
     const o = tagOverlapScore(c, horseTokens, ["modern", "shiny_glass", "office"]);
-    // "statue" matches positive; "modern" and "shiny_glass" both
-    // match negative -> score = 1 - 2*2 = -3
+    // "statue" (+1.5) matched; "modern" or "shiny_glass" anti-matched
+    // (each subtracts 2× weight). Net is non-positive.
     expect(o.matched).toContain("statue");
     expect(o.antiMatched.length).toBeGreaterThanOrEqual(1);
-    expect(o.score).toBeLessThan(0);
+    expect(o.score).toBeLessThanOrEqual(0);
   });
 
   it("generic descriptors are filtered (don't reward 'urban' or 'day')", () => {
@@ -143,13 +145,13 @@ describe("combinedRank", () => {
 // ---------------------------------------------------------------------------
 
 describe("isHighConfidence", () => {
-  it("triggers when top overlap >= 3 + at least 6 candidates with overlap + 4+ tokens", () => {
+  it("triggers when top overlap >= 2.0 + at least 6 candidates with overlap >= 0.5 + 4+ tokens", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 4 },
+      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 3.5 },
       poolOverlaps: Array.from({ length: 8 }, () => ({
         matched: ["x"],
         antiMatched: [],
-        score: 1,
+        score: 0.8,
       })),
       sceneTokens: ["horse", "statue", "monument", "equestrian"],
     });
@@ -158,40 +160,56 @@ describe("isHighConfidence", () => {
 
   it("returns false when scene tokens are vague (<4 distinctive)", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 4 },
+      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 3.5 },
       poolOverlaps: Array.from({ length: 8 }, () => ({
         matched: ["x"],
         antiMatched: [],
-        score: 1,
+        score: 0.8,
       })),
       sceneTokens: ["urban", "day"], // both generic
     });
     expect(result).toBe(false);
   });
 
-  it("returns false when top overlap is weak", () => {
+  it("returns false when top overlap is weak (< 2.0 IDF-weighted)", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a"], antiMatched: [], score: 1 },
+      topOverlap: { matched: ["a"], antiMatched: [], score: 0.8 },
       poolOverlaps: Array.from({ length: 8 }, () => ({
         matched: ["a"],
         antiMatched: [],
-        score: 1,
+        score: 0.8,
       })),
       sceneTokens: ["horse", "statue", "monument", "equestrian"],
     });
     expect(result).toBe(false);
   });
 
-  it("returns false when fewer than 6 candidates have any overlap", () => {
+  it("returns false when fewer than 6 candidates have meaningful overlap", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 4 },
+      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 3.5 },
       poolOverlaps: [
-        { matched: ["a"], antiMatched: [], score: 1 },
-        { matched: ["a"], antiMatched: [], score: 1 },
+        { matched: ["a"], antiMatched: [], score: 0.8 },
+        { matched: ["a"], antiMatched: [], score: 0.8 },
       ],
       sceneTokens: ["horse", "statue", "monument", "equestrian"],
     });
     expect(result).toBe(false);
+  });
+
+  it("uses IDF weighting — rare tokens like 'equestrian' alone clear the bar", () => {
+    // A candidate with the SINGLE rare match "equestrian" (weight 3.0)
+    // should already exceed the top-score threshold (2.0). This is the
+    // payoff of TF-IDF: one strong discriminator beats five fluff words.
+    const result = isHighConfidence({
+      topOverlap: { matched: ["equestrian"], antiMatched: [], score: 3.0 },
+      poolOverlaps: Array.from({ length: 7 }, () => ({
+        matched: ["statue"],
+        antiMatched: [],
+        score: 1.5,
+      })),
+      sceneTokens: ["horse", "statue", "monument", "equestrian"],
+    });
+    expect(result).toBe(true);
   });
 });
 

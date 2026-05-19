@@ -25,6 +25,7 @@ import { mergeCandidates } from "@/lib/providers/dedupe";
 import { runProviders } from "@/lib/providers/registry";
 import { rrfRank } from "@/lib/providers/rrf";
 import {
+  MIN_USEFUL_OVERLAP_SCORE,
   combinedRank,
   isHighConfidence,
   tagOverlapScore,
@@ -562,16 +563,21 @@ export const POST = withAuth(async (req) => {
   }
 
   // 5.8) Optional hard filter: when the user supplied 4+ distinctive
-  // scene tokens AND we have at least 6 candidates with non-zero overlap,
-  // drop everything with overlap=0. This is the "horse statue removes
-  // NYU and Woolworth Building from the pool" rule.
+  // scene tokens AND we have at least 6 candidates with at least
+  // *meaningful* IDF-weighted overlap (>=0.5, i.e. one common-token
+  // match like "park" or "monument"), drop candidates with negligible
+  // overlap (<0.5). This is the "horse statue removes NYU and the
+  // Woolworth Building from the pool" rule.
   const distinctiveTokenCount = sceneTokens.filter((t) => t.length > 2).length;
   const withOverlapCount = Array.from(overlapByCandidate.values()).filter(
-    (o) => o.score >= 1,
+    (o) => o.score >= MIN_USEFUL_OVERLAP_SCORE,
   ).length;
   const applyHardFilter = distinctiveTokenCount >= 4 && withOverlapCount >= 6;
   const afterTagFilter = applyHardFilter
-    ? rrfRanked.filter((c) => (overlapByCandidate.get(c.id)?.score ?? 0) >= 1)
+    ? rrfRanked.filter(
+        (c) =>
+          (overlapByCandidate.get(c.id)?.score ?? 0) >= MIN_USEFUL_OVERLAP_SCORE,
+      )
     : rrfRanked;
   const droppedZeroOverlap = rrfRanked.length - afterTagFilter.length;
 

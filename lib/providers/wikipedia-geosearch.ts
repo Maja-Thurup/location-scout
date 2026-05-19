@@ -117,7 +117,7 @@ export const wikipediaGeosearchProvider: CandidateProvider = {
     const { bbox } = input;
 
     // v2 cache namespace bump: response now has Q-id + thumbnail in one shot.
-    const cKey = cacheKey("wikipedia:geosearch", { kind: "v2-combined", bbox });
+    const cKey = cacheKey("wikipedia:geosearch", { kind: "v3-limit500", bbox });
     const cached = await cacheGet<RawCandidate[]>(cKey);
     if (cached) {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
@@ -132,7 +132,11 @@ export const wikipediaGeosearchProvider: CandidateProvider = {
     // Generator: every page with coords inside the bbox.
     url.searchParams.set("generator", "geosearch");
     url.searchParams.set("ggsbbox", gsbbox);
-    url.searchParams.set("ggslimit", "50");
+    // gslimit max is 500 per the MediaWiki API. NYC-sized bboxes have
+    // hundreds of geo-tagged landmark articles; 50 was sparse and
+    // dropped legitimate horse-statue articles before they could
+    // contribute to the candidate pool.
+    url.searchParams.set("ggslimit", "500");
     url.searchParams.set("ggsprop", "type|name");
     // Props: image + description + Wikidata Q-id, all in this request.
     url.searchParams.set("prop", "pageimages|pageterms|pageprops|coordinates");
