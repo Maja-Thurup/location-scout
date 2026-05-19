@@ -98,6 +98,26 @@ export const sceneAnalysisSchema = z.object({
    */
   scene_tokens: z.array(z.string()).default([]),
 
+  /**
+   * Negative/contradicting tokens — things that, if visible in a photo,
+   * mean the photo CANNOT be a match. The vision scorer subtracts heavily
+   * when these are observed. Aim for 3-8 anti-tokens that capture the
+   * obvious lookalikes / wrong subjects we don't want.
+   *
+   * Examples:
+   *   "an old blue building outside of town with trees in the back"
+   *     -> ["modern", "new_construction", "high_rise", "townhouse_row",
+   *         "office_block", "skyscraper", "dense_urban"]
+   *   "abandoned brick warehouse, Brooklyn"
+   *     -> ["modern", "renovated", "shiny_glass", "hotel", "luxury_condo"]
+   *   "bench on a wooded path"
+   *     -> ["highway", "parking_lot", "indoor", "industrial"]
+   *
+   * Empty array = no specific anti-matches (the scorer does its best with
+   * the positive tokens alone).
+   */
+  anti_tokens: z.array(z.string()).default([]),
+
   /** Broad setting category — informs the candidate-generation strategy. */
   location_kind: locationKindSchema.nullable().default(null),
 
@@ -162,6 +182,7 @@ Return ONLY a single JSON object, no prose, no code fences. The schema is:
   "city": "City, ST (United States)",
   "visual": "1-2 sentence visual descriptor",
   "scene_tokens": ["short", "discrete", "tokens"],
+  "anti_tokens": ["short", "negative", "tokens"],
   "location_kind": "urban|suburban|rural|industrial|wilderness|waterfront|mixed" | null,
   "mood": "string or null",
   "time_of_day": "string or null",
@@ -305,6 +326,32 @@ Guidance for fields:
     "neon-lit diner with phone booth"
       -> ["neon", "diner", "chrome", "formica", "booth", "phone_booth",
           "retro", "70s", "urban", "night"]
+
+- anti_tokens: 3-8 negative tokens — things that, if visibly present in a
+  photo, CONTRADICT the scene and should kill the score. Pick the obvious
+  "lookalike traps" that Mapillary/Street View commonly returns when our
+  candidate generation misfires.
+
+  Be specific to the scene's contradictions. Don't list random opposites.
+
+  Examples:
+    "an old blue building outside of town with trees in the back"
+      -> ["modern", "new_construction", "high_rise", "townhouse_row",
+          "office_block", "skyscraper", "dense_urban"]
+    "abandoned brick warehouse, Brooklyn"
+      -> ["modern", "renovated", "shiny_glass", "luxury_condo", "hotel"]
+    "Victorian row house"
+      -> ["modern", "ranch_house", "bungalow", "high_rise"]
+    "diner conversation at night"
+      -> ["fine_dining", "chain_restaurant", "fast_food_drive_thru",
+          "office_lobby"]
+    "bench on a wooded path"
+      -> ["highway", "parking_lot", "indoor", "industrial", "intersection"]
+    "neon-lit diner"
+      -> ["daylight", "no_signage", "office_building", "fine_dining"]
+
+  Empty array is acceptable for very generic scenes; otherwise emit at least
+  3.
 
 - location_kind: pick one of the enum values that best fits, or null.
     urban       — city center, dense streets, mid/high-rise

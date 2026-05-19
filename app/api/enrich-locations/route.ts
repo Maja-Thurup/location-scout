@@ -4,7 +4,7 @@ import { z } from "zod";
 import { withAuth } from "@/lib/auth";
 import { distanceMeters } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
-import { scoreImageMatch, type VisionScore } from "@/lib/claude-vision";
+import { scoreBestPhotoMatch, type VisionScore } from "@/lib/claude-vision";
 import {
   type ColorWord,
   colorMatches,
@@ -21,6 +21,7 @@ import {
   countDetectionsNearPoint,
   findBestImageNear,
   findDetectionsInBbox,
+  findImagesNear,
   type MapillaryDetection,
   type MapillaryImage,
 } from "@/lib/mapillary";
@@ -72,10 +73,23 @@ const requestSchema = z.object({
    * interpretable and grounded.
    */
   sceneTokens: z.array(z.string().min(1).max(40)).max(30).default([]),
+  /**
+   * Negative tokens — things that, if visible, kill the score. The vision
+   * rubric treats these as fatal (cap at 20) when one dominates the frame.
+   */
+  antiTokens: z.array(z.string().min(1).max(40)).max(20).default([]),
   /** Cap on candidates that get vision-scored. */
   visionScoreLimit: z.number().int().min(0).max(60).default(10),
+  /**
+   * How many photos to multi-shot per candidate. We score the closest
+   * Mapillary thumb plus N-1 nearby Mapillary thumbs at varying angles,
+   * then keep the best-scoring photo as the candidate's thumbnail. This
+   * solves the "OSM centroid faces the wrong way" problem where the
+   * actual subject is across the street from the closest panorama.
+   */
+  photosPerCandidate: z.number().int().min(1).max(6).default(3),
   /** Minimum vision score to appear in the output (drop low-quality matches). */
-  minVisionScore: z.number().int().min(0).max(100).default(30),
+  minVisionScore: z.number().int().min(0).max(100).default(50),
   /**
    * Mapillary `object_value` classes that should appear near the candidate.
    * When non-empty, we fetch Mapillary detections in the search bbox once
@@ -146,6 +160,8 @@ type EnrichResponse = {
     afterColorFilter: number;
     afterDetectionFilter: number;
     afterVisionFilter: number;
+    /** After dropping cards that have no photo from any source. */
+    afterPhotoFilter: number;
     finalRendered: number;
     targetColor: string | null;
     mapillaryDetectionsFound: number;
@@ -255,7 +271,10 @@ function dedupeCandidates(
 
 type FreeSignals = {
   candidate: z.infer<typeof candidateSchema>;
+  /** Closest Mapillary photo (legacy, still used for color extraction). */
   mapillary: MapillaryImage | null;
+  /** Up to N additional nearby Mapillary photos for multi-shot scoring. */
+  mapillaryAlternates: ReadonlyArray<MapillaryImage>;
   observedColor: ColorWord | null;
   /** True if the user asked for a color and this candidate's photo matches. */
   colorOk: boolean;
@@ -266,20 +285,52 @@ type FreeSignals = {
 async function gatherFreeSignals(
   candidate: z.infer<typeof candidateSchema>,
   targetColor: ColorWord | null,
+  altLimit: number,
 ): Promise<FreeSignals> {
-  const mapillary = await findBestImageNear(candidate.lat, candidate.lng).catch(() => null);
+  // Pull both the closest single image (legacy semantics for color check)
+  // and a small pool of nearby alternates for multi-shot vision scoring.
+  // Both are free (Mapillary tokens are unlimited at our scale) but we
+  // cache aggressively.
+  const [closest, alternates] = await Promise.all([
+    findBestImageNear(candidate.lat, candidate.lng).catch(() => null),
+    altLimit > 1
+      ? findImagesNear({
+          lat: candidate.lat,
+          lng: candidate.lng,
+          searchRadiusMeters: 120,
+          limit: Math.max(altLimit, 2),
+        }).catch(() => [] as MapillaryImage[])
+      : Promise.resolve([] as MapillaryImage[]),
+  ]);
 
+  // Build a deduped list with the closest first, then alternates by recency.
+  const seen = new Set<string>();
+  const ordered: MapillaryImage[] = [];
+  if (closest) {
+    ordered.push(closest);
+    seen.add(closest.id);
+  }
+  for (const img of alternates) {
+    if (seen.has(img.id)) continue;
+    ordered.push(img);
+    seen.add(img.id);
+    if (ordered.length >= altLimit) break;
+  }
+
+  // Use the very first image (closest) for color extraction so the color
+  // signal stays cheap and stable across runs.
   let observedColor: ColorWord | null = null;
   let colorOk = false;
-  if (targetColor && mapillary) {
-    const analysis = await extractDominantColor(mapillary.thumbUrl);
+  if (targetColor && ordered.length > 0) {
+    const analysis = await extractDominantColor(ordered[0]!.thumbUrl);
     observedColor = analysis?.word ?? null;
     colorOk = observedColor != null && colorMatches(targetColor, observedColor);
   }
 
   return {
     candidate,
-    mapillary,
+    mapillary: closest,
+    mapillaryAlternates: ordered.slice(1),
     observedColor,
     colorOk,
     colorNotRequested: targetColor == null,
@@ -287,32 +338,64 @@ async function gatherFreeSignals(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: Vision scoring on Mapillary photos (cheap)
+// Phase 2: Multi-shot vision scoring on candidate Mapillary photos
+//
+// For each candidate, we score up to `photosPerCandidate` nearby Mapillary
+// thumbnails and keep the BEST-scoring photo as the canonical thumbnail.
+// This addresses the "OSM centroid faces the wrong way" problem: when the
+// actual subject is across the street from the closest panorama, one of
+// the alternate photos usually frames it correctly.
 // ---------------------------------------------------------------------------
 
 type ScoredCandidate = FreeSignals & {
+  /** Best photo across the multi-shot pool, or null if scoring failed. */
   visionScore: VisionScore | null;
+  /** Mapillary image that produced the best score (may differ from `mapillary`). */
+  bestPhoto: MapillaryImage | null;
 };
 
 async function visionScoreSurvivors(
   survivors: ReadonlyArray<FreeSignals>,
   sceneDescription: string,
   sceneTokens: ReadonlyArray<string>,
+  antiTokens: ReadonlyArray<string>,
   limit: number,
 ): Promise<ScoredCandidate[]> {
-  // Only the top `limit` get scored to keep costs predictable.
+  // Only the top `limit` candidates get vision-scored to control cost.
   return mapWithConcurrency(
     survivors,
     async (s, i) => {
-      if (i >= limit || !s.mapillary) {
-        return { ...s, visionScore: null };
+      if (i >= limit) {
+        return { ...s, visionScore: null, bestPhoto: null };
       }
-      const score = await scoreImageMatch({
-        imageUrl: s.mapillary.thumbUrl,
+
+      // Pool of photos to score for this candidate. mapillary first
+      // (closest), then alternates (different positions/angles).
+      const pool: MapillaryImage[] = [];
+      if (s.mapillary) pool.push(s.mapillary);
+      for (const alt of s.mapillaryAlternates) {
+        if (!pool.some((p) => p.id === alt.id)) pool.push(alt);
+      }
+      if (pool.length === 0) {
+        return { ...s, visionScore: null, bestPhoto: null };
+      }
+
+      const best = await scoreBestPhotoMatch({
+        imageUrls: pool.map((p) => p.thumbUrl),
         sceneDescription,
         sceneTokens,
+        antiTokens,
       });
-      return { ...s, visionScore: score };
+
+      if (!best) {
+        return { ...s, visionScore: null, bestPhoto: null };
+      }
+
+      return {
+        ...s,
+        visionScore: best.score,
+        bestPhoto: pool[best.sourceIndex] ?? s.mapillary,
+      };
     },
     MAX_PARALLEL,
   );
@@ -500,8 +583,10 @@ export const POST = withAuth(async (req) => {
     searchCenter,
     sceneDescription,
     sceneTokens,
+    antiTokens,
     visionScoreLimit,
     minVisionScore,
+    photosPerCandidate,
     mapillaryClasses,
     searchBbox,
   } = parsed.data;
@@ -526,7 +611,7 @@ export const POST = withAuth(async (req) => {
   const targetColor = parseColorFromVisual(sceneDescription);
   const freeSignals = await mapWithConcurrency(
     dedupedCandidates,
-    (c) => gatherFreeSignals(c, targetColor),
+    (c) => gatherFreeSignals(c, targetColor, photosPerCandidate),
     MAX_PARALLEL,
   );
 
@@ -567,16 +652,23 @@ export const POST = withAuth(async (req) => {
     distanceSorted,
     sceneDescription,
     sceneTokens,
+    antiTokens,
     visionScoreLimit,
   );
 
-  // Drop candidates whose vision score is below threshold. Keep candidates
-  // that weren't scored (no Mapillary photo, or beyond the limit) so we
-  // still surface something for sparse areas.
-  const afterVisionFilter = scored.filter((s) => {
-    if (s.visionScore == null) return true; // unscored, keep
-    return s.visionScore.score >= minVisionScore;
-  });
+  // Drop candidates whose vision score is below threshold. Strict mode
+  // (the user's stated preference: better to show fewer high-confidence
+  // matches than many marginal ones). Unscored candidates beyond the
+  // visionScoreLimit are kept ONLY when nothing scored well enough; this
+  // ensures sparse-OSM areas still get something.
+  const passedThreshold = scored.filter(
+    (s) => s.visionScore != null && s.visionScore.score >= minVisionScore,
+  );
+  const afterVisionFilter =
+    passedThreshold.length > 0
+      ? passedThreshold
+      : // Fallback: nothing scored well; keep top-N unscored as best-effort.
+        scored.filter((s) => s.visionScore == null).slice(0, 6);
 
   // -------- Phase 3: paid enrichment for survivors --------
   // Cap to 12 to control Place Details spend; the lowest-scoring overflow
@@ -586,9 +678,14 @@ export const POST = withAuth(async (req) => {
   const enrichments = await mapWithConcurrency(
     survivors,
     async (s) => {
+      // Use the multi-shot WINNING photo for the Street View handoff so
+      // the GSV thumbnail looks at the same subject the vision model
+      // actually rated highly. Falls back to the closest panorama when
+      // no photo was scored (sparse area).
+      const photoForHandoff = s.bestPhoto ?? s.mapillary;
       const stat = await fetchStaticEnrichment({
         candidate: s.candidate,
-        mapillary: s.mapillary,
+        mapillary: photoForHandoff,
         includeClosed,
       });
       return { ...s, static: stat };
@@ -605,20 +702,23 @@ export const POST = withAuth(async (req) => {
     const place = e.static.googlePlace;
     const sv = e.static.streetView;
 
-    // Pick primary photo: GSV (when available, since it uses Mapillary's
-    // coord+heading for a higher-quality version of the matching shot)
-    // → Google Place Photo → Mapillary fallback.
-    const mapillaryPhoto = e.mapillary
-      ? selectedFromMapillary(e.mapillary, e.visionScore)
+    // Use the multi-shot winning Mapillary photo as the candidate's
+    // visible thumbnail — that's the photo that ACTUALLY frames the
+    // matching subject (which may be across the street from the OSM
+    // centroid). Falls back to the closest panorama if multi-shot didn't
+    // run (sparse area, no photos).
+    const mapillaryPhotoSource = e.bestPhoto ?? e.mapillary;
+    const mapillaryPhoto = mapillaryPhotoSource
+      ? selectedFromMapillary(mapillaryPhotoSource, e.visionScore)
       : null;
     const streetViewPhoto = selectedFromStreetView(sv, e.visionScore);
     const googlePhoto = place
       ? selectedFromGooglePlace(place, e.visionScore)
       : null;
 
-    // Order: GSV > Google Place Photo > Mapillary. Caller's directive:
-    // "if you find perfect coordinates in mapillary, use them to get the
-    // GSV tab/thumbnail; if too hard, keep mapillary thumbnail."
+    // Order: GSV > Google Place Photo > Mapillary. The GSV thumb was
+    // probed at the multi-shot winner's coord+heading, so it shows the
+    // same subject from Google's higher-resolution camera.
     const photo = streetViewPhoto ?? googlePhoto ?? mapillaryPhoto;
     const alternates: SelectedPhoto[] = [];
     for (const p of [streetViewPhoto, googlePhoto, mapillaryPhoto]) {
@@ -662,8 +762,14 @@ export const POST = withAuth(async (req) => {
     };
   });
 
+  // Drop cards with no photo from any source — we now treat "NO PHOTO
+  // FOUND" as "candidate not viable" rather than rendering an empty card.
+  // Phase 1 quality bar: every card must show something the user can
+  // actually look at.
+  const withPhoto = locations.filter((loc) => loc.photo !== null);
+
   // Final sort: vision score desc, then distance asc.
-  locations.sort((a, b) => {
+  withPhoto.sort((a, b) => {
     const sa = a.photo?.visionScore ?? -1;
     const sb = b.photo?.visionScore ?? -1;
     if (sa !== sb) return sb - sa;
@@ -686,14 +792,17 @@ export const POST = withAuth(async (req) => {
     afterColorFilter: afterColorFilter.length,
     afterDetectionFilter: afterDetectionFilter.length,
     afterVisionFilter: afterVisionFilter.length,
-    finalRendered: locations.length,
+    afterPhotoFilter: withPhoto.length,
+    finalRendered: withPhoto.length,
     visionScored: visionScoringApplied,
     targetColor,
     mapillaryDetections: detections.length,
+    photosPerCandidate,
+    minVisionScore,
   });
 
   const response: EnrichResponse = {
-    locations,
+    locations: withPhoto,
     visionScoringApplied,
     pipelineStats: {
       inputCandidates: candidates.length,
@@ -701,7 +810,8 @@ export const POST = withAuth(async (req) => {
       afterColorFilter: afterColorFilter.length,
       afterDetectionFilter: afterDetectionFilter.length,
       afterVisionFilter: afterVisionFilter.length,
-      finalRendered: locations.length,
+      afterPhotoFilter: withPhoto.length,
+      finalRendered: withPhoto.length,
       targetColor,
       mapillaryDetectionsFound: detections.length,
     },

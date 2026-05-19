@@ -126,6 +126,7 @@ type EnrichResponse = {
     afterColorFilter: number;
     afterDetectionFilter: number;
     afterVisionFilter: number;
+    afterPhotoFilter: number;
     finalRendered: number;
     targetColor: string | null;
     mapillaryDetectionsFound: number;
@@ -186,8 +187,10 @@ async function enrichLocationsRequest(input: {
   includeClosed?: boolean;
   sceneDescription: string;
   sceneTokens?: ReadonlyArray<string>;
+  antiTokens?: ReadonlyArray<string>;
   visionScoreLimit?: number;
   minVisionScore?: number;
+  photosPerCandidate?: number;
   mapillaryClasses?: ReadonlyArray<string>;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
@@ -439,8 +442,16 @@ export function SceneInputForm({
         includeClosed,
         sceneDescription,
         sceneTokens,
+        antiTokens: analysis.anti_tokens ?? [],
         visionScoreLimit: 10,
-        minVisionScore: 30,
+        // Strict bar: better to show 3 great matches than 12 marginal ones.
+        // Marginal cards push exact matches to the bottom (the user's
+        // exact complaint about Path A v1).
+        minVisionScore: 50,
+        // Multi-shot: score 3 nearby Mapillary photos per candidate and
+        // keep the best one as the thumbnail. Solves the "blue building
+        // is across the street" problem.
+        photosPerCandidate: 3,
         mapillaryClasses: analysis.mapillary_classes ?? [],
       });
       setEnrichResult(enriched);
@@ -991,7 +1002,26 @@ function AnalysisResultPanel({
                   key={t}
                   className="rounded-full border border-emerald-500/20 bg-emerald-500/5 px-2 py-0.5 font-mono text-xs text-emerald-200"
                 >
-                  {t}
+                  + {t}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Anti-tokens — fatal-if-visible cues. */}
+        {(analysis.anti_tokens?.length ?? 0) > 0 && (
+          <div className="space-y-1">
+            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              Anti-tokens ({analysis.anti_tokens.length} — penalized in vision scoring)
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {analysis.anti_tokens.map((t) => (
+                <span
+                  key={t}
+                  className="rounded-full border border-rose-500/20 bg-rose-500/5 px-2 py-0.5 font-mono text-xs text-rose-200"
+                >
+                  − {t}
                 </span>
               ))}
             </div>
@@ -1133,9 +1163,14 @@ function PipelineStatsStrip({
       visible: stats.mapillaryDetectionsFound > 0 && stats.afterDetectionFilter < stats.afterColorFilter,
     },
     {
-      label: visionApplied ? "vision ≥30" : "no vision",
+      label: visionApplied ? "vision ≥50" : "no vision",
       value: stats.afterVisionFilter,
       visible: visionApplied,
+    },
+    {
+      label: "has photo",
+      value: stats.afterPhotoFilter,
+      visible: stats.afterPhotoFilter < stats.afterVisionFilter,
     },
     { label: "rendered", value: stats.finalRendered, visible: true },
   ].filter((s) => s.visible);

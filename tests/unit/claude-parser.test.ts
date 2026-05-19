@@ -121,6 +121,7 @@ describe("parseSceneAnalysis", () => {
         "trees",
         "outside_town",
       ],
+      anti_tokens: ["modern", "high_rise", "townhouse_row"],
       location_kind: "rural",
       mood: "nostalgic",
       time_of_day: "day",
@@ -134,8 +135,29 @@ describe("parseSceneAnalysis", () => {
       expect(r.value.osm_tags_alternatives[0]).toEqual({ building: "house" });
       expect(r.value.scene_tokens).toContain("blue");
       expect(r.value.scene_tokens).toContain("trees");
+      expect(r.value.anti_tokens).toEqual([
+        "modern",
+        "high_rise",
+        "townhouse_row",
+      ]);
       expect(r.value.location_kind).toBe("rural");
     }
+  });
+
+  it("anti_tokens defaults to empty array when missing", () => {
+    const json = JSON.stringify({
+      osm_tags: { building: "house" },
+      google_query: "house",
+      google_types: [],
+      city: "New York, NY",
+      visual: "a house",
+      mood: null,
+      time_of_day: null,
+      interior_exterior: null,
+    });
+    const r = parseSceneAnalysis(json);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.anti_tokens).toEqual([]);
   });
 
   it("rejects an unknown location_kind value", () => {

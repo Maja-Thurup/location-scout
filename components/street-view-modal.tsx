@@ -52,20 +52,23 @@ export function StreetViewModal({
   const panoRef = useRef<google.maps.StreetViewPanorama | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Build a fresh panorama every time the modal OPENS, against whatever
+  // the current container DOM node is. The previous implementation reused
+  // a cached panorama, but when the modal is closed React unmounts the
+  // container; on reopen the cached panorama still pointed at a detached
+  // DOM node — net effect was a black screen on every reopen.
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Tear down any prior panorama so the next open builds a fresh one.
+      panoRef.current = null;
+      return;
+    }
     let cancelled = false;
 
     loadStreetView()
       .then((lib) => {
         if (cancelled || !containerRef.current) return;
-        // Clear any prior error from a previous open of this modal.
         setError(null);
-        if (panoRef.current) {
-          panoRef.current.setPosition({ lat, lng });
-          panoRef.current.setVisible(true);
-          return;
-        }
         const sv = new lib.StreetViewPanorama(containerRef.current, {
           position: { lat, lng },
           pov: { heading: 0, pitch: 0 },
@@ -91,6 +94,11 @@ export function StreetViewModal({
 
     return () => {
       cancelled = true;
+      // Hide the panorama on unmount so DOM cleanup doesn't leak listeners.
+      if (panoRef.current) {
+        panoRef.current.setVisible(false);
+        panoRef.current = null;
+      }
     };
   }, [open, lat, lng]);
 

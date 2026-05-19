@@ -160,6 +160,101 @@ export async function findBestImageNear(
   return result;
 }
 
+/**
+ * Look up multiple recent photos near a coordinate, sorted by capture
+ * time descending. Used by the multi-shot vision pipeline so we can score
+ * several angles/positions and pick the photo that actually frames the
+ * candidate (matters when the OSM centroid is across the street from the
+ * actual building).
+ *
+ * Always includes whatever `findBestImageNear` would return as the first
+ * result, so callers don't need to merge.
+ */
+export async function findImagesNear(args: {
+  lat: number;
+  lng: number;
+  searchRadiusMeters?: number;
+  limit?: number;
+}): Promise<MapillaryImage[]> {
+  const radius = args.searchRadiusMeters ?? 100;
+  const limit = Math.min(Math.max(args.limit ?? 5, 1), 12);
+
+  const k = cacheKey("mapillary:image", {
+    kind: "many-v1",
+    lat: round(args.lat),
+    lng: round(args.lng),
+    r: radius,
+    limit,
+  });
+  const cached = await cacheGet<MapillaryImage[]>(k);
+  if (cached) return cached;
+
+  const url = new URL(`${MAPILLARY_BASE}/images`);
+  url.searchParams.set("access_token", env.MAPILLARY_TOKEN);
+  url.searchParams.set("bbox", makeBbox(args.lat, args.lng, radius));
+  url.searchParams.set(
+    "fields",
+    "id,thumb_2048_url,thumb_1024_url,thumb_256_url,captured_at,compass_angle,geometry",
+  );
+  // Pull a wider pool than `limit` so we can rank/de-dupe before returning.
+  url.searchParams.set("limit", String(Math.max(limit * 4, 20)));
+
+  let raw: unknown;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(MAPILLARY_TIMEOUT_MS) });
+    if (!res.ok) {
+      logger.warn("mapillary findImagesNear http error", {
+        status: res.status,
+        lat: args.lat,
+        lng: args.lng,
+      });
+      await cacheSet(k, "mapillary:image", [], 7);
+      return [];
+    }
+    raw = await res.json();
+  } catch (err) {
+    logger.warn("mapillary findImagesNear fetch failed", { err: String(err) });
+    return [];
+  }
+
+  const parsed = responseSchema.safeParse(raw);
+  if (!parsed.success || !parsed.data.data) {
+    await cacheSet(k, "mapillary:image", [], 7);
+    return [];
+  }
+
+  // Sort by captured_at desc (newest first) and dedupe by id.
+  const sorted = [...parsed.data.data].sort((a, b) => {
+    const ta = Number(a.captured_at ?? 0);
+    const tb = Number(b.captured_at ?? 0);
+    return tb - ta;
+  });
+
+  const seen = new Set<string>();
+  const out: MapillaryImage[] = [];
+  for (const img of sorted) {
+    if (out.length >= limit) break;
+    if (seen.has(img.id)) continue;
+    const thumb = pickThumb(img);
+    if (!thumb) continue;
+    seen.add(img.id);
+    const coords = img.geometry?.coordinates;
+    out.push({
+      id: img.id,
+      thumbUrl: thumb,
+      capturedAt: normalizeCapturedAt(img.captured_at),
+      compassAngle: img.compass_angle ?? null,
+      lat: coords?.[1] ?? args.lat,
+      lng: coords?.[0] ?? args.lng,
+      attribution: ATTRIBUTION,
+      href: `https://www.mapillary.com/app/?focus=photo&pKey=${img.id}`,
+    });
+  }
+
+  await cacheSet(k, "mapillary:image", out, 7);
+  return out;
+}
+
 function round(n: number): number {
   return Math.round(n * 1e4) / 1e4;
 }
