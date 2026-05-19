@@ -48,14 +48,17 @@ const DEFAULT_PROXIMITY_METERS = 50;
  * deduplicated, source-tagged list.
  *
  * Strategy:
- * 1. Sort raws by descending source priority so the highest-priority
+ * 1. Compute each raw's RANK within its source provider (0-based,
+ *    matches the order each provider's `search()` returned). Used for
+ *    Reciprocal Rank Fusion downstream.
+ * 2. Sort raws by descending source priority so the highest-priority
  *    record is the seed for any cluster.
- * 2. For each raw, find an existing merged whose canonical coord is
+ * 3. For each raw, find an existing merged whose canonical coord is
  *    within `proximityMeters`. If found, MERGE in. Otherwise create a
  *    new merged record.
- * 3. When merging, take the highest-priority non-null value for each
- *    field (name, description, knownImageUrl, sourceUrl). Tags are
- *    union'd. Films are deduped by Q-id / title.
+ * 4. When merging, take the highest-priority non-null value for each
+ *    field. Tags are union'd. Films deduped by Q-id / title.
+ *    Per-source rank stays the rank from each provider's own list.
  *
  * Pure function — covered by unit tests.
  */
@@ -63,6 +66,19 @@ export function mergeCandidates(
   raws: ReadonlyArray<RawCandidate>,
   proximityMeters: number = DEFAULT_PROXIMITY_METERS,
 ): MergedCandidate[] {
+  // Compute per-source rank by walking the raws in arrival order — the
+  // first time we see a (source, externalId) pair, that index within
+  // the source is its rank.
+  const rankByExternalId = new Map<string, number>();
+  const seenCountPerSource = new Map<ProviderName, number>();
+  for (const raw of raws) {
+    const key = `${raw.source}\t${raw.externalId}`;
+    if (rankByExternalId.has(key)) continue;
+    const rank = seenCountPerSource.get(raw.source) ?? 0;
+    rankByExternalId.set(key, rank);
+    seenCountPerSource.set(raw.source, rank + 1);
+  }
+
   // Sort highest-priority first so cluster seeds win on coords + canonical name.
   const sorted = [...raws].sort(
     (a, b) => priorityOf(b.source) - priorityOf(a.source),
@@ -71,6 +87,9 @@ export function mergeCandidates(
   const merged: MergedCandidate[] = [];
 
   for (const raw of sorted) {
+    const rawKey = `${raw.source}\t${raw.externalId}`;
+    const rawRank = rankByExternalId.get(rawKey) ?? 0;
+
     const cluster = merged.find(
       (m) =>
         distanceMeters({ lat: m.lat, lng: m.lng }, { lat: raw.lat, lng: raw.lng }) <
@@ -83,6 +102,10 @@ export function mergeCandidates(
         (cluster.sources as ProviderName[]).push(raw.source);
       }
       cluster.externalIds[raw.source] = raw.externalId;
+      // Track the BEST (lowest = best) rank from each contributing source.
+      const existingRank = cluster.perSourceRank[raw.source];
+      cluster.perSourceRank[raw.source] =
+        existingRank == null ? rawRank : Math.min(existingRank, rawRank);
       cluster.name = pickRicher(cluster.name, raw.name);
       cluster.description = pickRicher(cluster.description, raw.description);
       cluster.knownImageUrl = cluster.knownImageUrl ?? raw.knownImageUrl;
@@ -95,6 +118,7 @@ export function mergeCandidates(
         primarySource: raw.source,
         sources: [raw.source],
         externalIds: { [raw.source]: raw.externalId },
+        perSourceRank: { [raw.source]: rawRank },
         lat: raw.lat,
         lng: raw.lng,
         name: raw.name,

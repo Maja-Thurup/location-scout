@@ -14,35 +14,55 @@ import { wikidataLandmarkProvider } from "@/lib/providers/wikidata-landmark";
 import { wikipediaGeosearchProvider } from "@/lib/providers/wikipedia-geosearch";
 
 // ---------------------------------------------------------------------------
-// Provider registry — Phase 2a candidate sources.
+// Provider registry — split into TWO categories.
 //
-// The OSM provider is intentionally NOT in this registry. OSM lives in
-// the existing search-osm route handler, and the registry is wired in
-// alongside it. Keeping OSM separate preserves the tiered relaxation
-// logic specific to Overpass without forcing every provider to model it.
+// 1. DEFAULT_CONTENT_PROVIDERS: pure-content sources. They return
+//    candidates based on WHAT IS THERE (a building, a monument, a park,
+//    a viewpoint). Used for every search regardless of intent. These are
+//    the only sources that influence ranking.
+//
+// 2. FILM_HISTORY_PROVIDERS: pure-film-history sources. They return
+//    locations based on FILMS that were shot there (Wikidata P915, NYC
+//    Scenes from the City, SF Films Locations). They're INTENTIONALLY
+//    excluded from the default search pool because film-history is
+//    irrelevant to most prompts ("horse statue in a park" doesn't care
+//    whether NYU has hosted movie shoots). Instead, these run as a
+//    POST-CARD ENRICHMENT step: for each card we surface, attach any
+//    films linked to that exact coord (within 50 m). They are also the
+//    retrievers for a future "find me filming locations" search mode
+//    where the user explicitly wants film-history-driven results.
+//
+// The OSM provider is intentionally NOT in either registry. OSM lives
+// in the search-osm route handler with its own tiered-relaxation logic.
 // ---------------------------------------------------------------------------
 
-export const PROVIDERS: ReadonlyArray<CandidateProvider> = [
+export const DEFAULT_CONTENT_PROVIDERS: ReadonlyArray<CandidateProvider> = [
   wikidataLandmarkProvider,
-  wikidataFilmingLocationProvider,
   wikipediaGeosearchProvider,
+];
+
+export const FILM_HISTORY_PROVIDERS: ReadonlyArray<CandidateProvider> = [
+  wikidataFilmingLocationProvider,
   nycScenesProvider,
   sfFilmLocationsProvider,
 ];
 
 /**
- * Run every provider whose `supportsBbox` matches the requested area, in
- * parallel. Each provider's failures are isolated — one provider erroring
- * never breaks the others.
- *
- * Returns the merged raw candidates (NOT YET deduped — that happens
- * in `mergeCandidates` once OSM contributes its own results).
+ * Backwards-compat: the old `PROVIDERS` symbol resolves to default
+ * content providers only. Anything that previously imported PROVIDERS
+ * keeps working without contributing film-history rows to the search.
  */
-export async function runProviders(input: ProviderInput): Promise<{
+export const PROVIDERS = DEFAULT_CONTENT_PROVIDERS;
+
+async function runProviderList(
+  list: ReadonlyArray<CandidateProvider>,
+  input: ProviderInput,
+  label: string,
+): Promise<{
   candidates: RawCandidate[];
   perProvider: Record<ProviderName, { count: number; ms: number; error: string | null }>;
 }> {
-  const eligible = PROVIDERS.filter((p) => p.supportsBbox(input.bbox));
+  const eligible = list.filter((p) => p.supportsBbox(input.bbox));
 
   const results = await Promise.all(
     eligible.map((p) =>
@@ -69,7 +89,10 @@ export async function runProviders(input: ProviderInput): Promise<{
       error: r.error,
     };
     if (r.error) {
-      logger.warn("provider failed (continuing)", { provider: p.name, error: r.error });
+      logger.warn(`${label} provider failed (continuing)`, {
+        provider: p.name,
+        error: r.error,
+      });
     }
   }
 
@@ -83,9 +106,39 @@ export async function runProviders(input: ProviderInput): Promise<{
 }
 
 /**
+ * Run every DEFAULT_CONTENT provider whose `supportsBbox` matches the
+ * requested area, in parallel. This is the search-time entry point.
+ *
+ * Excludes film-history sources by design — those are post-card
+ * enrichers and a future explicit search mode, not a default ranking
+ * signal. Films should be METADATA on a card, not the reason a card
+ * exists.
+ */
+export async function runProviders(input: ProviderInput): Promise<{
+  candidates: RawCandidate[];
+  perProvider: Record<ProviderName, { count: number; ms: number; error: string | null }>;
+}> {
+  return runProviderList(DEFAULT_CONTENT_PROVIDERS, input, "default-content");
+}
+
+/**
+ * Run every FILM_HISTORY provider whose `supportsBbox` matches the bbox.
+ * Used by the enrichment route to attach film metadata to cards by
+ * coord proximity AFTER the search has already chosen them.
+ */
+export async function runFilmHistoryProviders(input: ProviderInput): Promise<{
+  candidates: RawCandidate[];
+  perProvider: Record<ProviderName, { count: number; ms: number; error: string | null }>;
+}> {
+  return runProviderList(FILM_HISTORY_PROVIDERS, input, "film-history");
+}
+
+/**
  * For routes that want to know which providers WOULD have run for a bbox
  * without actually running them (e.g. UI hints).
  */
 export function eligibleProviders(bbox: Bbox): ReadonlyArray<ProviderName> {
-  return PROVIDERS.filter((p) => p.supportsBbox(bbox)).map((p) => p.name);
+  return DEFAULT_CONTENT_PROVIDERS.filter((p) => p.supportsBbox(bbox)).map(
+    (p) => p.name,
+  );
 }

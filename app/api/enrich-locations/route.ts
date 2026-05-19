@@ -25,6 +25,8 @@ import {
   type MapillaryDetection,
   type MapillaryImage,
 } from "@/lib/mapillary";
+import { runFilmHistoryProviders } from "@/lib/providers/registry";
+import type { AssociatedFilm, RawCandidate } from "@/lib/providers/types";
 import {
   buildThumbUrl,
   probeStreetView,
@@ -937,6 +939,70 @@ export const POST = withAuth(async (req) => {
   // Phase 1 quality bar: every card must show something the user can
   // actually look at.
   const withPhoto = locations.filter((loc) => loc.photo !== null);
+
+  // -------- Phase 5.5: film-history POST-CARD enrichment --------
+  // Films should NEVER drive search ranking — they're metadata on a card,
+  // not a reason for a card to exist. We run film-history providers
+  // (Wikidata P915, NYC Scenes from the City, SF Films) here, AFTER the
+  // search-osm pipeline has already chosen the cards based on
+  // content-only signals (Wikidata landmarks / Wikipedia / OSM).
+  // Each card is then matched against film-history coords within 50 m
+  // and any associated films are merged into the card's `films` array.
+  if (withPhoto.length > 0 && searchBbox) {
+    const filmHistoryRun = await runFilmHistoryProviders({
+      bbox: searchBbox,
+      sceneTokens: [],
+      antiTokens: [],
+      locationKind: null,
+      osmTagsAlternatives: [],
+    }).catch(() => null);
+
+    if (filmHistoryRun && filmHistoryRun.candidates.length > 0) {
+      const filmCandidates: ReadonlyArray<RawCandidate> = filmHistoryRun.candidates;
+      let attachedTotal = 0;
+      for (const loc of withPhoto) {
+        const matches = filmCandidates.filter(
+          (fc) =>
+            distanceMeters(
+              { lat: fc.lat, lng: fc.lng },
+              { lat: loc.lat, lng: loc.lng },
+            ) < 50,
+        );
+        if (matches.length === 0) continue;
+        const additionalFilms: AssociatedFilm[] = matches.flatMap(
+          (m) => m.associatedFilms,
+        );
+        // Dedupe by Wikidata Q-id when present, else by title+year.
+        const merged = [...loc.films];
+        for (const f of additionalFilms) {
+          const dup = merged.find((x) =>
+            f.wikidataQid && x.wikidataQid
+              ? x.wikidataQid === f.wikidataQid
+              : x.title.toLowerCase() === f.title.toLowerCase() && x.year === f.year,
+          );
+          if (!dup) {
+            merged.push({
+              title: f.title,
+              year: f.year,
+              posterUrl: null,
+              tmdbId: null,
+              tmdbUrl: null,
+              wikidataQid: f.wikidataQid,
+            });
+          }
+        }
+        if (merged.length !== loc.films.length) {
+          (loc as { films: ReadonlyArray<SurfacedFilm> }).films = merged;
+          attachedTotal += merged.length - loc.films.length;
+        }
+      }
+      logger.info("enrich-locations film-history attached", {
+        cards: withPhoto.length,
+        candidatesScanned: filmCandidates.length,
+        filmsAttached: attachedTotal,
+      });
+    }
+  }
 
   // -------- Phase 6: TMDb film enrichment --------
   // For each card with associated films, look up TMDb metadata (poster,

@@ -1,6 +1,5 @@
 import { z } from "zod";
 
-import type { Bbox } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { logger } from "@/lib/logger";
 import type {

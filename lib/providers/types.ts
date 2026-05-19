@@ -89,6 +89,12 @@ export type MergedCandidate = Omit<RawCandidate, "externalId" | "source"> & {
    * enrichers can query each source's own id.
    */
   externalIds: Partial<Record<ProviderName, string>>;
+  /**
+   * Rank of this candidate in each contributing provider's ORIGINAL
+   * returned list (0-indexed: 0 = first result the provider returned).
+   * Drives Reciprocal Rank Fusion (RRF) ranking downstream.
+   */
+  perSourceRank: Partial<Record<ProviderName, number>>;
 };
 
 export type ProviderInput = {
