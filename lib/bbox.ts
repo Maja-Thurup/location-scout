@@ -124,3 +124,21 @@ export function distanceMeters(a: LatLng, b: LatLng): number {
 export function metersToMiles(m: number): number {
   return m / 1609.344;
 }
+
+/**
+ * Whether two bounding boxes intersect at all.
+ *
+ * Used by city-scoped candidate providers (e.g. NYC Scenes from the City,
+ * SF film locations) to skip themselves cheaply when the search is
+ * nowhere near their geographic footprint.
+ *
+ * Pure function — bboxes share a common origin (no anti-meridian wrap
+ * support; we never search across longitude 180).
+ */
+export function isBboxOverlapping(a: Bbox, b: Bbox): boolean {
+  if (a.east < b.west) return false;
+  if (a.west > b.east) return false;
+  if (a.north < b.south) return false;
+  if (a.south > b.north) return false;
+  return true;
+}

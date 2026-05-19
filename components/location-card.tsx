@@ -2,7 +2,11 @@
 
 import { useState } from "react";
 
-import type { LocationCardProps } from "@/components/contracts";
+import type {
+  LocationCardProps,
+  LocationSource,
+  SurfacedFilm,
+} from "@/components/contracts";
 import { PhotoAttributionBadge } from "@/components/photo-attribution";
 import { StreetViewModal } from "@/components/street-view-modal";
 
@@ -51,6 +55,10 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
     onSelect,
     visionScore,
     visionReason,
+    sources,
+    description,
+    sourceUrl,
+    films,
   } = props;
 
   const [panoOpen, setPanoOpen] = useState(false);
@@ -134,7 +142,42 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
         </div>
 
         <div className="flex flex-1 flex-col gap-3 p-4">
-          {/* Tags + distance row */}
+          {/* Source pills (Wikidata, Wikipedia, NYC Scenes, OSM, ...) */}
+          {sources && sources.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1">
+              {sources.map((s) => (
+                <span
+                  key={s}
+                  className={
+                    "rounded-full px-2 py-0.5 text-[10px] font-medium tracking-wide " +
+                    sourcePillClass(s)
+                  }
+                >
+                  {sourcePillLabel(s)}
+                </span>
+              ))}
+              {sourceUrl && (
+                <a
+                  href={sourceUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  className="text-[10px] text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+                >
+                  open ↗
+                </a>
+              )}
+            </div>
+          )}
+
+          {/* Provider description (Wikidata schema:description, NYC fun-fact, ...) */}
+          {description && (
+            <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+              {description}
+            </p>
+          )}
+
+          {/* Tag pills */}
           <div className="flex flex-wrap gap-1">
             {badges && badges.length > 0 ? (
               badges.map((b, i) => (
@@ -149,6 +192,9 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
               <span className="text-[10px] text-muted-foreground">no tags</span>
             )}
           </div>
+
+          {/* Famous films shot here (TMDb-enriched poster strip) */}
+          {films && films.length > 0 && <FilmsStrip films={films} />}
 
           <SendToRow deepLinks={deepLinks} />
         </div>
@@ -247,4 +293,121 @@ function visionBadgeClass(score: number): string {
   if (score >= 70) return "bg-emerald-500/80 text-black";
   if (score >= 40) return "bg-amber-500/80 text-black";
   return "bg-red-500/70 text-white";
+}
+
+// ---------------------------------------------------------------------------
+// Source pills — visual identity per provider
+// ---------------------------------------------------------------------------
+
+function sourcePillLabel(source: LocationSource): string {
+  switch (source) {
+    case "osm":
+      return "OSM";
+    case "wikidata-landmark":
+      return "Wikidata";
+    case "wikidata-filming-location":
+      return "Wikidata · P915";
+    case "wikipedia-geosearch":
+      return "Wikipedia";
+    case "nyc-scenes-from-the-city":
+      return "NYC Scenes";
+    case "sf-film-locations":
+      return "SF Films";
+  }
+}
+
+function sourcePillClass(source: LocationSource): string {
+  switch (source) {
+    case "nyc-scenes-from-the-city":
+    case "sf-film-locations":
+      return "bg-rose-500/15 text-rose-200 border border-rose-500/20";
+    case "wikidata-filming-location":
+      return "bg-violet-500/15 text-violet-200 border border-violet-500/20";
+    case "wikidata-landmark":
+      return "bg-blue-500/15 text-blue-200 border border-blue-500/20";
+    case "wikipedia-geosearch":
+      return "bg-sky-500/15 text-sky-200 border border-sky-500/20";
+    case "osm":
+    default:
+      return "bg-white/5 text-muted-foreground border border-white/10";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "Famous films shot here" poster strip
+// ---------------------------------------------------------------------------
+
+function FilmsStrip({ films }: { films: ReadonlyArray<SurfacedFilm> }) {
+  // Up to 3 posters in the strip; the rest get a "+N more" pill.
+  const surfaced = films.slice(0, 3);
+  const overflow = films.length - surfaced.length;
+
+  return (
+    <div
+      className="space-y-1"
+      // Click on a poster shouldn't bubble to the card-select handler.
+      onClick={(e) => e.stopPropagation()}
+    >
+      <p className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+        🎬 Famous films shot here
+      </p>
+      <div className="flex gap-2">
+        {surfaced.map((f, i) => (
+          <FilmPoster key={f.tmdbId ?? `${i}:${f.title}`} film={f} />
+        ))}
+        {overflow > 0 && (
+          <div className="flex h-[78px] w-[52px] items-center justify-center rounded border border-white/10 bg-white/5 text-[10px] text-muted-foreground">
+            +{overflow}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FilmPoster({ film }: { film: SurfacedFilm }) {
+  const tooltipParts = [film.title, film.year ? `(${film.year})` : null].filter(
+    Boolean,
+  );
+  const tooltip = tooltipParts.join(" ");
+
+  const inner = film.posterUrl ? (
+    /* eslint-disable-next-line @next/next/no-img-element */
+    <img
+      src={film.posterUrl}
+      alt={tooltip}
+      loading="lazy"
+      className="h-[78px] w-[52px] rounded border border-white/10 object-cover"
+    />
+  ) : (
+    <div className="flex h-[78px] w-[52px] flex-col items-center justify-center rounded border border-white/10 bg-white/5 px-1 text-center">
+      <span className="line-clamp-2 text-[9px] leading-tight text-muted-foreground">
+        {film.title}
+      </span>
+      {film.year && (
+        <span className="mt-0.5 font-mono text-[9px] text-muted-foreground">
+          {film.year}
+        </span>
+      )}
+    </div>
+  );
+
+  if (film.tmdbUrl) {
+    return (
+      <a
+        href={film.tmdbUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={tooltip}
+        className="transition hover:opacity-80"
+      >
+        {inner}
+      </a>
+    );
+  }
+  return (
+    <span title={tooltip} className="block">
+      {inner}
+    </span>
+  );
 }

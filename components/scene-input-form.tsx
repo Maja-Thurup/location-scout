@@ -12,6 +12,7 @@ import type { SceneAnalysis } from "@/lib/claude";
 import type { OsmCandidate } from "@/lib/overpass";
 import type {
   DeepLinks,
+  LocationSource,
   PhotoAttribution,
   PhotoSource,
 } from "@/components/contracts";
@@ -58,7 +59,31 @@ type ParseSceneResponse = {
   rateLimit: { used: number; limit: number; remaining: number; resetAt: string };
 };
 
-type RankedCandidate = OsmCandidate & { distanceMeters: number };
+type ProviderName =
+  | "osm"
+  | "wikidata-landmark"
+  | "wikidata-filming-location"
+  | "wikipedia-geosearch"
+  | "nyc-scenes-from-the-city"
+  | "sf-film-locations";
+
+type AssociatedFilm = {
+  wikidataQid: string | null;
+  title: string;
+  year: number | null;
+  imdbId: string | null;
+};
+
+type RankedCandidate = OsmCandidate & {
+  distanceMeters: number;
+  // Phase 2a additions, all optional for backwards compat with cached entries.
+  sources?: ReadonlyArray<ProviderName>;
+  primarySource?: ProviderName;
+  description?: string | null;
+  knownImageUrl?: string | null;
+  associatedFilms?: ReadonlyArray<AssociatedFilm>;
+  sourceUrl?: string | null;
+};
 
 type SearchOsmResponse = {
   bbox: Bbox;
@@ -82,12 +107,21 @@ type SearchOsmResponse = {
 
 type SelectedPhoto = {
   url: string;
-  source: PhotoSource;
+  source: PhotoSource; // includes "wikimedia" via contracts.ts
   capturedAt: string | null;
   attributionText: string;
   attributionHref: string | null;
   visionScore: number | null;
   visionReason: string | null;
+};
+
+type SurfacedFilm = {
+  title: string;
+  year: number | null;
+  posterUrl: string | null;
+  tmdbId: number | null;
+  tmdbUrl: string | null;
+  wikidataQid: string | null;
 };
 
 type EnrichedLocation = {
@@ -115,6 +149,12 @@ type EnrichedLocation = {
   deepLinks: DeepLinks;
   badges: ReadonlyArray<{ key: string; value: string }>;
   enrichmentSparse: boolean;
+  // Phase 2a additions.
+  sources: ReadonlyArray<string>;
+  primarySource: string | null;
+  description: string | null;
+  sourceUrl: string | null;
+  films: ReadonlyArray<SurfacedFilm>;
 };
 
 type EnrichResponse = {
@@ -158,6 +198,9 @@ async function searchOsmRequest(input: {
   googleTypes?: string[];
   googleQuery?: string;
   mapillaryClasses?: string[];
+  sceneTokens?: ReadonlyArray<string>;
+  antiTokens?: ReadonlyArray<string>;
+  locationKind?: string | null;
   location?: string;
   radiusMiles: number | null;
 }): Promise<SearchOsmResponse> {
@@ -181,6 +224,12 @@ async function enrichLocationsRequest(input: {
     lng: number;
     tags: Record<string, string>;
     name?: string | null;
+    sources?: ReadonlyArray<ProviderName>;
+    primarySource?: ProviderName;
+    description?: string | null;
+    knownImageUrl?: string | null;
+    associatedFilms?: ReadonlyArray<AssociatedFilm>;
+    sourceUrl?: string | null;
   }>;
   searchCenter?: { lat: number; lng: number };
   searchBbox?: { south: number; west: number; north: number; east: number };
@@ -395,6 +444,10 @@ export function SceneInputForm({
         googleTypes: analysis.google_types,
         googleQuery: analysis.google_query,
         mapillaryClasses: analysis.mapillary_classes,
+        // Phase 2a: providers can use these to tailor their queries.
+        sceneTokens,
+        antiTokens: analysis.anti_tokens ?? [],
+        locationKind: analysis.location_kind ?? null,
         location,
         radiusMiles,
       });
@@ -436,6 +489,14 @@ export function SceneInputForm({
           lng: c.lng,
           tags: c.tags,
           name: c.name,
+          // Phase 2a: forward provider metadata so the vision step uses
+          // curated descriptions/images and the card can show source pills + films.
+          sources: c.sources,
+          primarySource: c.primarySource,
+          description: c.description,
+          knownImageUrl: c.knownImageUrl,
+          associatedFilms: c.associatedFilms,
+          sourceUrl: c.sourceUrl,
         })),
         searchCenter: osm.center,
         searchBbox: osm.bbox,
@@ -851,6 +912,14 @@ function ResultCardsPanel({
               badges={loc.badges.map((b) => `${b.key}=${b.value}`)}
               visionScore={loc.photo?.visionScore ?? undefined}
               visionReason={loc.photo?.visionReason ?? undefined}
+              sources={
+                loc.sources && loc.sources.length > 0
+                  ? (loc.sources as ReadonlyArray<LocationSource>)
+                  : undefined
+              }
+              description={loc.description ?? undefined}
+              sourceUrl={loc.sourceUrl ?? undefined}
+              films={loc.films}
             />
           ))}
         </div>

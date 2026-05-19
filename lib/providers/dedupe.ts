@@ -1,0 +1,159 @@
+import { distanceMeters } from "@/lib/bbox";
+import type {
+  AssociatedFilm,
+  MergedCandidate,
+  ProviderName,
+  RawCandidate,
+} from "@/lib/providers/types";
+
+/**
+ * Source priority — used both to pick which input becomes the canonical
+ * record (coords, name) AND to break dedupe ties when two providers
+ * disagree on which entry is "richer".
+ *
+ * Higher index = higher priority. Curated/structured data beats raw OSM.
+ *
+ * Rationale (most-priority first):
+ * - NYC Scenes from the City: book-curated, hand-verified iconic scenes
+ * - SF Film Locations: curated municipal dataset
+ * - Wikidata P915: structured film-location property, citation-backed
+ * - Wikidata generic: structured heritage/landmark data, less specific
+ * - Wikipedia geosearch: notable places by virtue of having an article
+ * - OSM: raw tag-driven, lowest curated signal
+ */
+const SOURCE_PRIORITY: ReadonlyArray<ProviderName> = [
+  "osm",
+  "wikipedia-geosearch",
+  "wikidata-landmark",
+  "wikidata-filming-location",
+  "sf-film-locations",
+  "nyc-scenes-from-the-city",
+];
+
+function priorityOf(p: ProviderName): number {
+  const idx = SOURCE_PRIORITY.indexOf(p);
+  return idx === -1 ? -1 : idx;
+}
+
+/**
+ * Two candidates are considered the same place when their coordinates are
+ * within `proximityMeters`. 50m is generous enough to merge the OSM
+ * polygon centroid with the Wikidata point and the curated film record,
+ * tight enough to keep distinct nearby buildings separate.
+ */
+const DEFAULT_PROXIMITY_METERS = 50;
+
+/**
+ * Merge a list of raw candidates from multiple providers into a
+ * deduplicated, source-tagged list.
+ *
+ * Strategy:
+ * 1. Sort raws by descending source priority so the highest-priority
+ *    record is the seed for any cluster.
+ * 2. For each raw, find an existing merged whose canonical coord is
+ *    within `proximityMeters`. If found, MERGE in. Otherwise create a
+ *    new merged record.
+ * 3. When merging, take the highest-priority non-null value for each
+ *    field (name, description, knownImageUrl, sourceUrl). Tags are
+ *    union'd. Films are deduped by Q-id / title.
+ *
+ * Pure function — covered by unit tests.
+ */
+export function mergeCandidates(
+  raws: ReadonlyArray<RawCandidate>,
+  proximityMeters: number = DEFAULT_PROXIMITY_METERS,
+): MergedCandidate[] {
+  // Sort highest-priority first so cluster seeds win on coords + canonical name.
+  const sorted = [...raws].sort(
+    (a, b) => priorityOf(b.source) - priorityOf(a.source),
+  );
+
+  const merged: MergedCandidate[] = [];
+
+  for (const raw of sorted) {
+    const cluster = merged.find(
+      (m) =>
+        distanceMeters({ lat: m.lat, lng: m.lng }, { lat: raw.lat, lng: raw.lng }) <
+        proximityMeters,
+    );
+
+    if (cluster) {
+      // Augment the cluster with this lower-priority record.
+      if (!cluster.sources.includes(raw.source)) {
+        (cluster.sources as ProviderName[]).push(raw.source);
+      }
+      cluster.externalIds[raw.source] = raw.externalId;
+      cluster.name = pickRicher(cluster.name, raw.name);
+      cluster.description = pickRicher(cluster.description, raw.description);
+      cluster.knownImageUrl = cluster.knownImageUrl ?? raw.knownImageUrl;
+      cluster.sourceUrl = cluster.sourceUrl ?? raw.sourceUrl;
+      cluster.tags = unionTags(cluster.tags, raw.tags);
+      cluster.associatedFilms = mergeFilms(cluster.associatedFilms, raw.associatedFilms);
+    } else {
+      merged.push({
+        id: `${raw.source}:${raw.externalId}`,
+        primarySource: raw.source,
+        sources: [raw.source],
+        externalIds: { [raw.source]: raw.externalId },
+        lat: raw.lat,
+        lng: raw.lng,
+        name: raw.name,
+        description: raw.description,
+        knownImageUrl: raw.knownImageUrl,
+        tags: { ...raw.tags },
+        associatedFilms: raw.associatedFilms,
+        sourceUrl: raw.sourceUrl,
+      });
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Pick the more informative of two strings. Both null -> null. One null -> the
+ * other. Both non-null -> the longer (more descriptive). Trims whitespace.
+ */
+function pickRicher(a: string | null, b: string | null): string | null {
+  const aT = a?.trim() ?? "";
+  const bT = b?.trim() ?? "";
+  if (!aT && !bT) return null;
+  if (!aT) return bT;
+  if (!bT) return aT;
+  return bT.length > aT.length ? bT : aT;
+}
+
+function unionTags(
+  a: Record<string, string>,
+  b: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...a };
+  for (const [k, v] of Object.entries(b)) {
+    if (!out[k] && v) out[k] = v;
+  }
+  return out;
+}
+
+/** Dedupe films by Wikidata Q-id when present, otherwise by title+year. */
+function mergeFilms(
+  a: ReadonlyArray<AssociatedFilm>,
+  b: ReadonlyArray<AssociatedFilm>,
+): AssociatedFilm[] {
+  const out: AssociatedFilm[] = [...a];
+  for (const f of b) {
+    const dup = out.find((x) =>
+      f.wikidataQid && x.wikidataQid
+        ? x.wikidataQid === f.wikidataQid
+        : x.title.toLowerCase() === f.title.toLowerCase() && x.year === f.year,
+    );
+    if (!dup) {
+      out.push(f);
+    } else {
+      // Prefer the entry with more identifiers populated.
+      dup.wikidataQid = dup.wikidataQid ?? f.wikidataQid;
+      dup.imdbId = dup.imdbId ?? f.imdbId;
+      dup.year = dup.year ?? f.year;
+    }
+  }
+  return out;
+}

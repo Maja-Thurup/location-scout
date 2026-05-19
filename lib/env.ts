@@ -27,6 +27,17 @@ const serverEnvSchema = z.object({
 
   NEXT_PUBLIC_POSTHOG_KEY: z.string().min(1),
   NEXT_PUBLIC_POSTHOG_HOST: z.url(),
+
+  /**
+   * The Movie Database read-access token (v4 bearer JWT). Used only for
+   * looking up movie metadata (poster, year, popularity) for filming-
+   * location candidates that have a Wikidata Q-id. Optional — if absent,
+   * the "Famous films shot here" badge degrades to title+year only.
+   *
+   * Get one at https://www.themoviedb.org/settings/api (free, requires
+   * confirming a brief usage statement).
+   */
+  TMDB_READ_ACCESS_TOKEN: z.string().optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;

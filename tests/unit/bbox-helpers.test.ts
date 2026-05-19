@@ -5,6 +5,7 @@ import {
   bboxFromRadius,
   distanceMeters,
   expandBbox,
+  isBboxOverlapping,
   isReasonableBbox,
   metersToMiles,
 } from "@/lib/bbox";
@@ -69,5 +70,31 @@ describe("distanceMeters (haversine)", () => {
     const km = distanceMeters(a, b) / 1000;
     expect(km).toBeGreaterThan(110);
     expect(km).toBeLessThan(112);
+  });
+});
+
+describe("isBboxOverlapping", () => {
+  const NYC = { south: 40.4, west: -74.3, north: 41.0, east: -73.7 };
+  const LA = { south: 33.7, west: -118.7, north: 34.3, east: -118.1 };
+  const PART_OF_NYC = { south: 40.7, west: -74.1, north: 40.8, east: -73.9 };
+
+  it("identical bboxes overlap", () => {
+    expect(isBboxOverlapping(NYC, NYC)).toBe(true);
+  });
+
+  it("inner bbox overlaps with the outer one", () => {
+    expect(isBboxOverlapping(NYC, PART_OF_NYC)).toBe(true);
+    expect(isBboxOverlapping(PART_OF_NYC, NYC)).toBe(true);
+  });
+
+  it("disjoint cities do NOT overlap", () => {
+    expect(isBboxOverlapping(NYC, LA)).toBe(false);
+    expect(isBboxOverlapping(LA, NYC)).toBe(false);
+  });
+
+  it("edge-touching boxes count as overlapping", () => {
+    const east = { south: 40, west: -74, north: 41, east: -73 };
+    const adjacent = { south: 40, west: -73, north: 41, east: -72 };
+    expect(isBboxOverlapping(east, adjacent)).toBe(true);
   });
 });

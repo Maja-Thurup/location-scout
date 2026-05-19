@@ -21,14 +21,21 @@ import {
   searchOsm,
   searchOsmRich,
 } from "@/lib/overpass";
+import { mergeCandidates } from "@/lib/providers/dedupe";
+import { runProviders } from "@/lib/providers/registry";
+import type {
+  AssociatedFilm,
+  ProviderName,
+  RawCandidate,
+} from "@/lib/providers/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 /**
  * Bumped from default (10s on Vercel Hobby, 15s on Pro) so the rich-tag
- * parallel-alternatives pipeline has headroom on big-city bboxes. Each
- * alternative caps at ~25s on Overpass; 60s lets a few stragglers fail
- * over to a backup mirror without aborting the whole request.
+ * parallel-alternatives pipeline plus the new candidate providers
+ * (Wikidata SPARQL, Wikipedia geosearch, NYC/SF datasets) all have
+ * headroom on big-city bboxes.
  */
 export const maxDuration = 60;
 
@@ -37,19 +44,14 @@ const ALLOWED_RADII = [5, 10, 25, 50, 100] as const;
 const requestSchema = z.object({
   /**
    * Single OSM tag-set. Backwards-compat path; if `osmTagsAlternatives` is
-   * non-empty, this is ignored for retrieval. Always required so callers
+   * non-empty, this is ignored for OSM retrieval. Always required so callers
    * can fall back when the LLM didn't emit alternatives.
-   * Example: { "building": "warehouse", "abandoned": "yes" }
    */
   osmTags: z
     .record(z.string(), z.string())
     .refine((obj) => Object.keys(obj).length > 0, "osmTags must have at least one entry"),
 
-  /**
-   * Multiple alternative tag-sets to UNION at the Overpass layer.
-   * When present, drives the rich-tag candidate-generation path.
-   * Empty/absent triggers the legacy single-tag-set path.
-   */
+  /** Multiple alternative tag-sets to UNION at the OSM layer. */
   osmTagsAlternatives: z
     .array(z.record(z.string(), z.string()))
     .optional()
@@ -58,25 +60,33 @@ const requestSchema = z.object({
   /** Optional Google Places "type" filter for the B2 text-search fallback. */
   googleTypes: z.array(z.string()).optional(),
 
-  /**
-   * Optional Claude-derived text query for the B2 fallback when OSM is
-   * empty even after ring expansion. e.g. "warehouse Brooklyn industrial".
-   */
+  /** Optional Claude-derived text query for the B2 fallback. */
   googleQuery: z.string().min(1).max(200).optional(),
 
-  /**
-   * Optional Mapillary `object_value` classes specified by Claude. When
-   * present, we fetch detections in the bbox and ADD them as candidates
-   * alongside OSM results. Especially useful for object-rich scenes
-   * where OSM is sparse (e.g. "bench on a wooded path" — OSM returns
-   * the park polygon centroid; Mapillary returns 50+ actual bench coords).
-   */
+  /** Optional Mapillary `object_value` classes specified by Claude. */
   mapillaryClasses: z.array(z.string()).optional(),
 
   /**
-   * Free-text location string to geocode (city, neighborhood, address).
-   * One of `location` or `bbox` must be provided.
+   * Phase 2a: pass through to providers so they can tailor their queries
+   * (e.g. Wikidata could filter by location_kind in the future).
    */
+  sceneTokens: z.array(z.string()).optional().default([]),
+  antiTokens: z.array(z.string()).optional().default([]),
+  locationKind: z
+    .enum([
+      "urban",
+      "suburban",
+      "rural",
+      "industrial",
+      "wilderness",
+      "waterfront",
+      "mixed",
+    ])
+    .nullable()
+    .optional()
+    .default(null),
+
+  /** Free-text location string to geocode. */
   location: z.string().min(2).max(160).optional(),
 
   /** Optional radius around the geocoded location, in miles. */
@@ -87,10 +97,7 @@ const requestSchema = z.object({
     .nullable()
     .optional(),
 
-  /**
-   * Pre-computed bbox. Used when a Project saves a search and we want to
-   * re-render the same results next session.
-   */
+  /** Pre-computed bbox. */
   bbox: z
     .object({
       south: z.number(),
@@ -101,37 +108,48 @@ const requestSchema = z.object({
     .optional(),
 });
 
-/** Candidate enriched with distance from the search center. */
-type RankedCandidate = OsmCandidate & {
-  /** Approximate distance (meters) from the search center. */
+/**
+ * Candidate sent to the client. Extends the OSM-shape with provider
+ * metadata so the enrichment pipeline + UI can show richer cards
+ * (descriptions, curated images, films attached, source pills).
+ */
+type RankedCandidate = {
+  // OSM-style core
+  id: string;
+  type: "node" | "way" | "relation";
+  osmId: number;
+  lat: number;
+  lng: number;
+  tags: Record<string, string>;
+  name: string | null;
+  // Provider extension
+  sources: ReadonlyArray<ProviderName>;
+  primarySource: ProviderName;
+  description: string | null;
+  knownImageUrl: string | null;
+  associatedFilms: ReadonlyArray<AssociatedFilm>;
+  sourceUrl: string | null;
+  // Search-time
   distanceMeters: number;
 };
 
-/** Extended match modes including the B2 Google-Places-text-search fallback. */
 export type ExtendedMatchMode = MatchMode | "google_text_fallback";
 
 type SearchOsmResponse = {
-  /** Bbox actually queried (post-expansion if any). */
   bbox: Bbox;
-  /** Bbox the user originally requested, before any ring expansion. */
   requestedBbox: Bbox;
   center: { lat: number; lng: number };
   candidates: RankedCandidate[];
   cached: boolean;
-  /** Where the original bbox came from. */
   bboxSource: "geocoded_city" | "geocoded_radius" | "supplied";
-  /** Tier that supplied the result. */
   matchMode: ExtendedMatchMode;
-  /** Tag the loose path used (non-null for primary_only* and possibly best_effort). */
   primaryTag: { key: string; value: string } | null;
-  /** Multiplier applied to the user's bbox: 1 | 2 | 4. */
   expansionMultiplier: 1 | 2 | 4;
-  /** Mirror that served the live query (null on cache hit). */
   mirror: string | null;
-  /** How many tag-set alternatives the rich-search path tried. 1 = legacy. */
   alternativesTried: number;
-  /** How many alternatives produced results (vs threw). */
   alternativesSucceeded: number;
+  /** Per-provider stats, surfaced for debugging + the analysis panel UI. */
+  providerStats: Record<ProviderName, { count: number; ms: number; error: string | null }>;
 };
 
 type CachedSearchValue = {
@@ -142,6 +160,7 @@ type CachedSearchValue = {
   expansionMultiplier: 1 | 2 | 4;
   alternativesTried: number;
   alternativesSucceeded: number;
+  providerStats: Record<ProviderName, { count: number; ms: number; error: string | null }>;
 };
 
 // ---------------------------------------------------------------------------
@@ -166,29 +185,61 @@ export function sceneImpliesAbandonment(args: {
 }
 
 // ---------------------------------------------------------------------------
-// B2 helper: convert Google Places search results into the same OsmCandidate
-// shape downstream code expects, so the rest of the pipeline doesn't care
-// where the candidates came from.
+// Conversion: OSM candidate -> RawCandidate so it can flow through the
+// provider-merge step alongside Wikidata/Wikipedia/NYC/SF results.
 // ---------------------------------------------------------------------------
 
-function googlePlaceToOsmCandidate(p: GooglePlace): OsmCandidate {
+function osmCandidateToRaw(c: OsmCandidate): RawCandidate {
   return {
-    id: `google/${p.id}`,
-    type: "node",
-    osmId: 0,
+    externalId: c.id,
+    source: "osm",
+    lat: c.lat,
+    lng: c.lng,
+    name: c.name,
+    description: null,
+    knownImageUrl: null,
+    tags: c.tags,
+    associatedFilms: [],
+    sourceUrl: `https://www.openstreetmap.org/${c.type}/${c.osmId}`,
+  };
+}
+
+function googlePlaceToRaw(p: GooglePlace): RawCandidate {
+  return {
+    externalId: p.id,
+    source: "osm", // treat Google fallback as OSM-class for the merge step
     lat: p.lat,
     lng: p.lng,
+    name: p.displayName ?? null,
+    description: p.editorialSummary ?? null,
+    knownImageUrl: null,
     tags: {
-      name: p.displayName ?? "",
       "google:place_id": p.id,
       "google:primary_type": p.primaryType ?? "",
       ...(p.businessStatus ? { "google:business_status": p.businessStatus } : {}),
     },
-    name: p.displayName ?? null,
+    associatedFilms: [],
+    sourceUrl: p.googleMapsUri ?? null,
   };
 }
 
 const MAX_BBOX_RADIUS_MILES = 100;
+const MAX_OUTPUT_CANDIDATES = 50;
+
+/** OSM "type" used downstream for ID composition. Provider candidates use "node". */
+function inferTypeFromId(id: string): "node" | "way" | "relation" {
+  if (id.startsWith("way/")) return "way";
+  if (id.startsWith("relation/")) return "relation";
+  return "node";
+}
+
+/** OSM-internal numeric id, when applicable; 0 for non-OSM provider sources. */
+function inferOsmId(externalIds: Record<string, string | undefined>): number {
+  const osmExt = externalIds.osm;
+  if (!osmExt) return 0;
+  const m = /^(?:node|way|relation)\/(\d+)$/.exec(osmExt);
+  return m ? Number(m[1]) : 0;
+}
 
 export const POST = withAuth(async (req) => {
   const t0 = Date.now();
@@ -219,23 +270,20 @@ export const POST = withAuth(async (req) => {
     googleTypes,
     googleQuery,
     mapillaryClasses,
+    sceneTokens,
+    antiTokens,
+    locationKind,
     location,
     radiusMiles,
     bbox: suppliedBbox,
   } = parsed.data;
 
-  /**
-   * When the client sends rich alternatives, prefer them. Otherwise fall
-   * back to a single-element list of `osmTags` so downstream code only
-   * deals with one shape.
-   */
   const effectiveAlternatives: ReadonlyArray<Record<string, string>> =
     osmTagsAlternatives.length > 0 ? osmTagsAlternatives : [osmTags];
 
-  // 1) Resolve bbox: supplied -> custom radius around geocode -> geocoded bbox.
+  // 1) Resolve bbox.
   let bbox: Bbox;
   let bboxSource: SearchOsmResponse["bboxSource"];
-
   if (suppliedBbox) {
     if (!isReasonableBbox(suppliedBbox)) {
       return NextResponse.json(
@@ -248,24 +296,17 @@ export const POST = withAuth(async (req) => {
   } else {
     if (!location) {
       return NextResponse.json(
-        {
-          error: "invalid_request",
-          message: "Either `location` or `bbox` is required.",
-        },
+        { error: "invalid_request", message: "Either `location` or `bbox` is required." },
         { status: 400 },
       );
     }
     const geocoded = await forwardGeocode(location);
     if (!geocoded) {
       return NextResponse.json(
-        {
-          error: "geocode_failed",
-          message: `Could not find "${location}" on the map.`,
-        },
+        { error: "geocode_failed", message: `Could not find "${location}" on the map.` },
         { status: 422 },
       );
     }
-
     if (radiusMiles != null) {
       bbox = clampBbox(
         bboxFromRadius({ lat: geocoded.lat, lng: geocoded.lng }, radiusMiles),
@@ -276,17 +317,16 @@ export const POST = withAuth(async (req) => {
       bbox = clampBbox(geocoded.bbox, MAX_BBOX_RADIUS_MILES);
       bboxSource = "geocoded_city";
     } else {
-      // Geocoder didn't return a bbox (rare). Default to a 25-mile radius.
       bbox = bboxFromRadius({ lat: geocoded.lat, lng: geocoded.lng }, 25);
       bboxSource = "geocoded_radius";
     }
   }
 
-  // 2) Cache lookup (14-day TTL).
-  // v3 namespace: candidate set now also includes Mapillary detections when
-  // mapillaryClasses is non-empty AND a rich-alternatives signal, so the
-  // key must include both.
+  // 2) Cache lookup.
+  // v4 namespace: response now includes provider results (Wikidata,
+  // Wikipedia, NYC, SF). Previous cache entries don't have those.
   const key = cacheKey("overpass:v3", {
+    schema: "v4-providers",
     bbox,
     osmTags,
     osmTagsAlternatives: effectiveAlternatives,
@@ -299,7 +339,6 @@ export const POST = withAuth(async (req) => {
       ms: Date.now() - t0,
       candidateCount: cached.candidates.length,
       matchMode: cached.matchMode,
-      expansionMultiplier: cached.expansionMultiplier,
     });
     const effective = cached.effectiveBbox ?? bbox;
     const response: SearchOsmResponse = {
@@ -315,31 +354,40 @@ export const POST = withAuth(async (req) => {
       mirror: null,
       alternativesTried: cached.alternativesTried ?? 1,
       alternativesSucceeded: cached.alternativesSucceeded ?? cached.alternativesTried ?? 1,
+      providerStats:
+        cached.providerStats ??
+        ({} as Record<ProviderName, { count: number; ms: number; error: string | null }>),
     };
     return NextResponse.json(response, { status: 200 });
   }
 
-  // 3) Run the Overpass query. Two paths:
-  //    - Rich UNION query when Claude (or the caller) supplied multiple
-  //      alternatives. Implements Pinterest-Lens "candidate generation":
-  //      generate broadly, the vision step downstream tightens precision.
-  //    - Legacy single-tag-set path with tier-relaxation, kept for
-  //      backwards-compat with old cache entries / non-Claude callers.
-  let result;
+  // 3) PARALLEL: run OSM and the provider registry.
+  //    OSM has its own tier-relaxation logic; providers each cache for
+  //    7 days so re-runs are nearly free.
+  const osmPromise = (async () => {
+    return effectiveAlternatives.length > 1
+      ? await searchOsmRich({
+          bbox,
+          osmTagsAlternatives: effectiveAlternatives,
+        })
+      : await searchOsm({ bbox, osmTags: effectiveAlternatives[0]! });
+  })();
+  const providersPromise = runProviders({
+    bbox,
+    sceneTokens,
+    antiTokens,
+    locationKind,
+    osmTagsAlternatives: effectiveAlternatives,
+  });
+
+  let osmResult;
   try {
-    result =
-      effectiveAlternatives.length > 1
-        ? await searchOsmRich({
-            bbox,
-            osmTagsAlternatives: effectiveAlternatives,
-          })
-        : await searchOsm({ bbox, osmTags: effectiveAlternatives[0]! });
+    [osmResult] = await Promise.all([osmPromise]);
   } catch (err) {
     logger.error("search-osm overpass failed", {
       userId: req.dbUserId,
       err: String(err),
       ms: Date.now() - t0,
-      alternativesCount: effectiveAlternatives.length,
     });
     return NextResponse.json(
       {
@@ -349,20 +397,20 @@ export const POST = withAuth(async (req) => {
       { status: 502 },
     );
   }
+  // Providers must NEVER throw; if they do, runProviders catches and
+  // returns an error stat. We await separately so an OSM throw doesn't
+  // cancel them (and vice versa).
+  const providerResult = await providersPromise;
 
-  let effectiveBbox = result.effectiveBbox;
-  let candidatesRaw = result.candidates;
-  let finalMatchMode: ExtendedMatchMode = result.matchMode;
-  let finalExpansion: 1 | 2 | 4 = result.expansionMultiplier;
-  let finalPrimaryTag = result.primaryTag;
+  let effectiveBbox = osmResult.effectiveBbox;
+  const osmCandidates = osmResult.candidates;
+  let finalMatchMode: ExtendedMatchMode = osmResult.matchMode;
+  let finalExpansion: 1 | 2 | 4 = osmResult.expansionMultiplier;
+  let finalPrimaryTag = osmResult.primaryTag;
 
-  // 3.5) Mapillary detections as additional candidates.
-  //
-  // For object-rich scenes (bench, fire hydrant, bike rack, cobblestone),
-  // Mapillary's pre-computed detections often locate filmable spots more
-  // precisely than OSM does. We fetch them in parallel with the OSM result
-  // and merge — each detection becomes its own candidate at the exact
-  // coord where the camera saw the object.
+  // 3.5) Mapillary detections — additional OSM-flavored candidates from
+  // street-level object detections (benches, hydrants, etc.).
+  const mapillaryCandidates: OsmCandidate[] = [];
   if (mapillaryClasses && mapillaryClasses.length > 0) {
     const bboxStr = `${effectiveBbox.west},${effectiveBbox.south},${effectiveBbox.east},${effectiveBbox.north}`;
     try {
@@ -371,29 +419,20 @@ export const POST = withAuth(async (req) => {
         classes: mapillaryClasses,
         limit: 80,
       });
-
+      for (const d of detections) {
+        mapillaryCandidates.push({
+          id: `mapillary/${d.id}`,
+          type: "node",
+          osmId: 0,
+          lat: d.lat,
+          lng: d.lng,
+          tags: { [`mapillary:${d.objectClass}`]: "yes" },
+          name: null,
+        });
+      }
       if (detections.length > 0) {
-        const before = candidatesRaw.length;
-        const seen = new Set(candidatesRaw.map((c) => c.id));
-        for (const d of detections) {
-          const id = `mapillary/${d.id}`;
-          if (seen.has(id)) continue;
-          seen.add(id);
-          candidatesRaw.push({
-            id,
-            type: "node",
-            osmId: 0,
-            lat: d.lat,
-            lng: d.lng,
-            tags: { [`mapillary:${d.objectClass}`]: "yes" },
-            name: null,
-          });
-        }
-        logger.info("search-osm Mapillary detections merged in", {
-          userId: req.dbUserId,
-          osmCount: before,
-          detectionCount: detections.length,
-          afterMerge: candidatesRaw.length,
+        logger.info("search-osm Mapillary detections merged", {
+          count: detections.length,
         });
       }
     } catch (err) {
@@ -403,16 +442,21 @@ export const POST = withAuth(async (req) => {
     }
   }
 
-  // 4) B2 — Google Places text-search fallback. Triggered when Overpass came
-  //    back empty even after ring expansion. Filmmakers' "diner" / "old
-  //    movie theatre" type searches in places where OSM is sparse get
-  //    rescued here, fulfilling the "always return something" promise.
+  // 4) Build the unified raw-candidate pool: OSM + Mapillary + providers.
+  const rawCandidates: RawCandidate[] = [
+    ...osmCandidates.map(osmCandidateToRaw),
+    ...mapillaryCandidates.map(osmCandidateToRaw),
+    ...providerResult.candidates,
+  ];
+
+  // 4.5) B2 — Google Places text-search fallback. Triggered when EVERY
+  // source came back empty (OSM + providers + Mapillary).
   if (
-    candidatesRaw.length === 0 &&
+    rawCandidates.length === 0 &&
     googleQuery &&
     googleQuery.trim().length >= 2
   ) {
-    logger.info("search-osm OSM empty, attempting Google Places text fallback", {
+    logger.info("search-osm all sources empty, attempting Google Places text fallback", {
       userId: req.dbUserId,
       googleQuery,
     });
@@ -427,39 +471,49 @@ export const POST = withAuth(async (req) => {
     });
 
     if (places.length > 0) {
-      candidatesRaw = places.map(googlePlaceToOsmCandidate);
+      rawCandidates.push(...places.map(googlePlaceToRaw));
       finalMatchMode = "google_text_fallback";
-      finalExpansion = result.expansionMultiplier;
+      finalExpansion = osmResult.expansionMultiplier;
       finalPrimaryTag = null;
       logger.info("search-osm Google Places fallback hit", {
-        userId: req.dbUserId,
-        count: candidatesRaw.length,
-        includeClosed,
+        count: places.length,
       });
     }
   }
 
-  // 5) Sort candidates by distance from the *effective* bbox center, so
-  //    the closest possible matches surface first.
-  const center = bboxCenter(effectiveBbox);
-  const ranked: RankedCandidate[] = candidatesRaw
-    .map((c) => ({
-      ...c,
-      distanceMeters: distanceMeters(center, { lat: c.lat, lng: c.lng }),
-    }))
-    .sort((a, b) => a.distanceMeters - b.distanceMeters);
+  // 5) Merge by 50m proximity, preferring richer sources.
+  const merged = mergeCandidates(rawCandidates);
 
-  // 6) Cache.
-  // `alternativesTried` / `alternativesSucceeded` are only present on
-  // RichSearchResult; default to 1 for the legacy single-tag path so old
-  // code keeps working.
+  // 6) Convert merged -> ranked, sort by distance from search center.
+  const center = bboxCenter(effectiveBbox);
+  const ranked: RankedCandidate[] = merged
+    .map((m) => ({
+      id: m.id,
+      type: m.primarySource === "osm" ? inferTypeFromId(m.externalIds.osm ?? "") : "node",
+      osmId: inferOsmId(m.externalIds),
+      lat: m.lat,
+      lng: m.lng,
+      tags: m.tags,
+      name: m.name,
+      sources: m.sources,
+      primarySource: m.primarySource,
+      description: m.description,
+      knownImageUrl: m.knownImageUrl,
+      associatedFilms: m.associatedFilms,
+      sourceUrl: m.sourceUrl,
+      distanceMeters: distanceMeters(center, { lat: m.lat, lng: m.lng }),
+    }))
+    .sort((a, b) => a.distanceMeters - b.distanceMeters)
+    .slice(0, MAX_OUTPUT_CANDIDATES);
+
+  // 7) Cache.
   const alternativesTried =
-    "alternativesTried" in result
-      ? (result as { alternativesTried: number }).alternativesTried
+    "alternativesTried" in osmResult
+      ? (osmResult as { alternativesTried: number }).alternativesTried
       : 1;
   const alternativesSucceeded =
-    "alternativesSucceeded" in result
-      ? (result as { alternativesSucceeded: number }).alternativesSucceeded
+    "alternativesSucceeded" in osmResult
+      ? (osmResult as { alternativesSucceeded: number }).alternativesSucceeded
       : 1;
 
   const toCache: CachedSearchValue = {
@@ -470,19 +524,20 @@ export const POST = withAuth(async (req) => {
     expansionMultiplier: finalExpansion,
     alternativesTried,
     alternativesSucceeded,
+    providerStats: providerResult.perProvider,
   };
   await cacheSet(key, "overpass:v3", toCache, 14);
 
   logger.info("search-osm success", {
     userId: req.dbUserId,
     ms: Date.now() - t0,
-    candidateCount: ranked.length,
-    rawCount: result.rawCount,
-    mirror: result.mirror,
+    osmCount: osmCandidates.length,
+    mapillaryCount: mapillaryCandidates.length,
+    providerCount: providerResult.candidates.length,
+    rawTotal: rawCandidates.length,
+    rendered: ranked.length,
     matchMode: finalMatchMode,
-    expansionMultiplier: finalExpansion,
-    alternativesTried,
-    alternativesSucceeded,
+    perProvider: providerResult.perProvider,
   });
 
   const response: SearchOsmResponse = {
@@ -495,9 +550,10 @@ export const POST = withAuth(async (req) => {
     matchMode: finalMatchMode,
     primaryTag: finalPrimaryTag,
     expansionMultiplier: finalExpansion,
-    mirror: result.mirror,
+    mirror: osmResult.mirror,
     alternativesTried,
     alternativesSucceeded,
+    providerStats: providerResult.perProvider,
   };
   return NextResponse.json(response, { status: 200 });
 });

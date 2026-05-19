@@ -31,6 +31,12 @@ import {
   probeStreetViewWithHeading,
   type StreetViewProbe,
 } from "@/lib/street-view";
+import {
+  findMovieByImdb,
+  findMovieByWikidata,
+  searchMovieByTitle,
+  type TmdbMovie,
+} from "@/lib/tmdb";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,6 +51,22 @@ export const maxDuration = 60;
 // Inputs / outputs
 // ---------------------------------------------------------------------------
 
+const providerNameSchema = z.enum([
+  "osm",
+  "wikidata-landmark",
+  "wikidata-filming-location",
+  "wikipedia-geosearch",
+  "nyc-scenes-from-the-city",
+  "sf-film-locations",
+]);
+
+const associatedFilmSchema = z.object({
+  wikidataQid: z.string().nullable(),
+  title: z.string(),
+  year: z.number().nullable(),
+  imdbId: z.string().nullable(),
+});
+
 const candidateSchema = z.object({
   id: z.string(),
   type: z.enum(["node", "way", "relation"]),
@@ -52,6 +74,13 @@ const candidateSchema = z.object({
   lng: z.number(),
   tags: z.record(z.string(), z.string()).default({}),
   name: z.string().nullable().optional(),
+  // Phase 2a: provider metadata (all optional for backwards compat).
+  sources: z.array(providerNameSchema).optional().default([]),
+  primarySource: providerNameSchema.optional(),
+  description: z.string().nullable().optional(),
+  knownImageUrl: z.string().nullable().optional(),
+  associatedFilms: z.array(associatedFilmSchema).optional().default([]),
+  sourceUrl: z.string().nullable().optional(),
 });
 
 const requestSchema = z.object({
@@ -110,12 +139,28 @@ const requestSchema = z.object({
 
 export type SelectedPhoto = {
   url: string;
-  source: "google" | "street_view" | "mapillary";
+  /** Mirrors `PhotoSource` from contracts.ts. "wikimedia" covers Wikidata + Wikipedia + Commons curated images. */
+  source: "google" | "street_view" | "mapillary" | "wikimedia";
   capturedAt: string | null;
   attributionText: string;
   attributionHref: string | null;
   visionScore: number | null;
   visionReason: string | null;
+};
+
+/**
+ * Surfaced film with TMDb enrichment when available. Title is always
+ * present (from the source provider). posterUrl and tmdbUrl are filled
+ * by the TMDb enricher when a match is found.
+ */
+export type SurfacedFilm = {
+  title: string;
+  year: number | null;
+  posterUrl: string | null;
+  tmdbId: number | null;
+  tmdbUrl: string | null;
+  /** Wikidata Q-id of the film, when known. */
+  wikidataQid: string | null;
 };
 
 export type EnrichedLocation = {
@@ -147,6 +192,18 @@ export type EnrichedLocation = {
 
   badges: ReadonlyArray<{ key: string; value: string }>;
   enrichmentSparse: boolean;
+
+  // ---- Phase 2a additions ----
+  /** Providers that contributed this candidate (for source pills in UI). */
+  sources: ReadonlyArray<string>;
+  /** Highest-priority source — drives the "primary" pill style. */
+  primarySource: string | null;
+  /** Wikidata description / NYC fun-fact / Wikipedia summary, when present. */
+  description: string | null;
+  /** Source URL for the "Open" link (Wikipedia article, NYC dataset row, ...). */
+  sourceUrl: string | null;
+  /** Films associated with this location (after TMDb poster enrichment). */
+  films: ReadonlyArray<SurfacedFilm>;
 };
 
 type EnrichResponse = {
@@ -347,11 +404,15 @@ async function gatherFreeSignals(
 // the alternate photos usually frames it correctly.
 // ---------------------------------------------------------------------------
 
+type PhotoPoolEntry =
+  | { kind: "mapillary"; url: string; mapillary: MapillaryImage }
+  | { kind: "known"; url: string };
+
 type ScoredCandidate = FreeSignals & {
-  /** Best photo across the multi-shot pool, or null if scoring failed. */
+  /** Best score across the multi-shot pool, or null if scoring failed. */
   visionScore: VisionScore | null;
-  /** Mapillary image that produced the best score (may differ from `mapillary`). */
-  bestPhoto: MapillaryImage | null;
+  /** Pool entry that produced the best score (Mapillary photo OR provider's curated image). */
+  bestPhoto: PhotoPoolEntry | null;
 };
 
 async function visionScoreSurvivors(
@@ -369,19 +430,29 @@ async function visionScoreSurvivors(
         return { ...s, visionScore: null, bestPhoto: null };
       }
 
-      // Pool of photos to score for this candidate. mapillary first
-      // (closest), then alternates (different positions/angles).
-      const pool: MapillaryImage[] = [];
-      if (s.mapillary) pool.push(s.mapillary);
+      // Pool of photos: Mapillary closest + alternates + provider's
+      // curated `knownImageUrl` (Wikidata/Wikipedia/Wikimedia Commons).
+      // Curated images are FREE and often dramatically better than
+      // street-level Mapillary thumbs at the centroid.
+      const pool: PhotoPoolEntry[] = [];
+      if (s.mapillary) {
+        pool.push({ kind: "mapillary", url: s.mapillary.thumbUrl, mapillary: s.mapillary });
+      }
       for (const alt of s.mapillaryAlternates) {
-        if (!pool.some((p) => p.id === alt.id)) pool.push(alt);
+        if (!pool.some((p) => p.kind === "mapillary" && p.mapillary.id === alt.id)) {
+          pool.push({ kind: "mapillary", url: alt.thumbUrl, mapillary: alt });
+        }
+      }
+      const known = s.candidate.knownImageUrl;
+      if (known) {
+        pool.push({ kind: "known", url: known });
       }
       if (pool.length === 0) {
         return { ...s, visionScore: null, bestPhoto: null };
       }
 
       const best = await scoreBestPhotoMatch({
-        imageUrls: pool.map((p) => p.thumbUrl),
+        imageUrls: pool.map((p) => p.url),
         sceneDescription,
         sceneTokens,
         antiTokens,
@@ -394,11 +465,17 @@ async function visionScoreSurvivors(
       return {
         ...s,
         visionScore: best.score,
-        bestPhoto: pool[best.sourceIndex] ?? s.mapillary,
+        bestPhoto: pool[best.sourceIndex] ?? null,
       };
     },
     MAX_PARALLEL,
   );
+}
+
+/** Pick the Mapillary record we should hand off to GSV (for compass alignment). */
+function mapillaryForGsvHandoff(s: ScoredCandidate): MapillaryImage | null {
+  if (s.bestPhoto?.kind === "mapillary") return s.bestPhoto.mapillary;
+  return s.mapillary;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +626,28 @@ function selectedFromGooglePlace(
   };
 }
 
+/**
+ * Build a SelectedPhoto for a curated provider image (Wikidata /
+ * Wikipedia / Wikimedia Commons). Attribution defaults to CC BY-SA
+ * pointing at the source URL the provider supplied.
+ */
+function selectedFromKnown(args: {
+  url: string;
+  attributionText?: string | null;
+  attributionHref: string | null;
+  score: VisionScore | null;
+}): SelectedPhoto {
+  return {
+    url: args.url,
+    source: "wikimedia",
+    capturedAt: null,
+    attributionText: args.attributionText ?? "Wikimedia Commons \u00b7 CC BY-SA",
+    attributionHref: args.attributionHref,
+    visionScore: args.score?.score ?? null,
+    visionReason: args.score?.reason ?? null,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Route handler
 // ---------------------------------------------------------------------------
@@ -680,9 +779,10 @@ export const POST = withAuth(async (req) => {
     async (s) => {
       // Use the multi-shot WINNING photo for the Street View handoff so
       // the GSV thumbnail looks at the same subject the vision model
-      // actually rated highly. Falls back to the closest panorama when
-      // no photo was scored (sparse area).
-      const photoForHandoff = s.bestPhoto ?? s.mapillary;
+      // actually rated highly. When the winner was a curated provider
+      // image (Wikipedia/Wikidata), fall back to the closest Mapillary
+      // panorama for GSV alignment — still better than nothing.
+      const photoForHandoff = mapillaryForGsvHandoff(s);
       const stat = await fetchStaticEnrichment({
         candidate: s.candidate,
         mapillary: photoForHandoff,
@@ -702,33 +802,44 @@ export const POST = withAuth(async (req) => {
     const place = e.static.googlePlace;
     const sv = e.static.streetView;
 
-    // Use the multi-shot winning Mapillary photo as the candidate's
-    // visible thumbnail — that's the photo that ACTUALLY frames the
-    // matching subject (which may be across the street from the OSM
-    // centroid). Falls back to the closest panorama if multi-shot didn't
-    // run (sparse area, no photos).
-    const mapillaryPhotoSource = e.bestPhoto ?? e.mapillary;
-    const mapillaryPhoto = mapillaryPhotoSource
-      ? selectedFromMapillary(mapillaryPhotoSource, e.visionScore)
-      : null;
+    // Build candidate photos. The multi-shot winner is our canonical
+    // primary thumbnail. Other sources go in alternates.
+    const winnerPhoto: SelectedPhoto | null =
+      e.bestPhoto?.kind === "mapillary"
+        ? selectedFromMapillary(e.bestPhoto.mapillary, e.visionScore)
+        : e.bestPhoto?.kind === "known"
+          ? selectedFromKnown({
+              url: e.bestPhoto.url,
+              attributionText: null,
+              attributionHref: candidate.sourceUrl ?? null,
+              score: e.visionScore,
+            })
+          : e.mapillary
+            ? selectedFromMapillary(e.mapillary, e.visionScore)
+            : null;
+
     const streetViewPhoto = selectedFromStreetView(sv, e.visionScore);
     const googlePhoto = place
       ? selectedFromGooglePlace(place, e.visionScore)
       : null;
 
-    // Order: GSV > Google Place Photo > Mapillary. The GSV thumb was
-    // probed at the multi-shot winner's coord+heading, so it shows the
-    // same subject from Google's higher-resolution camera.
-    const photo = streetViewPhoto ?? googlePhoto ?? mapillaryPhoto;
+    // Photo priority: multi-shot WINNER first (already vision-confirmed),
+    // then Google Place Photo / GSV / closest-Mapillary as alternates so
+    // a "swap photo" UI in the future can offer them.
+    const photo = winnerPhoto ?? streetViewPhoto ?? googlePhoto ?? null;
     const alternates: SelectedPhoto[] = [];
-    for (const p of [streetViewPhoto, googlePhoto, mapillaryPhoto]) {
+    for (const p of [streetViewPhoto, googlePhoto]) {
       if (p && p !== photo) alternates.push(p);
     }
 
     const lat = place?.lat ?? candidate.lat;
     const lng = place?.lng ?? candidate.lng;
 
-    const name = place?.displayName ?? candidate.name ?? deriveName(candidate.tags);
+    // Display-name priority: provider-supplied name (NYC scene title,
+    // Wikidata label, Wikipedia article title) > Google Place name >
+    // OSM-derived fallback. Provider names are far more human-friendly.
+    const providerName = candidate.name ?? null;
+    const name = providerName ?? place?.displayName ?? deriveName(candidate.tags);
 
     const deepLinks = buildDeepLinks({
       lat,
@@ -736,6 +847,16 @@ export const POST = withAuth(async (req) => {
       label: name,
       googlePlaceId: place?.id,
     });
+
+    // Films from the source provider — TMDb posters get filled in below.
+    const films: SurfacedFilm[] = (candidate.associatedFilms ?? []).map((f) => ({
+      title: f.title,
+      year: f.year,
+      posterUrl: null,
+      tmdbId: null,
+      tmdbUrl: null,
+      wikidataQid: f.wikidataQid,
+    }));
 
     return {
       id: candidate.id,
@@ -759,6 +880,12 @@ export const POST = withAuth(async (req) => {
       deepLinks,
       badges: buildBadges(candidate.tags),
       enrichmentSparse: place === null,
+      // Phase 2a metadata
+      sources: candidate.sources ?? [],
+      primarySource: candidate.primarySource ?? null,
+      description: candidate.description ?? null,
+      sourceUrl: candidate.sourceUrl ?? null,
+      films,
     };
   });
 
@@ -767,6 +894,62 @@ export const POST = withAuth(async (req) => {
   // Phase 1 quality bar: every card must show something the user can
   // actually look at.
   const withPhoto = locations.filter((loc) => loc.photo !== null);
+
+  // -------- Phase 6: TMDb film enrichment --------
+  // For each card with associated films, look up TMDb metadata (poster,
+  // year, popularity) and attach it. Resolution order per film:
+  //   1. Wikidata Q-id  ->  /find?external_source=wikidata_id
+  //   2. IMDb tt-id     ->  /find?external_source=imdb_id
+  //   3. Title + year   ->  /search/movie
+  // All results cached for 30 days. Cap to top 5 films per card to
+  // control TMDb call count for movie-heavy NYC blocks.
+  const TMDB_FILMS_PER_CARD = 5;
+  await Promise.all(
+    withPhoto.map(async (loc) => {
+      const filmsToResolve = loc.films.slice(0, TMDB_FILMS_PER_CARD);
+      if (filmsToResolve.length === 0) return;
+
+      const enriched = await Promise.all(
+        filmsToResolve.map(async (f): Promise<SurfacedFilm> => {
+          let tmdb: TmdbMovie | null = null;
+          if (f.wikidataQid) {
+            tmdb = await findMovieByWikidata(f.wikidataQid);
+          }
+          if (!tmdb && f.year != null) {
+            tmdb = await searchMovieByTitle(f.title, f.year);
+          }
+          if (!tmdb) {
+            tmdb = await searchMovieByTitle(f.title, null);
+          }
+          // Last resort: if the source had an IMDb id but no Wikidata Q-id,
+          // try TMDb's /find by IMDb id.
+          // (We don't currently store IMDb ids on SurfacedFilm — but the
+          // candidate's associatedFilms may have them. Skipping for now to
+          // keep this loop simple; both findMovieBy* functions are cached.)
+          void findMovieByImdb;
+
+          if (!tmdb) return f;
+          return {
+            ...f,
+            posterUrl: tmdb.posterUrl,
+            tmdbId: tmdb.tmdbId,
+            tmdbUrl: tmdb.tmdbUrl,
+            // Prefer the TMDb-canonical title over the source's title
+            // (handles e.g. "Goodfellas" vs "GoodFellas" inconsistencies).
+            title: tmdb.title || f.title,
+            year: f.year ?? tmdb.year,
+          };
+        }),
+      );
+
+      // Sort surfaced films by year desc (most recent first) — works
+      // both for displaying recent films first and as a stable order.
+      enriched.sort((a, b) => (b.year ?? 0) - (a.year ?? 0));
+      // Mutate the location in place (we created the array fresh per
+      // card so this doesn't leak into the cached source data).
+      (loc as { films: ReadonlyArray<SurfacedFilm> }).films = enriched;
+    }),
+  );
 
   // Final sort: vision score desc, then distance asc.
   withPhoto.sort((a, b) => {

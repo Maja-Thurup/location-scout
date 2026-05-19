@@ -19,7 +19,16 @@ export type CacheNamespace =
   | "google:place-details"
   | "google:place-photo"
   | "mapillary:image"
-  | "routes:distance";
+  | "routes:distance"
+  // ---- Phase 2a (filming-location enrichment) ----
+  /** Wikidata SPARQL (landmark + filming-location) bbox results. */
+  | "wikidata:sparql"
+  /** Wikipedia geosearch + page-detail composites. */
+  | "wikipedia:geosearch"
+  /** Cached snapshots of NYC qb3k-n8mm and SF yitu-d5am datasets. */
+  | "openfilm:dataset"
+  /** TMDb /find?wikidata_id and /movie/{id} lookups. */
+  | "tmdb:movie";
 
 export type TTLDays = 1 | 7 | 14 | 30 | 90 | 365;
 

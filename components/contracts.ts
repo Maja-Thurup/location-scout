@@ -64,6 +64,30 @@ export type SceneInputProps = {
 // LocationCard — used in M4 onwards
 // ---------------------------------------------------------------------------
 
+/**
+ * Films attached to a location by Phase 2a's filming-location providers
+ * (Wikidata P915, NYC Scenes from the City, SF Films), enriched with
+ * TMDb posters when available.
+ */
+export type SurfacedFilm = {
+  title: string;
+  year: number | null;
+  /** TMDb poster URL (w342) when TMDb has the film, else null. */
+  posterUrl: string | null;
+  tmdbUrl: string | null;
+  tmdbId: number | null;
+  wikidataQid: string | null;
+};
+
+/** Provider that produced the candidate (used for source pills in UI). */
+export type LocationSource =
+  | "osm"
+  | "wikidata-landmark"
+  | "wikidata-filming-location"
+  | "wikipedia-geosearch"
+  | "nyc-scenes-from-the-city"
+  | "sf-film-locations";
+
 export type LocationCardProps = {
   id: string;
   name: string;
@@ -94,6 +118,16 @@ export type LocationCardProps = {
 
   /** Per-location notes (free-tier feature). */
   notes?: string;
+
+  // ---- Phase 2a additions ----
+  /** Providers that surfaced this location (for source pills). */
+  sources?: ReadonlyArray<LocationSource>;
+  /** Wikidata description / NYC fun-fact / Wikipedia summary, when present. */
+  description?: string;
+  /** "Open in source" link (Wikipedia article, NYC dataset row, ...). */
+  sourceUrl?: string;
+  /** Films known to have been shot here. Up to 3 surfaced in the strip. */
+  films?: ReadonlyArray<SurfacedFilm>;
 
   isSaved?: boolean;
   isSelected?: boolean;
