@@ -103,6 +103,7 @@ type SearchOsmResponse = {
   mirror: string | null;
   alternativesTried: number;
   alternativesSucceeded: number;
+  highConfidence?: boolean;
 };
 
 type SelectedPhoto = {
@@ -170,6 +171,7 @@ type EnrichResponse = {
     finalRendered: number;
     targetColor: string | null;
     mapillaryDetectionsFound: number;
+    visionSkipped?: boolean;
   };
 };
 
@@ -244,6 +246,7 @@ async function enrichLocationsRequest(input: {
   visionScoreLimit?: number;
   minVisionScore?: number;
   photosPerCandidate?: number;
+  skipVision?: boolean;
   mapillaryClasses?: ReadonlyArray<string>;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
@@ -510,14 +513,13 @@ export function SceneInputForm({
         sceneTokens,
         antiTokens: analysis.anti_tokens ?? [],
         visionScoreLimit: 10,
-        // Strict bar: better to show 3 great matches than 12 marginal ones.
-        // Marginal cards push exact matches to the bottom (the user's
-        // exact complaint about Path A v1).
         minVisionScore: 50,
-        // Multi-shot: score 3 nearby Mapillary photos per candidate and
-        // keep the best one as the thumbnail. Solves the "blue building
-        // is across the street" problem.
         photosPerCandidate: 3,
+        // M4: skip vision when search-osm signaled high tag-overlap
+        // confidence. Saves ~3-5s and ~$0.03/search; the candidates are
+        // already ranked by RRF + tag-overlap which is sufficient when
+        // the LLM extracted distinctive scene tokens.
+        skipVision: osm.highConfidence === true,
         mapillaryClasses: analysis.mapillary_classes ?? [],
       });
       setEnrichResult(enriched);
@@ -1237,9 +1239,13 @@ function PipelineStatsStrip({
       visible: stats.mapillaryDetectionsFound > 0 && stats.afterDetectionFilter < stats.afterColorFilter,
     },
     {
-      label: visionApplied ? "vision ≥50" : "no vision",
+      label: stats.visionSkipped
+        ? "vision skipped"
+        : visionApplied
+          ? "vision ≥50"
+          : "no vision",
       value: stats.afterVisionFilter,
-      visible: visionApplied,
+      visible: visionApplied || stats.visionSkipped === true,
     },
     {
       label: "has photo",

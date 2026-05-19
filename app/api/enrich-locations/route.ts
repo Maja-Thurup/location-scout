@@ -130,6 +130,15 @@ const requestSchema = z.object({
   /** Minimum vision score to appear in the output (drop low-quality matches). */
   minVisionScore: z.number().int().min(0).max(100).default(50),
   /**
+   * When true, skip the Claude Vision multi-shot step entirely and rely
+   * on tag-overlap ranking from search-osm alone. Set by the caller
+   * when search-osm signaled `highConfidence: true`.
+   *
+   * Saves ~3-5 seconds + ~$0.03 per search and is the default behavior
+   * for the future free tier (M5).
+   */
+  skipVision: z.boolean().default(false),
+  /**
    * Mapillary `object_value` classes that should appear near the candidate.
    * When non-empty, we fetch Mapillary detections in the search bbox once
    * and require each candidate to have at least one matching detection
@@ -232,6 +241,8 @@ type EnrichResponse = {
     finalRendered: number;
     targetColor: string | null;
     mapillaryDetectionsFound: number;
+    /** True when vision scoring was skipped (high-confidence tag match). */
+    visionSkipped: boolean;
   };
 };
 
@@ -697,6 +708,7 @@ export const POST = withAuth(async (req) => {
     visionScoreLimit,
     minVisionScore,
     photosPerCandidate,
+    skipVision,
     mapillaryClasses,
     searchBbox,
   } = parsed.data;
@@ -752,7 +764,14 @@ export const POST = withAuth(async (req) => {
       : afterColorFilter;
 
   // -------- Phase 2: vision scoring on Mapillary photos --------
-  // Sort by distance so we score the nearest survivors first.
+  // Two paths:
+  //   - skipVision: tag-overlap from search-osm was strong enough that
+  //     vision scoring is unlikely to change rankings. Skip entirely.
+  //     Free tier (M5) defaults to this. Saves ~3-5s and ~$0.03/search.
+  //   - !skipVision: multi-shot vision-score the top N candidates.
+  // We still distance-sort first because the candidate ORDER from
+  // search-osm is already RRF+tag-overlap sorted; the distance-sort
+  // here only matters when we have to slice for the vision limit.
   const distanceSorted = [...afterDetectionFilter].sort((a, b) => {
     const da = searchCenter
       ? distanceMeters(searchCenter, { lat: a.candidate.lat, lng: a.candidate.lng })
@@ -762,13 +781,28 @@ export const POST = withAuth(async (req) => {
       : 0;
     return da - db;
   });
-  const scored = await visionScoreSurvivors(
-    distanceSorted,
-    sceneDescription,
-    sceneTokens,
-    antiTokens,
-    visionScoreLimit,
-  );
+
+  let scored: Awaited<ReturnType<typeof visionScoreSurvivors>>;
+  if (skipVision) {
+    // No vision call. Mark every candidate as unscored; downstream
+    // ordering will fall back to the search-osm tag/RRF ordering.
+    scored = distanceSorted.map((s) => ({
+      ...s,
+      visionScore: null,
+      bestPhoto: null,
+    }));
+    logger.info("enrich-locations: vision SKIPPED (high-confidence tag overlap)", {
+      candidates: scored.length,
+    });
+  } else {
+    scored = await visionScoreSurvivors(
+      distanceSorted,
+      sceneDescription,
+      sceneTokens,
+      antiTokens,
+      visionScoreLimit,
+    );
+  }
 
   // Drop candidates whose vision score is below threshold. Strict mode
   // (the user's stated preference: better to show fewer high-confidence
@@ -776,11 +810,15 @@ export const POST = withAuth(async (req) => {
   // gracefully rather than returning zero cards: keep the top-6 BY
   // SCORE even if all scored below threshold, plus some unscored
   // candidates as best-effort. Returning empty pages is the worst UX.
+  // When skipVision is set, we don't apply a threshold at all — the
+  // search-osm tag-overlap ranking is the source of truth.
   const passedThreshold = scored.filter(
     (s) => s.visionScore != null && s.visionScore.score >= minVisionScore,
   );
   let afterVisionFilter: typeof scored;
-  if (passedThreshold.length > 0) {
+  if (skipVision) {
+    afterVisionFilter = scored;
+  } else if (passedThreshold.length > 0) {
     afterVisionFilter = passedThreshold;
   } else {
     // Soft fallback: top-6 by vision score (best-of-the-marginals) +
@@ -1106,6 +1144,7 @@ export const POST = withAuth(async (req) => {
       finalRendered: withPhoto.length,
       targetColor,
       mapillaryDetectionsFound: detections.length,
+      visionSkipped: skipVision,
     },
   };
   return NextResponse.json(response, { status: 200 });

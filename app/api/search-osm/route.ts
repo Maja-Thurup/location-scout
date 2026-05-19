@@ -23,6 +23,13 @@ import {
 } from "@/lib/overpass";
 import { mergeCandidates } from "@/lib/providers/dedupe";
 import { runProviders } from "@/lib/providers/registry";
+import { rrfRank } from "@/lib/providers/rrf";
+import {
+  combinedRank,
+  isHighConfidence,
+  tagOverlapScore,
+  type TagOverlapScore,
+} from "@/lib/providers/tag-overlap";
 import type {
   AssociatedFilm,
   ProviderName,
@@ -131,6 +138,15 @@ type RankedCandidate = {
   sourceUrl: string | null;
   // Search-time
   distanceMeters: number;
+  // M4: ranking signals
+  /** Reciprocal Rank Fusion score across contributing retrievers. */
+  rrfScore: number;
+  /** Tag overlap with scene_tokens (positive matches minus anti-matches). */
+  tagOverlapScore: number;
+  /** Distinctive tokens that matched (for UI badge). */
+  matchedTokens: ReadonlyArray<string>;
+  /** Anti-tokens visibly present (penalty terms). */
+  antiMatchedTokens: ReadonlyArray<string>;
 };
 
 export type ExtendedMatchMode = MatchMode | "google_text_fallback";
@@ -150,6 +166,13 @@ type SearchOsmResponse = {
   alternativesSucceeded: number;
   /** Per-provider stats, surfaced for debugging + the analysis panel UI. */
   providerStats: Record<ProviderName, { count: number; ms: number; error: string | null }>;
+  /**
+   * True when tag-overlap is strong enough that vision scoring is
+   * unnecessary. Free tier (M5) skips vision when this is set; deep
+   * tier still runs vision for tie-breaking but expects fewer score
+   * disagreements.
+   */
+  highConfidence: boolean;
 };
 
 type CachedSearchValue = {
@@ -161,6 +184,7 @@ type CachedSearchValue = {
   alternativesTried: number;
   alternativesSucceeded: number;
   providerStats: Record<ProviderName, { count: number; ms: number; error: string | null }>;
+  highConfidence: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -357,6 +381,7 @@ export const POST = withAuth(async (req) => {
       providerStats:
         cached.providerStats ??
         ({} as Record<ProviderName, { count: number; ms: number; error: string | null }>),
+      highConfidence: cached.highConfidence ?? false,
     };
     return NextResponse.json(response, { status: 200 });
   }
@@ -481,7 +506,8 @@ export const POST = withAuth(async (req) => {
     }
   }
 
-  // 5) Merge by 50m proximity, preferring richer sources.
+  // 5) Merge by 50m proximity, preferring richer sources. Per-source
+  // ranks (used by RRF) are tracked in mergeCandidates.
   const merged = mergeCandidates(rawCandidates);
 
   // 5.5) Drop low-signal OSM-only candidates.
@@ -504,10 +530,7 @@ export const POST = withAuth(async (req) => {
     "tourism",
   ]);
   const filteredMerged = merged.filter((c) => {
-    // Multi-source candidates always pass — the OSM signal is augmenting
-    // a curated record (Wikidata, Wikipedia, NYC Scenes, etc.).
     if (c.sources.length > 1 || c.primarySource !== "osm") return true;
-    // Pure OSM. Keep only when there's a name OR a structural tag.
     if (c.name && c.name.trim().length > 0) return true;
     for (const k of Object.keys(c.tags)) {
       if (STRUCTURAL_KEEP_TAGS.has(k)) return true;
@@ -515,34 +538,103 @@ export const POST = withAuth(async (req) => {
     return false;
   });
   const droppedOsmNoise = merged.length - filteredMerged.length;
-  if (droppedOsmNoise > 0) {
-    logger.info("search-osm dropped low-signal OSM-only candidates", {
-      droppedOsmNoise,
-      remaining: filteredMerged.length,
-    });
+
+  // 5.7) Score each candidate with RRF (across retrievers) AND tag
+  // overlap (against the user's scene_tokens / anti_tokens). The
+  // combined rank is what drives the final ordering — pure proximity-
+  // sort produced terrible results because it surfaced un-named OSM
+  // polygons close to the bbox center over actual landmarks across town.
+  const rrfRanked = rrfRank(filteredMerged, locationKind);
+  const overlapByCandidate = new Map<string, TagOverlapScore>();
+  for (const c of rrfRanked) {
+    const overlap = tagOverlapScore(c, sceneTokens, antiTokens);
+    overlapByCandidate.set(c.id, overlap);
   }
 
-  // 6) Convert merged -> ranked, sort by distance from search center.
+  // 5.8) Optional hard filter: when the user supplied 4+ distinctive
+  // scene tokens AND we have at least 6 candidates with non-zero overlap,
+  // drop everything with overlap=0. This is the "horse statue removes
+  // NYU and Woolworth Building from the pool" rule.
+  const distinctiveTokenCount = sceneTokens.filter((t) => t.length > 2).length;
+  const withOverlapCount = Array.from(overlapByCandidate.values()).filter(
+    (o) => o.score >= 1,
+  ).length;
+  const applyHardFilter = distinctiveTokenCount >= 4 && withOverlapCount >= 6;
+  const afterTagFilter = applyHardFilter
+    ? rrfRanked.filter((c) => (overlapByCandidate.get(c.id)?.score ?? 0) >= 1)
+    : rrfRanked;
+  const droppedZeroOverlap = rrfRanked.length - afterTagFilter.length;
+
+  // 6) Convert to RankedCandidate[], rank by combined RRF + tag-overlap
+  // score (descending), then break ties by distance from search center.
   const center = bboxCenter(effectiveBbox);
-  const ranked: RankedCandidate[] = filteredMerged
-    .map((m) => ({
-      id: m.id,
-      type: m.primarySource === "osm" ? inferTypeFromId(m.externalIds.osm ?? "") : "node",
-      osmId: inferOsmId(m.externalIds),
-      lat: m.lat,
-      lng: m.lng,
-      tags: m.tags,
-      name: m.name,
-      sources: m.sources,
-      primarySource: m.primarySource,
-      description: m.description,
-      knownImageUrl: m.knownImageUrl,
-      associatedFilms: m.associatedFilms,
-      sourceUrl: m.sourceUrl,
-      distanceMeters: distanceMeters(center, { lat: m.lat, lng: m.lng }),
-    }))
-    .sort((a, b) => a.distanceMeters - b.distanceMeters)
+  const ranked: RankedCandidate[] = afterTagFilter
+    .map((m) => {
+      const overlap = overlapByCandidate.get(m.id) ?? {
+        matched: [],
+        antiMatched: [],
+        score: 0,
+      };
+      return {
+        id: m.id,
+        type:
+          m.primarySource === "osm" ? inferTypeFromId(m.externalIds.osm ?? "") : "node",
+        osmId: inferOsmId(m.externalIds),
+        lat: m.lat,
+        lng: m.lng,
+        tags: m.tags,
+        name: m.name,
+        sources: m.sources,
+        primarySource: m.primarySource,
+        description: m.description,
+        knownImageUrl: m.knownImageUrl,
+        associatedFilms: m.associatedFilms,
+        sourceUrl: m.sourceUrl,
+        distanceMeters: distanceMeters(center, { lat: m.lat, lng: m.lng }),
+        rrfScore: m.rrfScore,
+        tagOverlapScore: overlap.score,
+        matchedTokens: overlap.matched,
+        antiMatchedTokens: overlap.antiMatched,
+      };
+    })
+    .sort((a, b) => {
+      const aCombined = combinedRank(a.rrfScore, {
+        matched: a.matchedTokens,
+        antiMatched: a.antiMatchedTokens,
+        score: a.tagOverlapScore,
+      });
+      const bCombined = combinedRank(b.rrfScore, {
+        matched: b.matchedTokens,
+        antiMatched: b.antiMatchedTokens,
+        score: b.tagOverlapScore,
+      });
+      if (bCombined !== aCombined) return bCombined - aCombined;
+      return a.distanceMeters - b.distanceMeters;
+    })
     .slice(0, MAX_OUTPUT_CANDIDATES);
+
+  // 6.5) Decide whether vision scoring is necessary at enrichment time.
+  // Strong tag overlap on enough candidates means vision is unlikely to
+  // change the ranking, so the enrichment route can skip it (free tier
+  // automatically; deep tier as a latency optimization).
+  const topOverlap =
+    ranked.length > 0
+      ? overlapByCandidate.get(ranked[0]!.id) ?? null
+      : null;
+  const highConfidence = isHighConfidence({
+    topOverlap,
+    poolOverlaps: Array.from(overlapByCandidate.values()),
+    sceneTokens,
+  });
+
+  if (droppedOsmNoise > 0 || droppedZeroOverlap > 0) {
+    logger.info("search-osm filter stats", {
+      droppedOsmNoise,
+      droppedZeroOverlap,
+      applyHardFilter,
+      finalCount: ranked.length,
+    });
+  }
 
   // 7) Cache.
   const alternativesTried =
@@ -563,6 +655,7 @@ export const POST = withAuth(async (req) => {
     alternativesTried,
     alternativesSucceeded,
     providerStats: providerResult.perProvider,
+    highConfidence,
   };
   await cacheSet(key, "overpass:v3", toCache, 14);
 
@@ -592,6 +685,7 @@ export const POST = withAuth(async (req) => {
     alternativesTried,
     alternativesSucceeded,
     providerStats: providerResult.perProvider,
+    highConfidence,
   };
   return NextResponse.json(response, { status: 200 });
 });

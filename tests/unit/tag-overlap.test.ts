@@ -1,0 +1,215 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  buildCandidateText,
+  combinedRank,
+  isHighConfidence,
+  tagOverlapScore,
+} from "@/lib/providers/tag-overlap";
+import type { MergedCandidate, ProviderName } from "@/lib/providers/types";
+
+function merged(partial: Partial<MergedCandidate>): MergedCandidate {
+  return {
+    id: "x:1",
+    primarySource: "wikidata-landmark" as ProviderName,
+    sources: ["wikidata-landmark"],
+    externalIds: { "wikidata-landmark": "Q1" },
+    perSourceRank: { "wikidata-landmark": 0 },
+    lat: 40.7,
+    lng: -74,
+    name: null,
+    description: null,
+    knownImageUrl: null,
+    tags: {},
+    associatedFilms: [],
+    sourceUrl: null,
+    ...partial,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// tagOverlapScore — the core test of the horse-statue case
+// ---------------------------------------------------------------------------
+
+describe("tagOverlapScore", () => {
+  const horseTokens = [
+    "horse",
+    "statue",
+    "monument",
+    "park",
+    "equestrian",
+    "bronze",
+    "trees",
+    "open_space",
+  ];
+
+  it("a real horse monument scores HIGH on the horse-statue prompt", () => {
+    const c = merged({
+      name: "Simon Bolívar Monument",
+      description: "equestrian statue of Simón Bolívar in Central Park",
+    });
+    const o = tagOverlapScore(c, horseTokens, []);
+    // "horse" itself doesn't appear in the text, but "equestrian" is in
+    // the same scene_tokens list; matching it captures the intent.
+    expect(o.matched).toContain("statue");
+    expect(o.matched).toContain("monument");
+    expect(o.matched).toContain("equestrian");
+    expect(o.matched).toContain("park");
+    expect(o.score).toBeGreaterThanOrEqual(4);
+  });
+
+  it("NYU scores ZERO on the horse-statue prompt", () => {
+    const c = merged({
+      name: "New York University",
+      description: "private university in the New York metropolitan area",
+    });
+    const o = tagOverlapScore(c, horseTokens, []);
+    expect(o.matched.length).toBe(0);
+    expect(o.score).toBe(0);
+  });
+
+  it("Woolworth Building scores ZERO on the horse-statue prompt", () => {
+    const c = merged({
+      name: "Woolworth Building",
+      description: "skyscraper in New York City",
+    });
+    const o = tagOverlapScore(c, horseTokens, []);
+    expect(o.matched.length).toBe(0);
+    expect(o.score).toBe(0);
+  });
+
+  it("anti-tokens subtract from the score", () => {
+    const c = merged({
+      name: "Modern Glass Office Tower",
+      description: "shiny modern glass office tower with statue at the entrance",
+    });
+    const o = tagOverlapScore(c, horseTokens, ["modern", "shiny_glass", "office"]);
+    // "statue" matches positive; "modern" and "shiny_glass" both
+    // match negative -> score = 1 - 2*2 = -3
+    expect(o.matched).toContain("statue");
+    expect(o.antiMatched.length).toBeGreaterThanOrEqual(1);
+    expect(o.score).toBeLessThan(0);
+  });
+
+  it("generic descriptors are filtered (don't reward 'urban' or 'day')", () => {
+    const c = merged({
+      name: "Some random building",
+      description: "urban day exterior",
+      tags: { setting: "urban" },
+    });
+    const o = tagOverlapScore(c, ["urban", "day", "exterior"], []);
+    expect(o.matched.length).toBe(0);
+  });
+
+  it("compound tokens match across underscore / space / hyphen variants", () => {
+    const c1 = merged({ name: "Phone Booth Plaza", description: null });
+    const c2 = merged({ name: "Phone-booth Plaza", description: null });
+    const c3 = merged({ name: "phone_booth plaza", description: null });
+    const tokens = ["phone_booth"];
+    expect(tagOverlapScore(c1, tokens, []).score).toBeGreaterThan(0);
+    expect(tagOverlapScore(c2, tokens, []).score).toBeGreaterThan(0);
+    expect(tagOverlapScore(c3, tokens, []).score).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// combinedRank
+// ---------------------------------------------------------------------------
+
+describe("combinedRank", () => {
+  it("higher RRF + higher overlap => higher combined score", () => {
+    const low = combinedRank(0.01, { matched: [], antiMatched: [], score: 0 });
+    const high = combinedRank(0.05, {
+      matched: ["a", "b", "c"],
+      antiMatched: [],
+      score: 3,
+    });
+    expect(high).toBeGreaterThan(low);
+  });
+
+  it("negative overlap is clamped to 0 in the boost (doesn't bonus-ize anti-tokens)", () => {
+    const negOverlap = combinedRank(0.05, {
+      matched: [],
+      antiMatched: ["modern"],
+      score: -2,
+    });
+    const zeroOverlap = combinedRank(0.05, { matched: [], antiMatched: [], score: 0 });
+    expect(negOverlap).toBe(zeroOverlap);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isHighConfidence
+// ---------------------------------------------------------------------------
+
+describe("isHighConfidence", () => {
+  it("triggers when top overlap >= 3 + at least 6 candidates with overlap + 4+ tokens", () => {
+    const result = isHighConfidence({
+      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 4 },
+      poolOverlaps: Array.from({ length: 8 }, () => ({
+        matched: ["x"],
+        antiMatched: [],
+        score: 1,
+      })),
+      sceneTokens: ["horse", "statue", "monument", "equestrian"],
+    });
+    expect(result).toBe(true);
+  });
+
+  it("returns false when scene tokens are vague (<4 distinctive)", () => {
+    const result = isHighConfidence({
+      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 4 },
+      poolOverlaps: Array.from({ length: 8 }, () => ({
+        matched: ["x"],
+        antiMatched: [],
+        score: 1,
+      })),
+      sceneTokens: ["urban", "day"], // both generic
+    });
+    expect(result).toBe(false);
+  });
+
+  it("returns false when top overlap is weak", () => {
+    const result = isHighConfidence({
+      topOverlap: { matched: ["a"], antiMatched: [], score: 1 },
+      poolOverlaps: Array.from({ length: 8 }, () => ({
+        matched: ["a"],
+        antiMatched: [],
+        score: 1,
+      })),
+      sceneTokens: ["horse", "statue", "monument", "equestrian"],
+    });
+    expect(result).toBe(false);
+  });
+
+  it("returns false when fewer than 6 candidates have any overlap", () => {
+    const result = isHighConfidence({
+      topOverlap: { matched: ["a", "b", "c"], antiMatched: [], score: 4 },
+      poolOverlaps: [
+        { matched: ["a"], antiMatched: [], score: 1 },
+        { matched: ["a"], antiMatched: [], score: 1 },
+      ],
+      sceneTokens: ["horse", "statue", "monument", "equestrian"],
+    });
+    expect(result).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildCandidateText smoke
+// ---------------------------------------------------------------------------
+
+describe("buildCandidateText", () => {
+  it("concatenates name + description + tag values", () => {
+    const c = merged({
+      name: "Simon Bolívar Monument",
+      description: "equestrian statue",
+      tags: { historic: "monument", tourism: "artwork" },
+    });
+    const text = buildCandidateText(c);
+    expect(text).toContain("simon bolívar monument");
+    expect(text).toContain("equestrian statue");
+    expect(text).toContain("monument");
+    expect(text).toContain("artwork");
+  });
+});
