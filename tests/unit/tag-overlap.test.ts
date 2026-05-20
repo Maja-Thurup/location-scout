@@ -102,6 +102,73 @@ describe("tagOverlapScore", () => {
     expect(tagOverlapScore(c2, tokens).score).toBeGreaterThan(0);
     expect(tagOverlapScore(c3, tokens).score).toBeGreaterThan(0);
   });
+
+  // ---------------------------------------------------------------------
+  // Subject-name boost (the horse-statue-vs-Statue-of-Liberty case)
+  // ---------------------------------------------------------------------
+
+  it("subject regex matches NAME -> 2.5x score (Joan of Arc beats Statue of Liberty)", () => {
+    const subjectNameRegex = "horse|equestrian|cavalry|jockey|rider";
+
+    const joan = merged({
+      name: "Equestrian Statue of Joan of Arc",
+      description: "statue by Anna Hyatt Huntington in New York City",
+    });
+    const liberty = merged({
+      name: "Statue of Liberty",
+      description: "Made in Paris by the French sculptor Bartholdi",
+    });
+
+    const joanScore = tagOverlapScore(joan, horseTokens, { subjectNameRegex });
+    const libertyScore = tagOverlapScore(liberty, horseTokens, {
+      subjectNameRegex,
+    });
+
+    expect(joanScore.subjectNameMatched).toBe(true);
+    expect(libertyScore.subjectNameMatched).toBe(false);
+    // Joan should comfortably outscore Liberty even though Liberty matches
+    // the common token "statue".
+    expect(joanScore.score).toBeGreaterThan(libertyScore.score * 2);
+  });
+
+  it("subject regex does NOT match in description-only -> no boost", () => {
+    // Sherman Memorial: name is "Sherman Memorial" but description
+    // mentions "horseback". We want strict NAME-match for the boost
+    // (description-only matches still get IDF credit but no 2.5x).
+    const sherman = merged({
+      name: "Sherman Memorial",
+      description: "bronze equestrian statue of Sherman on horseback",
+    });
+    const score = tagOverlapScore(sherman, horseTokens, {
+      subjectNameRegex: "horse|equestrian",
+    });
+    expect(score.subjectNameMatched).toBe(false);
+    // BUT the IDF score is still high because horse + equestrian +
+    // statue + bronze are all in the description blob.
+    expect(score.score).toBeGreaterThan(4);
+  });
+
+  it("knownImageUrl present -> +0.5 score", () => {
+    const noImage = merged({ name: "Some Statue", knownImageUrl: null });
+    const withImage = merged({
+      name: "Some Statue",
+      knownImageUrl: "https://example.com/img.jpg",
+    });
+    const a = tagOverlapScore(noImage, horseTokens);
+    const b = tagOverlapScore(withImage, horseTokens);
+    expect(b.hasImage).toBe(true);
+    expect(b.score).toBeCloseTo(a.score + 0.5, 5);
+  });
+
+  it("malformed regex does not crash -> no boost", () => {
+    const c = merged({ name: "Equestrian Statue" });
+    const score = tagOverlapScore(c, horseTokens, {
+      subjectNameRegex: "[invalid(",
+    });
+    expect(score.subjectNameMatched).toBe(false);
+    // Falls through to plain IDF score.
+    expect(score.score).toBeGreaterThan(0);
+  });
 });
 
 // ---------------------------------------------------------------------------

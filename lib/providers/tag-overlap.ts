@@ -145,6 +145,25 @@ const TOKEN_IDF_WEIGHTS: ReadonlyMap<string, number> = new Map([
   ["water_tower", 2.5],
   ["pump_house", 2.5],
 
+  // Animal subject nouns. When these appear in scene_tokens the user
+  // typically wants the literal thing — not just any "memorial" or
+  // "statue". Weighted high so Sherman/Joan/Bolívar (whose blobs
+  // contain "horse" / "horseback") leapfrog Statue of Liberty.
+  ["horse", 2.5],
+  ["dog", 2.5],
+  ["cat", 2.5],
+  ["lion", 2.5],
+  ["eagle", 2.5],
+  ["buffalo", 2.5],
+  ["bear", 2.5],
+  ["tiger", 2.5],
+  ["whale", 2.5],
+  ["horseback", 2.5], // very common synonym in monument descriptions
+  ["rider", 2.0],
+  ["jockey", 2.5],
+  ["cavalry", 2.5],
+  ["knight", 2.5],
+
   // Medium specificity
   ["statue", 1.5],
   ["sculpture", 1.5],
@@ -251,37 +270,95 @@ export type TagOverlapScore = {
   /** Distinctive scene tokens matched in name+description+tags. */
   matched: ReadonlyArray<string>;
   /**
-   * IDF-weighted score: rare/distinctive token matches weigh more than
-   * common ones.
+   * Whether the candidate's NAME (not description, not tags) contains
+   * one of the user's subject keywords. When true, the candidate is the
+   * literal thing the user asked for; we apply a 2.5x multiplier to the
+   * raw IDF score before returning. Optional for backwards-compat with
+   * mock literals in tests.
+   */
+  subjectNameMatched?: boolean;
+  /** Whether the candidate has a curated knownImageUrl. */
+  hasImage?: boolean;
+  /**
+   * IDF-weighted score with subject-name and image bonuses applied.
    *
    * Approximate ranges:
    *   - 0      no useful overlap
    *   - 0.5-2  common matches only ("park", "house")
    *   - 2-5    one rare match ("equestrian", "obelisk", "abandoned")
-   *   - 5+     multiple rare matches OR one very-rare + several common
+   *   - 5-12   the user's subject IS the candidate's name (rare match × 2.5)
+   *   - 12+    multiple rare matches AND the subject is in the name
    */
   score: number;
+};
+
+export type TagOverlapOptions = {
+  /**
+   * A pipe-separated regex of subject synonyms emitted by Claude as the
+   * `name` alternative in osm_tags_alternatives. e.g. for "horse statue":
+   *   "horse|equestrian|cavalry|jockey|rider"
+   *
+   * When this regex matches the candidate's NAME (case-insensitive,
+   * substring), we multiply the IDF score by 2.5 — the candidate is
+   * literally the kind of thing the user asked for, ahead of generic
+   * "memorial" / "monument" hits whose names contain the user's words
+   * incidentally (Statue of Liberty matches "statue" but not the
+   * subject regex).
+   */
+  subjectNameRegex?: string | null;
 };
 
 export function tagOverlapScore(
   candidate: MergedCandidate,
   sceneTokens: ReadonlyArray<string>,
+  opts: TagOverlapOptions = {},
 ): TagOverlapScore {
   const blob = buildCandidateText(candidate);
   const positive = countMatches(sceneTokens, blob);
+
+  // Subject-name match: does the candidate's NAME match Claude's
+  // synonym regex? "Equestrian Statue of George Washington" → YES;
+  // "Statue of Liberty" → NO; "Pulitzer Memorial Fountain" → NO.
+  let subjectNameMatched = false;
+  if (opts.subjectNameRegex && candidate.name) {
+    try {
+      const re = new RegExp(opts.subjectNameRegex, "i");
+      subjectNameMatched = re.test(candidate.name);
+    } catch {
+      // Bad regex from Claude — ignore the boost rather than crash.
+      subjectNameMatched = false;
+    }
+  }
+
+  const hasImage = Boolean(candidate.knownImageUrl);
+
+  // Apply boosts:
+  //   - subject in name = 2.5x multiplier on the IDF score (huge —
+  //     dominates RRF for non-subject candidates).
+  //   - image present = +0.5 flat (small — breaks ties between
+  //     candidates that score equally on text but only one has a
+  //     curated photo).
+  let score = positive.weightedScore;
+  if (subjectNameMatched) score *= 2.5;
+  if (hasImage) score += 0.5;
+
   return {
     matched: positive.matched,
-    score: positive.weightedScore,
+    subjectNameMatched,
+    hasImage,
+    score,
   };
 }
 
 /**
  * Combined score for sorting: RRF rank-score + tag-overlap multiplier.
  *
- * The 0.5 multiplier (bumped from 0.15) gives tag-overlap real
- * influence: a candidate with one rare match (weight 3) gets a +1.5
- * boost, which is enough to leapfrog a non-matching candidate that
- * topped its retriever. Tunable.
+ * The 0.5 multiplier on the overlap score gives tag-overlap real
+ * influence: a candidate with the subject IN its name (overlap.score
+ * already pre-multiplied by 2.5x in tagOverlapScore) gets a 0.5 ×
+ * (rare 3.0 × 2.5) = +3.75 boost, easily leapfrogging a high-RRF
+ * candidate (like Statue of Liberty stacking UNESCO + Wikipedia + OSM)
+ * that doesn't match the subject. Tunable.
  */
 export function combinedRank(
   rrfScore: number,

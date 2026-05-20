@@ -362,7 +362,7 @@ export const POST = withAuth(async (req) => {
   // depends on them; the same OSM-tag query with different scene tokens
   // produces a different ordering and must miss.
   const key = cacheKey("overpass:v3", {
-    schema: "v7-no-anti-tokens",
+    schema: "v8-subject-name-boost",
     bbox,
     osmTags,
     osmTagsAlternatives: effectiveAlternatives,
@@ -590,10 +590,19 @@ export const POST = withAuth(async (req) => {
   // The combined rank is what drives the final ordering — pure proximity-
   // sort produced terrible results because it surfaced un-named OSM
   // polygons close to the bbox center over actual landmarks across town.
+  //
+  // For prompts where Claude emitted a name-keyword alternative
+  // ({ "name": "horse|equestrian|cavalry|..." }), pull that regex out
+  // and use it as a STRONG name-match multiplier in tag-overlap. This
+  // is the "horse statue ranks above Statue of Liberty even when
+  // Liberty has higher RRF" rule — Liberty's NAME doesn't contain a
+  // horse-synonym so it doesn't get the boost.
+  const subjectNameRegex =
+    effectiveAlternatives.find((alt) => "name" in alt)?.name ?? null;
   const rrfRanked = rrfRank(filteredMerged, locationKind);
   const overlapByCandidate = new Map<string, TagOverlapScore>();
   for (const c of rrfRanked) {
-    const overlap = tagOverlapScore(c, sceneTokens);
+    const overlap = tagOverlapScore(c, sceneTokens, { subjectNameRegex });
     overlapByCandidate.set(c.id, overlap);
   }
 

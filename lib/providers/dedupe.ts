@@ -50,7 +50,13 @@ function priorityOf(p: ProviderName): number {
  * polygon centroid with the Wikidata point and the curated film record,
  * tight enough to keep distinct nearby buildings separate.
  */
-const DEFAULT_PROXIMITY_METERS = 50;
+// 30m is tight enough to NOT merge unrelated statues in the same plaza
+// (Pulitzer Fountain and Sherman Memorial sit ~40m apart at Grand Army
+// Plaza in NYC, so 50m would incorrectly fold them into one cluster
+// with the wrong name + photo). Same-entity hits across providers
+// (Wikidata Q-id + OSM node + Wikipedia article for the same statue)
+// are virtually always within 10-15m.
+const DEFAULT_PROXIMITY_METERS = 30;
 
 /**
  * Merge a list of raw candidates from multiple providers into a
