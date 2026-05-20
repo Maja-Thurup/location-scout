@@ -94,6 +94,13 @@ const requestSchema = z.object({
     .optional()
     .default(null),
 
+  /**
+   * M5: which tier this search runs at. "free" (default) skips Google
+   * Places searchText. "deep" enables it as a parallel provider and is
+   * gated on the user's deep-search credit balance.
+   */
+  searchTier: z.enum(["free", "deep"]).optional().default("free"),
+
   /** Free-text location string to geocode. */
   location: z.string().min(2).max(160).optional(),
 
@@ -298,6 +305,7 @@ export const POST = withAuth(async (req) => {
     sceneTokens,
     antiTokens,
     locationKind,
+    searchTier,
     location,
     radiusMiles,
     bbox: suppliedBbox,
@@ -358,7 +366,7 @@ export const POST = withAuth(async (req) => {
   // because M4's ranking depends on them; the same OSM-tag query with
   // different scene tokens produces a different ordering and must miss.
   const key = cacheKey("overpass:v3", {
-    schema: "v5-rrf-tag-overlap",
+    schema: "v6-tier-aware",
     bbox,
     osmTags,
     osmTagsAlternatives: effectiveAlternatives,
@@ -366,6 +374,9 @@ export const POST = withAuth(async (req) => {
     sceneTokens: [...sceneTokens].sort(),
     antiTokens: [...antiTokens].sort(),
     locationKind: locationKind ?? null,
+    // M5: free vs deep produces different candidate pools (Google
+    // Places searchText only runs in deep). Cache them separately.
+    searchTier,
   });
   const cached = await cacheGet<CachedSearchValue>(key);
   if (cached?.candidates) {
@@ -416,6 +427,28 @@ export const POST = withAuth(async (req) => {
     osmTagsAlternatives: effectiveAlternatives,
   });
 
+  // 3b) DEEP TIER ONLY: parallel Google Places searchText. This is the
+  // entity-name index — for prompts like "horse statue in a park" or
+  // "diner conversation" Google's place index returns named matches
+  // (Sherman Monument, Joan of Arc Statue, ...) instantly. We pay
+  // ~$0.02 per searchText call and gate this behind the "deep" tier
+  // so free-tier searches stay near-zero cost.
+  const googleTextPromise: Promise<GooglePlace[]> =
+    searchTier === "deep" && googleQuery && googleQuery.trim().length >= 2
+      ? searchText({
+          textQuery: googleQuery,
+          bbox,
+          includedType: googleTypes?.[0],
+          includeClosedPermanently: false,
+          maxResultCount: 20,
+        }).catch((err) => {
+          logger.warn("deep-tier Google searchText threw (non-fatal)", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+          return [];
+        })
+      : Promise.resolve([] as GooglePlace[]);
+
   let osmResult;
   try {
     [osmResult] = await Promise.all([osmPromise]);
@@ -437,6 +470,7 @@ export const POST = withAuth(async (req) => {
   // returns an error stat. We await separately so an OSM throw doesn't
   // cancel them (and vice versa).
   const providerResult = await providersPromise;
+  const googleTextResults = await googleTextPromise;
 
   let effectiveBbox = osmResult.effectiveBbox;
   const osmCandidates = osmResult.candidates;
@@ -478,12 +512,19 @@ export const POST = withAuth(async (req) => {
     }
   }
 
-  // 4) Build the unified raw-candidate pool: OSM + Mapillary + providers.
+  // 4) Build the unified raw-candidate pool: OSM + Mapillary + providers
+  //    + (deep tier only) Google Places searchText.
   const rawCandidates: RawCandidate[] = [
     ...osmCandidates.map(osmCandidateToRaw),
     ...mapillaryCandidates.map(osmCandidateToRaw),
     ...providerResult.candidates,
+    ...googleTextResults.map(googlePlaceToRaw),
   ];
+  if (googleTextResults.length > 0) {
+    logger.info("search-osm deep-tier Google searchText contributed", {
+      count: googleTextResults.length,
+    });
+  }
 
   // 4.5) B2 — Google Places text-search fallback. Triggered when EVERY
   // source came back empty (OSM + providers + Mapillary).

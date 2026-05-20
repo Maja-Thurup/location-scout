@@ -49,6 +49,13 @@ const DEFAULT_RRF_WEIGHTS: Record<ProviderName, number> = {
   "nps-places": 1.4,
   "unesco-heritage": 1.5,
   "ridb-recreation": 0.9,
+  // M6 own-db: candidates from our consolidated DB. Most of them
+  // re-map at read time to their original source (nps-places, unesco-
+  // heritage, ...) so they pick up THOSE weights. NRHP / NHL stay as
+  // own-db-emitted ProviderNames and use these direct weights.
+  "own-db": 1.0,
+  "nrhp": 1.3, // National Register listing = vetted historic significance
+  "nhl": 1.6, // National Historic Landmarks = curated top tier
   // Film-history sources never participate in RRF retrieval ranking —
   // see lib/providers/registry.ts (DEFAULT_CONTENT_PROVIDERS vs
   // FILM_HISTORY_PROVIDERS). Weights here are zero so any accidental

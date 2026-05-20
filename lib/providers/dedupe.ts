@@ -29,9 +29,12 @@ const SOURCE_PRIORITY: ReadonlyArray<ProviderName> = [
   "ridb-recreation",
   "wikipedia-geosearch",
   "wikidata-landmark",
+  "own-db",
   "wikidata-filming-location",
+  "nrhp",
   "nps-places",
   "sf-film-locations",
+  "nhl",
   "unesco-heritage",
   "nyc-scenes-from-the-city",
 ];

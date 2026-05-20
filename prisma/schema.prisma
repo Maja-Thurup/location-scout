@@ -21,6 +21,21 @@ model User {
   crewBaseAddress String?
   crewBaseLat     Float?
   crewBaseLng     Float?
+
+  // M5 — Deep Search tier credits.
+  /// Remaining "deep search" credits this month. Each user is granted
+  /// 5 free deep searches per month. Decremented when the user submits
+  /// a search with searchTier="deep". Reset monthly by a Vercel cron.
+  /// Unlimited for users on the paid plan (handled at request-time
+  /// via subscriptionTier).
+  deepSearchCreditsRemaining Int @default(5)
+  /// "free" (default, 5 credits/month) or "pro" (unlimited deep
+  /// searches, $9/mo via Stripe — wiring deferred to a later commit).
+  subscriptionTier String @default("free")
+  /// Last time the monthly credit allocation was reset. Cron uses this
+  /// to find users whose credits need topping up.
+  lastCreditResetAt DateTime @default(now())
+
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -114,6 +129,70 @@ model SearchHistory {
   createdAt    DateTime @default(now())
 
   @@index([userId, createdAt])
+}
+
+/// Curated places imported from external sources (NRHP, NHL, UNESCO,
+/// NPS, RIDB, NYC Scenes, SF Films, ...). Provides a free-tier-fast,
+/// always-available retrieval layer that doesn't depend on third-party
+/// APIs at query time.
+///
+/// Coordinates are stored as plain Float (lat/lng) with a btree index;
+/// PostGIS isn't enabled on Supabase free tier so we filter by simple
+/// bbox comparisons (`lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?`)
+/// which Postgres optimizes against the (lat, lng) compound index.
+///
+/// `tags` stores arbitrary key/value descriptors (architectural style,
+/// year built, materials, named-after, ...) for tag-overlap matching.
+/// `popularity` is a normalized 0-1 score used as a ranking tiebreaker.
+model Place {
+  /// Source-prefixed stable id, e.g. "nrhp:71001234" or "unesco:42".
+  id String @id
+
+  /// Originating source. Same enum as our provider names.
+  source String
+
+  /// Display name (e.g. "Sherman Monument").
+  name String
+
+  /// Optional one-line description (200-300 char snippets work best for
+  /// downstream tag-overlap matching).
+  description String? @db.Text
+
+  /// Coordinates.
+  lat Float
+  lng Float
+
+  /// Free-form tag map: { "architectural_style": "Beaux-Arts",
+  /// "year_built": "1903", "material": "bronze", ... }.
+  /// Stored as JSON for flexibility; queried with `@>` containment
+  /// in raw SQL when needed.
+  tags Json
+
+  /// Pre-curated photo URL, when the source provides one (Wikimedia
+  /// Commons, NPS, NYC Open Data, ...).
+  imageUrl String?
+
+  /// Source page URL for "Open in source" links.
+  sourceUrl String?
+
+  /// 0-1 popularity score for ranking ties. Computed at import time:
+  ///   - Wikidata: log(sitelinks count) / log(50)  clamped to [0,1]
+  ///   - NRHP: 1 if NHL (top 2,600), 0.5 otherwise
+  ///   - UNESCO: always 1.0
+  ///   - NPS, RIDB: 0.7 / 0.5 default
+  popularityScore Float @default(0)
+
+  /// When this row was last refreshed from its source.
+  importedAt DateTime @default(now())
+
+  // Compound spatial index: optimal for `lat BETWEEN ? AND ? AND
+  // lng BETWEEN ? AND ?` queries. Postgres can scan within (south, north)
+  // first then filter by lng. Together with the small in-memory tag-overlap
+  // pass this gives sub-100ms lookups even at 200k+ rows.
+  @@index([lat, lng])
+  // Used by the per-source refresh-by-source code path (re-import or
+  // delete by source).
+  @@index([source])
 }
 
 /// Per-user, per-day usage counter for rate-limiting on the free tier.

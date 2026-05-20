@@ -319,6 +319,12 @@ function sourcePillLabel(source: LocationSource): string {
       return "Recreation.gov";
     case "unesco-heritage":
       return "UNESCO";
+    case "own-db":
+      return "Own DB";
+    case "nrhp":
+      return "NRHP";
+    case "nhl":
+      return "NHL";
   }
 }
 
@@ -339,6 +345,12 @@ function sourcePillClass(source: LocationSource): string {
       return "bg-teal-500/15 text-teal-200 border border-teal-500/20";
     case "unesco-heritage":
       return "bg-amber-500/15 text-amber-200 border border-amber-500/20";
+    case "nrhp":
+      return "bg-orange-500/15 text-orange-200 border border-orange-500/20";
+    case "nhl":
+      return "bg-yellow-500/15 text-yellow-200 border border-yellow-500/20";
+    case "own-db":
+      return "bg-indigo-500/15 text-indigo-200 border border-indigo-500/20";
     case "osm":
     default:
       return "bg-white/5 text-muted-foreground border border-white/10";

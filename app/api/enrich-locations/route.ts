@@ -27,6 +27,7 @@ import {
 } from "@/lib/mapillary";
 import { runFilmHistoryProviders } from "@/lib/providers/registry";
 import type { AssociatedFilm, RawCandidate } from "@/lib/providers/types";
+import { checkDeepCredit, consumeDeepCredit } from "@/lib/search-tier";
 import {
   buildThumbUrl,
   probeStreetView,
@@ -63,6 +64,9 @@ const providerNameSchema = z.enum([
   "nps-places",
   "ridb-recreation",
   "unesco-heritage",
+  "own-db",
+  "nrhp",
+  "nhl",
 ]);
 
 const associatedFilmSchema = z.object({
@@ -141,6 +145,14 @@ const requestSchema = z.object({
    * for the future free tier (M5).
    */
   skipVision: z.boolean().default(false),
+  /**
+   * M5 — search tier. "free" (default) skips Claude Vision multi-shot
+   * scoring AND Mapillary alternates fetch (single closest-photo only,
+   * for color extraction). "deep" runs the full vision pipeline. Note:
+   * `skipVision` overrides this when the search-osm route signals high
+   * confidence.
+   */
+  searchTier: z.enum(["free", "deep"]).optional().default("free"),
   /**
    * Mapillary `object_value` classes that should appear near the candidate.
    * When non-empty, we fetch Mapillary detections in the search bbox once
@@ -710,11 +722,39 @@ export const POST = withAuth(async (req) => {
     antiTokens,
     visionScoreLimit,
     minVisionScore,
-    photosPerCandidate,
-    skipVision,
+    photosPerCandidate: photosPerCandidateInput,
+    skipVision: skipVisionInput,
+    searchTier,
     mapillaryClasses,
     searchBbox,
   } = parsed.data;
+
+  // M5: free tier defaults to single-shot photo + no vision unless the
+  // caller explicitly asked otherwise. Deep tier respects whatever
+  // photosPerCandidate / skipVision the caller provided.
+  const photosPerCandidate =
+    searchTier === "free" ? 1 : photosPerCandidateInput;
+  const skipVision = skipVisionInput || searchTier === "free";
+
+  // M5: deep tier is credit-gated. Check the user's balance BEFORE we
+  // burn API tokens. Free tier searches always pass.
+  if (searchTier === "deep") {
+    const credit = await checkDeepCredit(req.dbUserId);
+    if (!credit.ok) {
+      return NextResponse.json(
+        {
+          error: "deep_tier_no_credits",
+          message: `You're out of Deep Search credits. ${credit.tier === "free" ? "Free-tier credits reset at the start of each month." : ""}`,
+          remaining: 0,
+          resetAt: credit.resetAt.toISOString(),
+        },
+        { status: 402 },
+      );
+    }
+    // Consume the credit BEFORE we run vision/Mapillary/etc. so a
+    // mid-pipeline failure doesn't double-charge.
+    await consumeDeepCredit(req.dbUserId);
+  }
 
   // -------- Phase 0: dedupe input by proximity --------
   const dedupedCandidates = dedupeCandidates(candidates);

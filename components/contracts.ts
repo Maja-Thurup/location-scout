@@ -89,7 +89,10 @@ export type LocationSource =
   | "sf-film-locations"
   | "nps-places"
   | "ridb-recreation"
-  | "unesco-heritage";
+  | "unesco-heritage"
+  | "own-db"
+  | "nrhp"
+  | "nhl";
 
 export type LocationCardProps = {
   id: string;

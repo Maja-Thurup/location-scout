@@ -2,6 +2,7 @@ import type { Bbox } from "@/lib/bbox";
 import { logger } from "@/lib/logger";
 import { npsPlacesProvider } from "@/lib/providers/nps-places";
 import { nycScenesProvider } from "@/lib/providers/nyc-scenes";
+import { ownDbProvider } from "@/lib/providers/own-db";
 import { ridbRecreationProvider } from "@/lib/providers/ridb-recreation";
 import { sfFilmLocationsProvider } from "@/lib/providers/sf-films";
 import type {
@@ -40,9 +41,15 @@ import { wikipediaGeosearchProvider } from "@/lib/providers/wikipedia-geosearch"
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_CONTENT_PROVIDERS: ReadonlyArray<CandidateProvider> = [
+  // M6: own-db runs FIRST. It's a single Postgres query with sub-100ms
+  // latency. Its candidates carry their original-source metadata so RRF
+  // weights and dedupe priority work normally. When the table is empty
+  // (fresh deploy, no imports yet) this no-ops and the live providers
+  // below carry the search.
+  ownDbProvider,
   wikidataLandmarkProvider,
   wikipediaGeosearchProvider,
-  // M7: scenic + heritage sources. Each gracefully no-ops when its
+  // M7: scenic + heritage live sources. Each gracefully no-ops when its
   // optional API key is missing or the bbox is non-US (where applicable).
   npsPlacesProvider,
   ridbRecreationProvider,

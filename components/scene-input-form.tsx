@@ -68,7 +68,10 @@ type ProviderName =
   | "sf-film-locations"
   | "nps-places"
   | "ridb-recreation"
-  | "unesco-heritage";
+  | "unesco-heritage"
+  | "own-db"
+  | "nrhp"
+  | "nhl";
 
 type AssociatedFilm = {
   wikidataQid: string | null;
@@ -206,6 +209,7 @@ async function searchOsmRequest(input: {
   sceneTokens?: ReadonlyArray<string>;
   antiTokens?: ReadonlyArray<string>;
   locationKind?: string | null;
+  searchTier?: "free" | "deep";
   location?: string;
   radiusMiles: number | null;
 }): Promise<SearchOsmResponse> {
@@ -250,6 +254,7 @@ async function enrichLocationsRequest(input: {
   minVisionScore?: number;
   photosPerCandidate?: number;
   skipVision?: boolean;
+  searchTier?: "free" | "deep";
   mapillaryClasses?: ReadonlyArray<string>;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
@@ -433,8 +438,10 @@ export function SceneInputForm({
     location?: string;
     radiusMiles: number | null;
     sceneText: string;
+    searchTier?: "free" | "deep";
   }): Promise<void> {
     const { analysis, location, radiusMiles, sceneText } = args;
+    const searchTier: "free" | "deep" = args.searchTier ?? "free";
 
     setStage({ kind: "searching-osm" });
     setEnrichResult(null);
@@ -458,6 +465,7 @@ export function SceneInputForm({
         sceneTokens,
         antiTokens: analysis.anti_tokens ?? [],
         locationKind: analysis.location_kind ?? null,
+        searchTier,
         location,
         radiusMiles,
       });
@@ -523,6 +531,8 @@ export function SceneInputForm({
         // already ranked by RRF + tag-overlap which is sufficient when
         // the LLM extracted distinctive scene tokens.
         skipVision: osm.highConfidence === true,
+        // M5: server-side, free tier auto-disables vision regardless.
+        searchTier,
         mapillaryClasses: analysis.mapillary_classes ?? [],
       });
       setEnrichResult(enriched);
@@ -577,12 +587,13 @@ export function SceneInputForm({
         rateLimitRemaining: parsed.rateLimit.remaining,
       });
 
-      // Chain straight into OSM + enrichment.
+      // Chain straight into OSM + enrichment. Default tier is "free".
       await runOsmAndEnrich({
         analysis: parsed.analysis,
         location,
         radiusMiles,
         sceneText: values.sceneText.trim(),
+        searchTier: "free",
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong.";
@@ -590,6 +601,28 @@ export function SceneInputForm({
       posthog.capture("scene_parse_failed", { error: message });
     }
   });
+
+  /**
+   * M5: re-run the same parse against the DEEP tier (Claude Vision +
+   * Google Places searchText + Mapillary multi-shot). Costs 1 credit
+   * per call; server returns 402 when out.
+   */
+  async function runDeepSearch(): Promise<void> {
+    if (!parseResult) return;
+    const values = watch();
+    const location = values.location?.trim() || undefined;
+    const radiusMiles = values.radius === "any" ? null : Number(values.radius);
+    setOsmResult(null);
+    setEnrichResult(null);
+    posthog.capture("deep_search_requested", { city: parseResult.analysis.city });
+    await runOsmAndEnrich({
+      analysis: parseResult.analysis,
+      location,
+      radiusMiles,
+      sceneText: values.sceneText?.trim() ?? "",
+      searchTier: "deep",
+    });
+  }
 
   function loadSample(sample: (typeof SAMPLES)[number]) {
     setValue("sceneText", sample.sceneText, { shouldValidate: true });
@@ -749,6 +782,8 @@ export function SceneInputForm({
         <ResultCardsPanel
           enriched={enrichResult}
           isEnriching={stage.kind === "enriching"}
+          onRunDeepSearch={parseResult ? runDeepSearch : undefined}
+          isDeepRunning={stage.kind === "enriching" || stage.kind === "searching-osm"}
         />
       )}
 
@@ -851,20 +886,44 @@ function SearchSummaryPanel({
 function ResultCardsPanel({
   enriched,
   isEnriching,
+  onRunDeepSearch,
+  isDeepRunning,
 }: {
   enriched: EnrichResponse | null;
   isEnriching: boolean;
+  onRunDeepSearch?: () => void;
+  isDeepRunning?: boolean;
 }) {
   if (!enriched && !isEnriching) return null;
+
+  // M5: only show the Deep Search CTA after a free-tier run completed
+  // (we have enriched results AND vision was skipped — meaning vision
+  // hasn't already run). If the current results came from a deep run,
+  // hide the button.
+  const isFreeResult =
+    enriched != null && enriched.pipelineStats.visionSkipped === true;
 
   return (
     <section className="space-y-4 rounded-lg border border-white/10 bg-card p-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-lg font-semibold">Result cards</h2>
-        {enriched && (
-          <span className="text-xs text-muted-foreground">
-            {enriched.locations.length} of {enriched.pipelineStats.inputCandidates} candidates kept
-          </span>
+        <div className="flex flex-wrap items-baseline gap-3">
+          <h2 className="text-lg font-semibold">Result cards</h2>
+          {enriched && (
+            <span className="text-xs text-muted-foreground">
+              {enriched.locations.length} of {enriched.pipelineStats.inputCandidates} candidates kept
+            </span>
+          )}
+        </div>
+        {isFreeResult && onRunDeepSearch && (
+          <button
+            type="button"
+            onClick={onRunDeepSearch}
+            disabled={isDeepRunning}
+            className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 transition hover:border-amber-500/50 hover:bg-amber-500/15 disabled:opacity-50"
+            title="Re-run with Claude Vision + Google Places searchText + Mapillary multi-shot. Costs 1 credit."
+          >
+            {isDeepRunning ? "Running deep search…" : "🔍 Run Deep Search (1 credit)"}
+          </button>
         )}
       </header>
 

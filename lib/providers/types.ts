@@ -24,7 +24,14 @@ export type ProviderName =
   /** Recreation.gov RIDB — federal facilities + recreation areas. M7. */
   | "ridb-recreation"
   /** UNESCO World Heritage List (WHC). M7. */
-  | "unesco-heritage";
+  | "unesco-heritage"
+  /** Own consolidated Postgres DB. Runner that returns Place rows
+   *  imported from any of the sources below. M6. */
+  | "own-db"
+  /** National Register of Historic Places (US, ~95k). Served via own-db. */
+  | "nrhp"
+  /** National Historic Landmarks (US, ~2.6k subset of NRHP). */
+  | "nhl";
 
 /**
  * Compact "famous films" reference attached to a candidate by the
