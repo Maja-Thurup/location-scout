@@ -100,16 +100,33 @@ export function mergeCandidates(
   );
 
   const merged: MergedCandidate[] = [];
+  // Cross-source merge index: every cluster that knows a Wikidata
+  // Q-id (either from being seeded by wikidata-landmark, or from
+  // having an OSM/Wikipedia tag pointing to one) is reachable here
+  // by Q-id. This lets a downstream OSM `tourism=artwork` node with
+  // tag `wikidata=Q1234` merge with the canonical Wikidata cluster
+  // even when proximity-merging would have failed (e.g. Wikidata's
+  // coord is the centroid of a memorial garden 80m from the OSM
+  // node's pin).
+  const clusterByQid = new Map<string, MergedCandidate>();
 
   for (const raw of sorted) {
     const rawKey = `${raw.source}\t${raw.externalId}`;
     const rawRank = rankByExternalId.get(rawKey) ?? 0;
+    const rawQid = qidFromRaw(raw);
 
-    const cluster = merged.find(
-      (m) =>
-        distanceMeters({ lat: m.lat, lng: m.lng }, { lat: raw.lat, lng: raw.lng }) <
-        proximityMeters,
-    );
+    // Cross-source merge: try Q-id first (definitive), fall back to
+    // proximity match (heuristic, prone to false-merges in dense
+    // urban areas).
+    let cluster: MergedCandidate | undefined =
+      rawQid ? clusterByQid.get(rawQid) : undefined;
+    if (!cluster) {
+      cluster = merged.find(
+        (m) =>
+          distanceMeters({ lat: m.lat, lng: m.lng }, { lat: raw.lat, lng: raw.lng }) <
+          proximityMeters,
+      );
+    }
 
     if (cluster) {
       // Augment the cluster with this lower-priority record.
@@ -135,9 +152,11 @@ export function mergeCandidates(
       if (coordPrecisionRank(raw) > coordPrecisionRank(coordOwnerOfCluster(cluster))) {
         cluster.lat = raw.lat;
         cluster.lng = raw.lng;
-        // Track which source the coords came from so subsequent merges
-        // can compare correctly.
         (cluster as ClusterWithCoordOwner)._coordOwner = raw.source;
+      }
+      // Register the Q-id pointer if this raw introduced one.
+      if (rawQid && !clusterByQid.has(rawQid)) {
+        clusterByQid.set(rawQid, cluster);
       }
     } else {
       const fresh: ClusterWithCoordOwner = {
@@ -157,10 +176,34 @@ export function mergeCandidates(
         _coordOwner: raw.source,
       };
       merged.push(fresh);
+      if (rawQid) clusterByQid.set(rawQid, fresh);
     }
   }
 
   return merged;
+}
+
+/**
+ * Pull a Wikidata Q-id from a RawCandidate. Sources:
+ *   1. wikidata-landmark uses the Q-id AS its externalId
+ *   2. wikipedia-geosearch tags the candidate with `wikidata:qid` (set
+ *      from MediaWiki's `pageprops.wikibase_item`)
+ *   3. OSM nodes/ways have a `wikidata` tag for famous entities (e.g.
+ *      Sherman Memorial OSM node has `wikidata=Q1346181`)
+ *   4. wikidata-filming-location uses Q-id as externalId too
+ *
+ * Returns `null` when the raw has no Q-id we can use for cross-source
+ * merging — falls back to proximity-only matching downstream.
+ */
+function qidFromRaw(raw: RawCandidate): string | null {
+  if (raw.source === "wikidata-landmark" || raw.source === "wikidata-filming-location") {
+    if (/^Q\d+$/.test(raw.externalId)) return raw.externalId;
+  }
+  const tagQid = raw.tags["wikidata"] ?? raw.tags["wikidata:qid"];
+  if (typeof tagQid === "string" && /^Q\d+$/.test(tagQid)) {
+    return tagQid;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

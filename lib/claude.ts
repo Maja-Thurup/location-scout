@@ -275,39 +275,87 @@ Guidance for fields:
   classifier tag (statues, monuments, lighthouses, windmills, named
   parks). Use the special key "name" with a regex of pipe-separated
   alternatives. The value is matched against the OSM "name" tag
-  case-insensitively as a substring, so include synonyms.
+  case-insensitively as a substring AND used downstream to boost any
+  candidate whose name matches.
+
+  CRITICAL RULES — read carefully:
+
+  1. The name regex MUST contain ONLY synonyms of the user's SUBJECT.
+     The "subject" is the THING the user is asking for: horse,
+     lighthouse, windmill, carousel, fountain, etc.
+
+  2. NEVER include the prompt's bare nouns "statue", "sculpture",
+     "monument", "memorial", "artwork", "building" in the regex.
+     Those are categories, not subjects. If you include them, the
+     regex matches every "Statue of [X]" in the city — including
+     Statue of Liberty for a HORSE prompt — and the downstream
+     boost ranks unrelated entities at the top.
+
+  3. NEVER use this alternative for GENERIC prompts ("a building
+     in a park", "an old house") — there's no specific subject.
+     Skip the name alternative entirely; tag-based filters handle
+     these.
 
   Examples:
 
-    Scene: "horse statue in a park" (subject is in the feature name,
-                                     not building=warehouse)
+    Scene: "horse statue in a park" (subject = horse)
     -> [
          { "tourism": "artwork" },
          { "historic": "memorial" },
          { "historic": "monument" },
-         { "name": "horse|equestrian|cavalry|jockey|rider" },
+         { "name": "horse|equestrian|cavalry|jockey|rider|knight" },
          { "leisure": "park" }
        ]
+    GOOD: regex = horse synonyms only.
+    BAD:  regex would be "horse|equestrian|...|statue" — the trailing
+          "statue" makes everything with "statue" in its name match,
+          including non-horse statues.
 
-    Scene: "old lighthouse on a cliff"
+    Scene: "old lighthouse on a cliff" (subject = lighthouse)
     -> [
          { "man_made": "lighthouse" },
          { "name": "lighthouse|light station|beacon" },
          { "natural": "cliff" }
        ]
+    GOOD: regex = lighthouse synonyms.
 
-    Scene: "dutch windmill in a field"
+    Scene: "dutch windmill in a field" (subject = windmill)
     -> [
          { "man_made": "windmill" },
          { "name": "windmill|mill" },
          { "landuse": "farmland" }
        ]
 
-  Use name-regex alternatives ONLY when the prompt's subject is
-  typically captured in the OSM name (proper nouns, monument
-  subjects, lighthouse/windmill names). Do not use them for generic
-  building types — building=house is a far better filter than
-  name=house.
+    Scene: "lion statue at a museum entrance" (subject = lion)
+    -> [
+         { "tourism": "artwork" },
+         { "historic": "monument" },
+         { "name": "lion|lions" },
+         { "tourism": "museum" }
+       ]
+
+    Scene: "a carousel in a park" (subject = carousel)
+    -> [
+         { "tourism": "theme_park" },
+         { "name": "carousel|merry-go-round" },
+         { "leisure": "park" }
+       ]
+
+    Scene: "abandoned warehouse with broken windows" (NO specific
+                                                      subject — the
+                                                      subject IS
+                                                      "warehouse"
+                                                      which is
+                                                      already an OSM
+                                                      classifier)
+    -> [
+         { "building": "warehouse" },
+         { "building": "industrial" },
+         { "landuse": "industrial" },
+         { "landuse": "brownfield" }
+       ]
+    No name alternative needed here — building=warehouse already
+    handles it.
 
     Scene: "old stone church in a small town"
     -> [

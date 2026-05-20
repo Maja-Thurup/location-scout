@@ -33,6 +33,7 @@ import {
 } from "@/lib/providers/tag-overlap";
 import type {
   AssociatedFilm,
+  MergedCandidate,
   ProviderName,
   RawCandidate,
 } from "@/lib/providers/types";
@@ -270,6 +271,110 @@ function inferOsmId(externalIds: Record<string, string | undefined>): number {
   return m ? Number(m[1]) : 0;
 }
 
+/**
+ * Concatenate a candidate's name + description + tag values into one
+ * lowercased text blob for substring matching.
+ */
+function candidateBlob(c: MergedCandidate): string {
+  const parts: string[] = [];
+  if (c.name) parts.push(c.name);
+  if (c.description) parts.push(c.description);
+  for (const v of Object.values(c.tags)) {
+    if (typeof v === "string" && v.length > 0) parts.push(v);
+  }
+  return parts.join(" \u2022 ").toLowerCase();
+}
+
+/**
+ * Tokens that are too generic to be a "subject" we'd require in a
+ * candidate. The user might write them but they don't carve out a
+ * specific thing — every memorial mentions "park"/"statue"/"monument"
+ * incidentally.
+ */
+const NON_SUBJECT_TOKENS = new Set([
+  "park",
+  "statue",
+  "sculpture",
+  "monument",
+  "memorial",
+  "artwork",
+  "building",
+  "house",
+  "tree",
+  "trees",
+  "grass",
+  "sky",
+  "background",
+  "outdoor",
+  "exterior",
+  "interior",
+  "the",
+  "a",
+  "an",
+  "of",
+  "in",
+  "with",
+  "and",
+  "or",
+  "old",
+  "new",
+  "big",
+  "small",
+  "large",
+  "tiny",
+]);
+
+/**
+ * Collect the literal subject keywords used by the subject-required
+ * filter. Pulls them from two places:
+ *   1. The pipe-separated `name` regex Claude emitted (e.g.
+ *      "horse|equestrian|cavalry|jockey|rider"). These are the
+ *      authoritative subject synonyms.
+ *   2. As a fallback (when there's no name regex), any single-word
+ *      scene_token that isn't in the generic-noun blacklist. Short
+ *      words and category nouns are dropped.
+ */
+function collectSubjectKeywords(
+  subjectNameRegex: string | null,
+  sceneTokens: ReadonlyArray<string>,
+): string[] {
+  const out = new Set<string>();
+  if (subjectNameRegex && subjectNameRegex.trim().length > 0) {
+    for (const part of subjectNameRegex.split("|")) {
+      const norm = part.trim().toLowerCase();
+      if (norm.length >= 3 && !NON_SUBJECT_TOKENS.has(norm)) {
+        out.add(norm);
+      }
+    }
+  }
+  if (out.size === 0) {
+    for (const t of sceneTokens) {
+      const norm = t.trim().toLowerCase();
+      if (
+        norm.length >= 4 &&
+        !norm.includes(" ") &&
+        !NON_SUBJECT_TOKENS.has(norm)
+      ) {
+        out.add(norm);
+      }
+    }
+  }
+  return Array.from(out);
+}
+
+/**
+ * Build a regex that matches any of `keywords` as a word-substring in
+ * a lowercased blob. Returns null when there are no usable keywords —
+ * the caller should skip the filter in that case.
+ */
+function buildSubjectMatcher(keywords: ReadonlyArray<string>): RegExp | null {
+  const escaped = keywords.map((k) =>
+    k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+  );
+  if (escaped.length === 0) return null;
+  return new RegExp(`(?:${escaped.join("|")})`, "i");
+}
+
 export const POST = withAuth(async (req) => {
   const t0 = Date.now();
 
@@ -362,7 +467,7 @@ export const POST = withAuth(async (req) => {
   // depends on them; the same OSM-tag query with different scene tokens
   // produces a different ordering and must miss.
   const key = cacheKey("overpass:v3", {
-    schema: "v8-subject-name-boost",
+    schema: "v9-subject-required-filter",
     bbox,
     osmTags,
     osmTagsAlternatives: effectiveAlternatives,
@@ -625,10 +730,47 @@ export const POST = withAuth(async (req) => {
     : rrfRanked;
   const droppedZeroOverlap = rrfRanked.length - afterTagFilter.length;
 
+  // 5.9) SUBJECT-REQUIRED HARD FILTER. This is the "Statue of Liberty
+  // is not a horse statue" rule.
+  //
+  // When the user's prompt has a clear SUBJECT noun (Claude emitted a
+  // "name" alternative in osm_tags_alternatives, or scene_tokens
+  // contains a high-IDF subject word like "horse"/"lighthouse"), every
+  // surviving candidate MUST physically reference that subject — the
+  // candidate's name OR description OR tag values must contain the
+  // subject noun OR one of its synonyms from the regex.
+  //
+  // Without this filter:
+  //   - UNESCO Statue of Liberty (text: "Made in Paris by Bartholdi...")
+  //     passes because it matches "statue" via tag-overlap
+  //   - JQA Ward standing-Washington (text: "bronze statue on Wall St")
+  //     passes for the same reason
+  //
+  // With this filter, both drop because their text contains zero
+  // horse-synonym tokens.
+  const subjectKeywords = collectSubjectKeywords(
+    subjectNameRegex,
+    sceneTokens,
+  );
+  const subjectMatcher = buildSubjectMatcher(subjectKeywords);
+  const subjectFiltered = subjectMatcher
+    ? afterTagFilter.filter((c) => {
+        const blob = candidateBlob(c).toLowerCase();
+        return subjectMatcher.test(blob);
+      })
+    : afterTagFilter;
+  // Don't apply the filter if it would empty the pool — prefer 12
+  // marginal results to zero results.
+  const finalAfterSubject =
+    subjectMatcher && subjectFiltered.length >= 3
+      ? subjectFiltered
+      : afterTagFilter;
+  const droppedNoSubject = afterTagFilter.length - finalAfterSubject.length;
+
   // 6) Convert to RankedCandidate[], rank by combined RRF + tag-overlap
   // score (descending), then break ties by distance from search center.
   const center = bboxCenter(effectiveBbox);
-  const ranked: RankedCandidate[] = afterTagFilter
+  const ranked: RankedCandidate[] = finalAfterSubject
     .map((m) => {
       const overlap = overlapByCandidate.get(m.id) ?? {
         matched: [],
@@ -683,11 +825,13 @@ export const POST = withAuth(async (req) => {
     sceneTokens,
   });
 
-  if (droppedOsmNoise > 0 || droppedZeroOverlap > 0) {
+  if (droppedOsmNoise > 0 || droppedZeroOverlap > 0 || droppedNoSubject > 0) {
     logger.info("search-osm filter stats", {
       droppedOsmNoise,
       droppedZeroOverlap,
+      droppedNoSubject,
       applyHardFilter,
+      subjectKeywords,
       finalCount: ranked.length,
     });
   }

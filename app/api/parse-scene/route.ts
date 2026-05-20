@@ -105,7 +105,7 @@ export const POST = withAuth(async (req) => {
   // this constant whenever the prompt or output schema changes
   // materially. v4 drops anti_tokens and reframes scene_tokens as
   // prompt-derived only (no inferred attributes).
-  const PARSE_SCENE_SCHEMA_VERSION = "v4-prompt-tokens";
+  const PARSE_SCENE_SCHEMA_VERSION = "v5-subject-only-name-regex";
   const key = cacheKey("claude:parse-scene", {
     schema: PARSE_SCENE_SCHEMA_VERSION,
     sceneText,
