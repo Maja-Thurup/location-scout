@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { type Bbox, isBboxOverlapping } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
+import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import type {
   AssociatedFilm,
@@ -100,10 +101,14 @@ async function fetchAllRows(): Promise<Row[]> {
   if (cached) return cached;
 
   const url = `${SODA_ENDPOINT}?$limit=${FETCH_LIMIT}`;
+  const headers: Record<string, string> = {
+    "User-Agent": "LocationScout/0.1 (+https://github.com/Maja-Thurup/location-scout)",
+  };
+  if (env.SOCRATA_APP_TOKEN) {
+    headers["X-App-Token"] = env.SOCRATA_APP_TOKEN;
+  }
   const res = await fetch(url, {
-    headers: {
-      "User-Agent": "LocationScout/0.1 (+https://github.com/Maja-Thurup/location-scout)",
-    },
+    headers,
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!res.ok) {

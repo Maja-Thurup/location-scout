@@ -36,9 +36,13 @@ function clusterKey(lat: number, lng: number): string {
 
 async function main(): Promise<void> {
   console.log(`[sf-films] fetching ${ENDPOINT}…`);
-  const res = await fetch(ENDPOINT, {
-    headers: { "User-Agent": "LocationScout-import/0.1" },
-  });
+  const headers: Record<string, string> = {
+    "User-Agent": "LocationScout-import/0.1",
+  };
+  if (process.env.SOCRATA_APP_TOKEN) {
+    headers["X-App-Token"] = process.env.SOCRATA_APP_TOKEN;
+  }
+  const res = await fetch(ENDPOINT, { headers });
   if (!res.ok) throw new Error(`SF Films HTTP ${res.status}`);
   const raw = (await res.json()) as SfRow[];
   console.log(`[sf-films] fetched ${raw.length} rows`);

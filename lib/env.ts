@@ -59,6 +59,18 @@ const serverEnvSchema = z.object({
    * a recreation.gov account).
    */
   RIDB_API_KEY: z.string().optional(),
+
+  /**
+   * Socrata App Token. Required by data.cityofnewyork.us (and most
+   * other Socrata-backed open-data portals) for unauthenticated
+   * requests to clear the anonymous-rate-limit gate. Without one
+   * NYC Open Data returns 403 for any non-trivial query.
+   *
+   * Get one at https://data.cityofnewyork.us/profile/edit/
+   * developer_settings (free, instant; the "App Token" / "API Key
+   * ID" 25-char string).
+   */
+  SOCRATA_APP_TOKEN: z.string().optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;

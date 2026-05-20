@@ -35,9 +35,19 @@ type SceneRow = {
 
 async function main(): Promise<void> {
   console.log(`[nyc-scenes] fetching ${ENDPOINT}…`);
-  const res = await fetch(ENDPOINT, {
-    headers: { "User-Agent": "LocationScout-import/0.1" },
-  });
+  const headers: Record<string, string> = {
+    "User-Agent": "LocationScout-import/0.1",
+  };
+  if (process.env.SOCRATA_APP_TOKEN) {
+    // X-App-Token clears the anonymous-rate-limit gate; without it NYC
+    // Open Data returns 403 for non-trivial queries since 2024.
+    headers["X-App-Token"] = process.env.SOCRATA_APP_TOKEN;
+  } else {
+    console.warn(
+      "[nyc-scenes] SOCRATA_APP_TOKEN not set — request will likely fail with 403",
+    );
+  }
+  const res = await fetch(ENDPOINT, { headers });
   if (!res.ok) throw new Error(`NYC Scenes HTTP ${res.status}`);
   const raw = (await res.json()) as SceneRow[];
   console.log(`[nyc-scenes] fetched ${raw.length} rows`);
