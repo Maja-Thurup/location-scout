@@ -80,43 +80,33 @@ export const sceneAnalysisSchema = z.object({
   visual: z.string().min(1),
 
   /**
-   * Discrete visual/setting/mood tokens for vision scoring AND future
-   * embedding-based retrieval. Aim for 5-15 short, concrete words.
+   * Tokens extracted DIRECTLY from the user's prompt — distinct words and
+   * useful sub-phrases the user actually wrote. NEVER inferred attributes
+   * (no "bronze", "stone", "weathered" unless the user said so). NEVER
+   * vague background nouns (no "trees" / "grass" unless the user said so).
    *
-   * Examples (per scene):
-   *   "old blue building outside of town with trees in the back"
-   *     -> ["blue", "weathered", "old", "rural", "suburban", "wooden",
-   *         "house", "trees", "forest", "outside_town"]
+   * Both individual words AND multi-word phrases are valid; downstream
+   * matching looks up each token's IDF weight and scores the candidate.
+   *
+   * Examples (note: NO inferred adjectives, NO Claude embellishment):
+   *   "horse statue in a park"
+   *     -> ["horse", "statue", "park", "horse statue", "horse in a park"]
    *   "abandoned brick warehouse, Brooklyn"
-   *     -> ["brick", "warehouse", "industrial", "abandoned", "weathered",
-   *         "boarded_up", "graffiti", "urban"]
+   *     -> ["abandoned", "brick", "warehouse", "abandoned warehouse",
+   *         "brick warehouse"]
    *   "neon-lit diner with phone booth"
-   *     -> ["neon", "diner", "chrome", "phone_booth", "retro", "urban"]
+   *     -> ["neon", "diner", "phone booth", "neon diner"]
+   *   "an old blue building outside of town with trees in the back"
+   *     -> ["old", "blue", "building", "outside of town", "trees",
+   *         "old blue building", "blue building"]
    *
-   * These tokens are NOT OSM tags — they're free-text descriptors used by
-   * the vision scorer to look for specific cues in candidate photos.
+   * The tokens drive both retrieval (per-source keyword queries) and
+   * ranking (IDF-weighted tag-overlap against each candidate's name +
+   * description + tags). Faithfulness to the user's wording is more
+   * important than coverage — drop any tokens that aren't directly
+   * derived from the prompt.
    */
   scene_tokens: z.array(z.string()).default([]),
-
-  /**
-   * Negative/contradicting tokens — things that, if visible in a photo,
-   * mean the photo CANNOT be a match. The vision scorer subtracts heavily
-   * when these are observed. Aim for 3-8 anti-tokens that capture the
-   * obvious lookalikes / wrong subjects we don't want.
-   *
-   * Examples:
-   *   "an old blue building outside of town with trees in the back"
-   *     -> ["modern", "new_construction", "high_rise", "townhouse_row",
-   *         "office_block", "skyscraper", "dense_urban"]
-   *   "abandoned brick warehouse, Brooklyn"
-   *     -> ["modern", "renovated", "shiny_glass", "hotel", "luxury_condo"]
-   *   "bench on a wooded path"
-   *     -> ["highway", "parking_lot", "indoor", "industrial"]
-   *
-   * Empty array = no specific anti-matches (the scorer does its best with
-   * the positive tokens alone).
-   */
-  anti_tokens: z.array(z.string()).default([]),
 
   /** Broad setting category — informs the candidate-generation strategy. */
   location_kind: locationKindSchema.nullable().default(null),
@@ -180,9 +170,8 @@ Return ONLY a single JSON object, no prose, no code fences. The schema is:
   "google_query": "string suitable for Google Places text search",
   "google_types": ["string", "..."],
   "city": "City, ST (United States)",
-  "visual": "1-2 sentence visual descriptor",
-  "scene_tokens": ["short", "discrete", "tokens"],
-  "anti_tokens": ["short", "negative", "tokens"],
+  "visual": "1-2 sentence visual descriptor (vision scorer ONLY)",
+  "scene_tokens": ["tokens", "from", "the", "user's prompt"],
   "location_kind": "urban|suburban|rural|industrial|wilderness|waterfront|mixed" | null,
   "mood": "string or null",
   "time_of_day": "string or null",
@@ -328,55 +317,41 @@ Guidance for fields:
   US city (LA, NYC, Atlanta, Detroit, Miami, ...).
 
 - visual: 1-2 sentences capturing what a candidate photo should show.
-  Concrete and specific — colors, materials, era, framing.
+  Concrete and specific — colors, materials, era, framing. NOTE: this
+  field is consumed ONLY by the vision scorer (deep-tier image
+  ranking). It is NEVER used to derive scene_tokens for retrieval —
+  see scene_tokens below.
 
-- scene_tokens: 5-15 short, discrete words/phrases for vision matching and
-  future embedding retrieval. Use snake_case for multi-word tokens. Mix:
-  COLORS (blue, navy, red, weathered, faded), MATERIALS (brick, wood,
-  stone, concrete, metal), AGE/CONDITION (old, abandoned, decayed,
-  renovated, modern), SETTING (urban, rural, suburban, wooded,
-  outside_town, roadside), OBJECTS (trees, fence, porch, signage), MOOD
-  (gritty, peaceful, noir).
+- scene_tokens: tokens extracted DIRECTLY from the user's prompt.
+  Distinct words AND useful sub-phrases the user wrote. CRITICAL RULES:
+    1. NEVER invent attributes the user didn't say. If the prompt says
+       "horse statue", DO NOT add "bronze" or "stone" — the user might
+       want a wooden horse.
+    2. NEVER add filler nouns describing the implied surroundings.
+       "horse statue in a park" should NOT include "trees" or "grass"
+       unless the user typed those words.
+    3. ONLY pull from the user's wording (or trivial paraphrases like
+       reordering words). Bigram/trigram phrases are OK when they appear
+       in the prompt: "horse statue", "bronze statue", "old blue
+       building" are valid; "weathered_paint" or "rural_setting" are
+       NOT (unless the user said them).
+    4. Faithfulness > coverage. 2 faithful tokens beat 10 inferred ones.
+    5. Lowercase. Plain spaces between words for phrases (no underscores).
 
-  Be expansive. 5 is the floor; 10-15 is ideal.
-
-  Examples:
-    "an old blue building outside of town with trees in the back"
-      -> ["blue", "navy", "weathered", "old", "rural", "suburban",
-          "wooden", "house", "barn", "trees", "forest", "outside_town",
-          "roadside", "peeling_paint"]
-    "abandoned brick warehouse, broken windows"
-      -> ["brick", "warehouse", "industrial", "abandoned", "broken_windows",
-          "boarded_up", "graffiti", "weathered", "decayed", "urban", "gritty"]
-    "neon-lit diner with phone booth"
-      -> ["neon", "diner", "chrome", "formica", "booth", "phone_booth",
-          "retro", "70s", "urban", "night"]
-
-- anti_tokens: 3-8 negative tokens — things that, if visibly present in a
-  photo, CONTRADICT the scene and should kill the score. Pick the obvious
-  "lookalike traps" that Mapillary/Street View commonly returns when our
-  candidate generation misfires.
-
-  Be specific to the scene's contradictions. Don't list random opposites.
-
-  Examples:
-    "an old blue building outside of town with trees in the back"
-      -> ["modern", "new_construction", "high_rise", "townhouse_row",
-          "office_block", "skyscraper", "dense_urban"]
+  Examples (notice the absence of inferred attributes):
+    "horse statue in a park"
+      -> ["horse", "statue", "park", "horse statue",
+          "horse in a park"]
     "abandoned brick warehouse, Brooklyn"
-      -> ["modern", "renovated", "shiny_glass", "luxury_condo", "hotel"]
-    "Victorian row house"
-      -> ["modern", "ranch_house", "bungalow", "high_rise"]
-    "diner conversation at night"
-      -> ["fine_dining", "chain_restaurant", "fast_food_drive_thru",
-          "office_lobby"]
+      -> ["abandoned", "brick", "warehouse", "abandoned warehouse",
+          "brick warehouse"]
+    "neon-lit diner with phone booth"
+      -> ["neon", "diner", "phone booth", "neon-lit diner"]
+    "an old blue building outside of town with trees in the back"
+      -> ["old", "blue", "building", "trees", "outside of town",
+          "old blue building", "blue building"]
     "bench on a wooded path"
-      -> ["highway", "parking_lot", "indoor", "industrial", "intersection"]
-    "neon-lit diner"
-      -> ["daylight", "no_signage", "office_building", "fine_dining"]
-
-  Empty array is acceptable for very generic scenes; otherwise emit at least
-  3.
+      -> ["bench", "wooded", "path", "wooded path", "bench on a path"]
 
 - location_kind: pick one of the enum values that best fits, or null.
     urban       — city center, dense streets, mid/high-rise

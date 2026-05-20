@@ -49,9 +49,9 @@ describe("mergeCandidates", () => {
     expect(out[0]!.name).toBe("Tribeca Building");
   });
 
-  it("uses the highest-priority source as the cluster seed (NYC > Wikidata > OSM)", () => {
+  it("uses the highest-priority source as the cluster seed and the most-precise coords (OSM node > NYC Scenes)", () => {
     const out = mergeCandidates([
-      raw({ source: "osm", externalId: "way/1", lat: 40.700, lng: -74.0, name: "OSM building" }),
+      raw({ source: "osm", externalId: "node/1", lat: 40.700, lng: -74.0, name: "OSM building" }),
       raw({
         source: "wikidata-landmark",
         externalId: "Q1",
@@ -69,9 +69,28 @@ describe("mergeCandidates", () => {
     ]);
 
     expect(out).toHaveLength(1);
+    // Display priority: NYC Scenes wins (highest source priority for
+    // canonical name + film attribution).
     expect(out[0]!.primarySource).toBe("nyc-scenes-from-the-city");
-    // Coords come from the highest-priority record.
-    expect(out[0]!.lat).toBeCloseTo(40.7002, 4);
+    // Coord precision: OSM node beats NYC Scenes centroid (rank 5 vs 3).
+    // The user navigates to the OSM-precise pin, not the centroid.
+    expect(out[0]!.lat).toBeCloseTo(40.700, 4);
+  });
+
+  it("OSM way (polygon centroid) does NOT win coord precision over Wikidata point", () => {
+    const out = mergeCandidates([
+      raw({ source: "osm", externalId: "way/1", lat: 40.700, lng: -74.0 }),
+      raw({
+        source: "wikidata-landmark",
+        externalId: "Q1",
+        lat: 40.7001,
+        lng: -74.0001,
+        name: "Wikidata name",
+      }),
+    ]);
+    expect(out).toHaveLength(1);
+    // OSM way (polygon centroid) is rank 3, Wikidata is rank 4 -> Wikidata wins.
+    expect(out[0]!.lat).toBeCloseTo(40.7001, 4);
   });
 
   it("merges associatedFilms across providers (dedupe by Q-id)", () => {

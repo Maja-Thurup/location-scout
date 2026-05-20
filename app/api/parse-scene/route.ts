@@ -101,11 +101,11 @@ export const POST = withAuth(async (req) => {
 
   // 2) Cache lookup (cache hits do NOT consume the rate-limit quota).
   // Schema version is part of the key so cache entries from an older
-  // prompt/schema (e.g. before osm_tags_alternatives + scene_tokens +
-  // anti_tokens existed) miss cleanly and trigger a fresh Claude call.
-  // Bump this constant whenever the prompt or output schema changes
-  // materially.
-  const PARSE_SCENE_SCHEMA_VERSION = "v3-tokens-anti";
+  // prompt/schema miss cleanly and trigger a fresh Claude call. Bump
+  // this constant whenever the prompt or output schema changes
+  // materially. v4 drops anti_tokens and reframes scene_tokens as
+  // prompt-derived only (no inferred attributes).
+  const PARSE_SCENE_SCHEMA_VERSION = "v4-prompt-tokens";
   const key = cacheKey("claude:parse-scene", {
     schema: PARSE_SCENE_SCHEMA_VERSION,
     sceneText,

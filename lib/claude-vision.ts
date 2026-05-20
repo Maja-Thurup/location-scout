@@ -39,32 +39,26 @@ function getClient(): Anthropic {
 
 const SYSTEM_PROMPT = `You are scoring filming-location photos for a video production scout.
 
-Given a scene description (with optional discrete tokens AND anti-tokens for explicit cues) and a single photo, rate from 0-100 how well the photo matches the scene as a potential filming location.
+Given a scene description (with optional tokens for the user's intent) and a single photo, rate from 0-100 how well the photo matches the scene as a potential filming location.
 
 Consider, in priority order:
-- POSITIVE TOKENS in the brief (color, material, age, condition, setting, signature objects). Each token directly present in the photo adds confidence; each conspicuously absent token subtracts.
-- ANTI-TOKENS (negative): if any anti-token is visibly present in the photo, the score MUST drop hard — the candidate cannot be a match. A photo of a brand-new high-rise apartment block is NEVER a match for "old blue building", regardless of any incidental blue paint.
-- Building / subject TYPE (warehouse, diner, cathedral, house, barn, ...) — must match the scene's primary subject
-- Materials (brick, glass, wood, concrete, stone, metal, ...)
-- Color and condition (faded, weathered, peeling, freshly-painted)
-- Setting / surroundings (urban / suburban / rural / wilderness / waterfront)
+- TOKENS from the user's prompt (subjects, materials, colors, age cues — whatever they actually wrote). Each token visibly present in the photo adds confidence; each conspicuously absent token subtracts.
+- Subject TYPE (warehouse, diner, cathedral, house, barn, statue, monument, ...) — must match the scene's primary subject
 - Whether the photo actually SHOWS the subject (not just a road, sky, parked car, or unrelated foliage)
 - How prominently the matching elements appear in the frame
+- Setting / surroundings (urban / suburban / rural / wilderness / waterfront) when relevant
 
 Scoring rubric:
-  90-100  most positive tokens visibly match + correct subject type + zero anti-tokens visible
-  70-89   subject type matches; majority of positive tokens visible; no anti-tokens
-  50-69   subject type matches but several positive tokens absent OR one mild anti-token visible
-  30-49   subject loosely related (street near the right kind of building) OR anti-token present
-  10-29   wrong subject type, OR multiple anti-tokens clearly visible
-   0-9    completely unrelated, OR strong anti-token dominates the frame
-           (e.g. asked for "old blue building", photo shows a glassy high-rise)
+  90-100  most tokens visibly match + correct subject type + clear framing
+  70-89   subject type matches; majority of tokens visible
+  50-69   subject type matches but several tokens absent
+  30-49   subject loosely related (street near the right kind of building)
+  10-29   wrong subject type but adjacent (asked for warehouse, photo shows nearby retail)
+   0-9    completely unrelated (empty road, sky-only, parking lot)
 
-Anti-tokens are FATAL. A photo dominated by an anti-token must score <= 20, even
-if it incidentally has a few positive tokens. Don't reward "blue paint somewhere
-in the background" if the dominant subject contradicts the brief.
+Be honest about what you SEE. Do not penalize for missing tokens that the prompt didn't actually emphasize.
 
-Return ONLY a JSON object: { "score": <integer 0-100>, "reason": "<one sentence — call out which key tokens hit or missed and which anti-tokens (if any) are visible>" }
+Return ONLY a JSON object: { "score": <integer 0-100>, "reason": "<one sentence — name the key tokens that hit or missed>" }
 No prose, no code fences, no explanation outside the JSON.`;
 
 /**
@@ -80,35 +74,26 @@ No prose, no code fences, no explanation outside the JSON.`;
  * Returns null on any error so callers can fall back to source-priority
  * ordering rather than blowing up the whole search.
  *
- * `sceneTokens` (optional) is a list of short discrete words/phrases like
- * ["blue", "weathered", "rural", "trees"] that the model uses as the
- * primary checklist when scoring. Encourages tighter, more interpretable
- * scores than prose alone.
- *
- * `antiTokens` (optional) is the negative checklist — when any of these is
- * visibly present in the photo, the score is supposed to drop hard. Use
- * for the obvious lookalike traps (e.g. "modern", "high_rise", "townhouse"
- * for an "old blue building" prompt).
+ * `sceneTokens` (optional) is a list of short words/phrases pulled
+ * directly from the user's prompt — used as the primary checklist when
+ * scoring. Encourages tighter, more interpretable scores than prose
+ * alone.
  */
 export async function scoreImageMatch(args: {
   imageUrl: string;
   sceneDescription: string;
   sceneTokens?: ReadonlyArray<string>;
-  antiTokens?: ReadonlyArray<string>;
 }): Promise<VisionScore | null> {
   // Normalize tokens for cache stability: lowercase, deduped, sorted.
   const normTokens = Array.from(
     new Set((args.sceneTokens ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean)),
-  ).sort();
-  const normAnti = Array.from(
-    new Set((args.antiTokens ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean)),
   ).sort();
 
   const cKey = cacheKey("claude:vision-score", {
     image: args.imageUrl,
     scene: args.sceneDescription.toLowerCase().trim(),
     tokens: normTokens,
-    anti: normAnti,
+    schema: "v2-no-anti",
   });
   const cached = await cacheGet<VisionScore>(cKey);
   if (cached) return cached;
@@ -169,7 +154,7 @@ export async function scoreImageMatch(args: {
               },
               {
                 type: "text",
-                text: buildVisionPrompt(args.sceneDescription, normTokens, normAnti),
+                text: buildVisionPrompt(args.sceneDescription, normTokens),
               },
             ],
           },
@@ -221,7 +206,6 @@ export async function scoreImagesParallel(args: {
   imageUrls: ReadonlyArray<string>;
   sceneDescription: string;
   sceneTokens?: ReadonlyArray<string>;
-  antiTokens?: ReadonlyArray<string>;
   concurrency?: number;
 }): Promise<Array<VisionScore | null>> {
   const concurrency = args.concurrency ?? 4;
@@ -235,7 +219,6 @@ export async function scoreImagesParallel(args: {
       imageUrl: args.imageUrls[i]!,
       sceneDescription: args.sceneDescription,
       sceneTokens: args.sceneTokens,
-      antiTokens: args.antiTokens,
     });
     return worker();
   }
@@ -267,7 +250,6 @@ export async function scoreBestPhotoMatch(args: {
   imageUrls: ReadonlyArray<string>;
   sceneDescription: string;
   sceneTokens?: ReadonlyArray<string>;
-  antiTokens?: ReadonlyArray<string>;
   concurrency?: number;
 }): Promise<BestPhotoMatch | null> {
   if (args.imageUrls.length === 0) return null;
@@ -276,7 +258,6 @@ export async function scoreBestPhotoMatch(args: {
     imageUrls: args.imageUrls,
     sceneDescription: args.sceneDescription,
     sceneTokens: args.sceneTokens,
-    antiTokens: args.antiTokens,
     concurrency: args.concurrency,
   });
 
@@ -298,22 +279,13 @@ export async function scoreBestPhotoMatch(args: {
 function buildVisionPrompt(
   description: string,
   tokens: ReadonlyArray<string>,
-  antiTokens: ReadonlyArray<string>,
 ): string {
   const sections: string[] = [];
 
   if (tokens.length > 0) {
     sections.push(
-      "POSITIVE tokens (the explicit visual checklist — match these first):",
-      tokens.map((t) => `  + ${t}`).join("\n"),
-      "",
-    );
-  }
-
-  if (antiTokens.length > 0) {
-    sections.push(
-      "ANTI-TOKENS (FATAL if visibly present — score must be <= 20):",
-      antiTokens.map((t) => `  - ${t}`).join("\n"),
+      "Tokens from the user's prompt (the explicit visual checklist):",
+      tokens.map((t) => `  - ${t}`).join("\n"),
       "",
     );
   }

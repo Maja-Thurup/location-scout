@@ -121,8 +121,20 @@ export function mergeCandidates(
       cluster.sourceUrl = cluster.sourceUrl ?? raw.sourceUrl;
       cluster.tags = unionTags(cluster.tags, raw.tags);
       cluster.associatedFilms = mergeFilms(cluster.associatedFilms, raw.associatedFilms);
+      // Coord precision: prefer the contributing record with the most
+      // precise coords. OSM nodes (`node/...`) are typically point-
+      // precise (1 m). UNESCO and Wikipedia coords are often centroids
+      // of multi-acre areas (50-100 m+ off). When a more-precise source
+      // joins the cluster, swap the cluster's coords to its.
+      if (coordPrecisionRank(raw) > coordPrecisionRank(coordOwnerOfCluster(cluster))) {
+        cluster.lat = raw.lat;
+        cluster.lng = raw.lng;
+        // Track which source the coords came from so subsequent merges
+        // can compare correctly.
+        (cluster as ClusterWithCoordOwner)._coordOwner = raw.source;
+      }
     } else {
-      merged.push({
+      const fresh: ClusterWithCoordOwner = {
         id: `${raw.source}:${raw.externalId}`,
         primarySource: raw.source,
         sources: [raw.source],
@@ -136,11 +148,70 @@ export function mergeCandidates(
         tags: { ...raw.tags },
         associatedFilms: raw.associatedFilms,
         sourceUrl: raw.sourceUrl,
-      });
+        _coordOwner: raw.source,
+      };
+      merged.push(fresh);
     }
   }
 
   return merged;
+}
+
+// ---------------------------------------------------------------------------
+// Coord precision helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-source coord precision rank. Higher = more precise.
+ *
+ *   OSM node            5  point-precise (1m)
+ *   NPS / Wikidata      4  curated point coords (5-20m)
+ *   SF Films / RIDB     4  point coords from official datasets
+ *   Wikidata-P915       3  filming-location coord (variable)
+ *   NYC Scenes          3  curated but point coords
+ *   Wikipedia geosearch 2  often a region centroid (10-100m off)
+ *   UNESCO              1  often a multi-acre site centroid (100m+ off)
+ *
+ * Ties on rank fall through to the cluster's existing coords.
+ */
+type ClusterWithCoordOwner = MergedCandidate & {
+  _coordOwner?: ProviderName;
+};
+
+function coordPrecisionRank(input: {
+  source: ProviderName;
+  externalId?: string;
+} | { source?: ProviderName }): number {
+  const source = "source" in input ? input.source : undefined;
+  // OSM node ids look like "node/12345"; ways/relations are polygon
+  // centroids and less precise.
+  const externalId =
+    "externalId" in input && typeof input.externalId === "string"
+      ? input.externalId
+      : "";
+  if (source === "osm") {
+    return externalId.startsWith("node/") ? 5 : 3;
+  }
+  if (source === "nps-places") return 4;
+  if (source === "wikidata-landmark") return 4;
+  if (source === "ridb-recreation") return 4;
+  if (source === "sf-film-locations") return 4;
+  if (source === "nrhp" || source === "nhl") return 4;
+  if (source === "wikidata-filming-location") return 3;
+  if (source === "nyc-scenes-from-the-city") return 3;
+  if (source === "own-db") return 3;
+  if (source === "wikipedia-geosearch") return 2;
+  if (source === "unesco-heritage") return 1;
+  return 0;
+}
+
+function coordOwnerOfCluster(cluster: MergedCandidate): {
+  source?: ProviderName;
+  externalId?: string;
+} {
+  const c = cluster as ClusterWithCoordOwner;
+  const owner = c._coordOwner ?? cluster.primarySource;
+  return { source: owner, externalId: cluster.externalIds[owner] };
 }
 
 /**

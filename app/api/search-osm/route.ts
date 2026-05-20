@@ -79,7 +79,6 @@ const requestSchema = z.object({
    * (e.g. Wikidata could filter by location_kind in the future).
    */
   sceneTokens: z.array(z.string()).optional().default([]),
-  antiTokens: z.array(z.string()).optional().default([]),
   locationKind: z
     .enum([
       "urban",
@@ -149,12 +148,10 @@ type RankedCandidate = {
   // M4: ranking signals
   /** Reciprocal Rank Fusion score across contributing retrievers. */
   rrfScore: number;
-  /** Tag overlap with scene_tokens (positive matches minus anti-matches). */
+  /** IDF-weighted tag overlap with scene_tokens. */
   tagOverlapScore: number;
   /** Distinctive tokens that matched (for UI badge). */
   matchedTokens: ReadonlyArray<string>;
-  /** Anti-tokens visibly present (penalty terms). */
-  antiMatchedTokens: ReadonlyArray<string>;
 };
 
 export type ExtendedMatchMode = MatchMode | "google_text_fallback";
@@ -303,7 +300,6 @@ export const POST = withAuth(async (req) => {
     googleQuery,
     mapillaryClasses,
     sceneTokens,
-    antiTokens,
     locationKind,
     searchTier,
     location,
@@ -362,17 +358,16 @@ export const POST = withAuth(async (req) => {
   // History: v4-providers (post-providers refactor) → v5-rrf-tag-overlap
   // (M4 ranking with RRF + tag-overlap + macro-region filter + films-as-
   // post-add).
-  // The key also includes scene_tokens / anti_tokens / location_kind
-  // because M4's ranking depends on them; the same OSM-tag query with
-  // different scene tokens produces a different ordering and must miss.
+  // The key includes scene_tokens / location_kind because M4's ranking
+  // depends on them; the same OSM-tag query with different scene tokens
+  // produces a different ordering and must miss.
   const key = cacheKey("overpass:v3", {
-    schema: "v6-tier-aware",
+    schema: "v7-no-anti-tokens",
     bbox,
     osmTags,
     osmTagsAlternatives: effectiveAlternatives,
     mapillaryClasses: mapillaryClasses ? [...mapillaryClasses].sort() : null,
     sceneTokens: [...sceneTokens].sort(),
-    antiTokens: [...antiTokens].sort(),
     locationKind: locationKind ?? null,
     // M5: free vs deep produces different candidate pools (Google
     // Places searchText only runs in deep). Cache them separately.
@@ -422,7 +417,6 @@ export const POST = withAuth(async (req) => {
   const providersPromise = runProviders({
     bbox,
     sceneTokens,
-    antiTokens,
     locationKind,
     osmTagsAlternatives: effectiveAlternatives,
   });
@@ -591,15 +585,15 @@ export const POST = withAuth(async (req) => {
   });
   const droppedOsmNoise = merged.length - filteredMerged.length;
 
-  // 5.7) Score each candidate with RRF (across retrievers) AND tag
-  // overlap (against the user's scene_tokens / anti_tokens). The
-  // combined rank is what drives the final ordering — pure proximity-
+  // 5.7) Score each candidate with RRF (across retrievers) AND IDF-
+  // weighted tag overlap (against the user's prompt-derived scene_tokens).
+  // The combined rank is what drives the final ordering — pure proximity-
   // sort produced terrible results because it surfaced un-named OSM
   // polygons close to the bbox center over actual landmarks across town.
   const rrfRanked = rrfRank(filteredMerged, locationKind);
   const overlapByCandidate = new Map<string, TagOverlapScore>();
   for (const c of rrfRanked) {
-    const overlap = tagOverlapScore(c, sceneTokens, antiTokens);
+    const overlap = tagOverlapScore(c, sceneTokens);
     overlapByCandidate.set(c.id, overlap);
   }
 
@@ -629,7 +623,6 @@ export const POST = withAuth(async (req) => {
     .map((m) => {
       const overlap = overlapByCandidate.get(m.id) ?? {
         matched: [],
-        antiMatched: [],
         score: 0,
       };
       return {
@@ -651,18 +644,15 @@ export const POST = withAuth(async (req) => {
         rrfScore: m.rrfScore,
         tagOverlapScore: overlap.score,
         matchedTokens: overlap.matched,
-        antiMatchedTokens: overlap.antiMatched,
       };
     })
     .sort((a, b) => {
       const aCombined = combinedRank(a.rrfScore, {
         matched: a.matchedTokens,
-        antiMatched: a.antiMatchedTokens,
         score: a.tagOverlapScore,
       });
       const bCombined = combinedRank(b.rrfScore, {
         matched: b.matchedTokens,
-        antiMatched: b.antiMatchedTokens,
         score: b.tagOverlapScore,
       });
       if (bCombined !== aCombined) return bCombined - aCombined;

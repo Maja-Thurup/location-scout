@@ -1,22 +1,21 @@
 import type { MergedCandidate } from "@/lib/providers/types";
 
 // ---------------------------------------------------------------------------
-// Tag-overlap scoring — the missing piece between LLM-extracted scene
-// tokens and candidate text fields.
+// Tag-overlap scoring — the bridge between prompt-derived scene tokens
+// and candidate text fields.
 //
-// For "horse statue in a park" Claude emits scene_tokens like
-// ["horse", "statue", "monument", "park", "equestrian", "bronze"] and
-// anti_tokens like ["modern", "high_rise", "indoor"]. A candidate's
-// name + description + tag values forms its TEXT BLOB. We count the
-// scene_tokens that appear in the blob, minus a small penalty for
-// each anti_token that appears.
+// For "horse statue in a park" Claude emits scene_tokens drawn directly
+// from the prompt: ["horse", "statue", "park", "horse statue"]. A
+// candidate's name + description + tag values forms its TEXT BLOB. We
+// count which scene_tokens appear in the blob and weight each match by
+// its IDF (rare tokens like "horse" or "statue" outweigh common ones
+// like "park").
 //
 // Why this matters: for confident, content-rich prompts ("horse statue",
 // "abandoned brick warehouse", "lighthouse on a cliff") the BEST
 // candidates have scene_token matches in their NAME alone. Vision
 // scoring is unnecessary noise when text retrieval already nails the
-// answer. M5's free tier will skip vision entirely when
-// confidence is high; M5's deep tier will keep it.
+// answer — free tier skips vision entirely; deep tier keeps it.
 //
 // Pure functions — covered by unit tests.
 // ---------------------------------------------------------------------------
@@ -251,20 +250,15 @@ function countMatches(
 export type TagOverlapScore = {
   /** Distinctive scene tokens matched in name+description+tags. */
   matched: ReadonlyArray<string>;
-  /** Anti-tokens visibly present in the same blob (penalty). */
-  antiMatched: ReadonlyArray<string>;
   /**
-   * IDF-weighted final score: rare/distinctive token matches weight more
-   * than common ones. Anti-tokens subtract 2× their weight.
+   * IDF-weighted score: rare/distinctive token matches weigh more than
+   * common ones.
    *
    * Approximate ranges:
    *   - 0      no useful overlap
    *   - 0.5-2  common matches only ("park", "house")
    *   - 2-5    one rare match ("equestrian", "obelisk", "abandoned")
    *   - 5+     multiple rare matches OR one very-rare + several common
-   *
-   * Negative scores are clamped to 0 by callers when used as a ranking
-   * multiplier; the raw negative is still surfaced for debugging.
    */
   score: number;
 };
@@ -272,30 +266,28 @@ export type TagOverlapScore = {
 export function tagOverlapScore(
   candidate: MergedCandidate,
   sceneTokens: ReadonlyArray<string>,
-  antiTokens: ReadonlyArray<string>,
 ): TagOverlapScore {
   const blob = buildCandidateText(candidate);
   const positive = countMatches(sceneTokens, blob);
-  const negative = countMatches(antiTokens, blob);
   return {
     matched: positive.matched,
-    antiMatched: negative.matched,
-    score: positive.weightedScore - 2 * negative.weightedScore,
+    score: positive.weightedScore,
   };
 }
 
 /**
  * Combined score for sorting: RRF rank-score + tag-overlap multiplier.
  *
- * The 0.15 multiplier was chosen so a candidate with 3 distinctive
- * token matches gets roughly the same score as a candidate that
- * appeared #1 in a high-weight retriever. Tunable.
+ * The 0.5 multiplier (bumped from 0.15) gives tag-overlap real
+ * influence: a candidate with one rare match (weight 3) gets a +1.5
+ * boost, which is enough to leapfrog a non-matching candidate that
+ * topped its retriever. Tunable.
  */
 export function combinedRank(
   rrfScore: number,
   overlap: TagOverlapScore,
 ): number {
-  const overlapBoost = Math.max(0, overlap.score) * 0.15;
+  const overlapBoost = Math.max(0, overlap.score) * 0.5;
   return rrfScore + overlapBoost;
 }
 

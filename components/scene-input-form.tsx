@@ -207,7 +207,6 @@ async function searchOsmRequest(input: {
   googleQuery?: string;
   mapillaryClasses?: string[];
   sceneTokens?: ReadonlyArray<string>;
-  antiTokens?: ReadonlyArray<string>;
   locationKind?: string | null;
   searchTier?: "free" | "deep";
   location?: string;
@@ -249,7 +248,6 @@ async function enrichLocationsRequest(input: {
    *  prose. */
   sceneText?: string;
   sceneTokens?: ReadonlyArray<string>;
-  antiTokens?: ReadonlyArray<string>;
   visionScoreLimit?: number;
   minVisionScore?: number;
   photosPerCandidate?: number;
@@ -463,7 +461,6 @@ export function SceneInputForm({
         mapillaryClasses: analysis.mapillary_classes,
         // Phase 2a: providers can use these to tailor their queries.
         sceneTokens,
-        antiTokens: analysis.anti_tokens ?? [],
         locationKind: analysis.location_kind ?? null,
         searchTier,
         location,
@@ -522,7 +519,6 @@ export function SceneInputForm({
         sceneDescription,
         sceneText: sceneText.trim(),
         sceneTokens,
-        antiTokens: analysis.anti_tokens ?? [],
         visionScoreLimit: 10,
         minVisionScore: 50,
         photosPerCandidate: 3,
@@ -1141,25 +1137,6 @@ function AnalysisResultPanel({
                   className="rounded-full border border-emerald-500/20 bg-emerald-500/5 px-2 py-0.5 font-mono text-xs text-emerald-200"
                 >
                   + {t}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Anti-tokens — fatal-if-visible cues. */}
-        {(analysis.anti_tokens?.length ?? 0) > 0 && (
-          <div className="space-y-1">
-            <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-              Anti-tokens ({analysis.anti_tokens.length} — penalized in vision scoring)
-            </p>
-            <div className="flex flex-wrap gap-1.5">
-              {analysis.anti_tokens.map((t) => (
-                <span
-                  key={t}
-                  className="rounded-full border border-rose-500/20 bg-rose-500/5 px-2 py-0.5 font-mono text-xs text-rose-200"
-                >
-                  − {t}
                 </span>
               ))}
             </div>

@@ -112,9 +112,8 @@ export type MergedCandidate = Omit<RawCandidate, "externalId" | "source"> & {
 
 export type ProviderInput = {
   bbox: Bbox;
-  /** Tokens / location kind let providers tailor their queries. */
+  /** Prompt-derived tokens that providers can use to tailor queries. */
   sceneTokens: ReadonlyArray<string>;
-  antiTokens: ReadonlyArray<string>;
   locationKind: LocationKind | null;
   /**
    * Pre-resolved alternatives from Claude. The OSM provider uses these;

@@ -119,11 +119,6 @@ const requestSchema = z.object({
    * interpretable and grounded.
    */
   sceneTokens: z.array(z.string().min(1).max(40)).max(30).default([]),
-  /**
-   * Negative tokens — things that, if visible, kill the score. The vision
-   * rubric treats these as fatal (cap at 20) when one dominates the frame.
-   */
-  antiTokens: z.array(z.string().min(1).max(40)).max(20).default([]),
   /** Cap on candidates that get vision-scored. */
   visionScoreLimit: z.number().int().min(0).max(60).default(10),
   /**
@@ -455,7 +450,6 @@ async function visionScoreSurvivors(
   survivors: ReadonlyArray<FreeSignals>,
   sceneDescription: string,
   sceneTokens: ReadonlyArray<string>,
-  antiTokens: ReadonlyArray<string>,
   limit: number,
 ): Promise<ScoredCandidate[]> {
   // Only the top `limit` candidates get vision-scored to control cost.
@@ -491,7 +485,6 @@ async function visionScoreSurvivors(
         imageUrls: pool.map((p) => p.url),
         sceneDescription,
         sceneTokens,
-        antiTokens,
       });
 
       if (!best) {
@@ -719,7 +712,6 @@ export const POST = withAuth(async (req) => {
     sceneDescription,
     sceneText,
     sceneTokens,
-    antiTokens,
     visionScoreLimit,
     minVisionScore,
     photosPerCandidate: photosPerCandidateInput,
@@ -842,7 +834,6 @@ export const POST = withAuth(async (req) => {
       distanceSorted,
       sceneDescription,
       sceneTokens,
-      antiTokens,
       visionScoreLimit,
     );
   }
@@ -916,30 +907,49 @@ export const POST = withAuth(async (req) => {
     const place = e.static.googlePlace;
     const sv = e.static.streetView;
 
-    // Build candidate photos. The multi-shot winner is our canonical
-    // primary thumbnail. Other sources go in alternates.
-    const winnerPhoto: SelectedPhoto | null =
-      e.bestPhoto?.kind === "mapillary"
-        ? selectedFromMapillary(e.bestPhoto.mapillary, e.visionScore)
-        : e.bestPhoto?.kind === "known"
-          ? selectedFromKnown({
-              url: e.bestPhoto.url,
-              attributionText: null,
-              attributionHref: candidate.sourceUrl ?? null,
-              score: e.visionScore,
-            })
-          : e.mapillary
-            ? selectedFromMapillary(e.mapillary, e.visionScore)
-            : null;
+    // Build candidate photos. Two paths:
+    //   - Vision ran (deep tier or high-confidence skip-vision didn't
+    //     apply): the multi-shot winner is canonical.
+    //   - Vision skipped (free tier): use the candidate's KNOWN
+    //     curated image first (Wikidata P18 / Wikipedia pageimages /
+    //     UNESCO main_image_url / NPS images[0] / SF Films, ...). It's
+    //     a hand-picked photo of the actual subject; vastly better than
+    //     a Mapillary streetview thumb of the empty intersection
+    //     nearby. Mapillary stays as fallback when no curated image
+    //     exists.
+    const visionRan = e.visionScore != null;
+
+    let winnerPhoto: SelectedPhoto | null = null;
+    if (visionRan && e.bestPhoto?.kind === "mapillary") {
+      winnerPhoto = selectedFromMapillary(e.bestPhoto.mapillary, e.visionScore);
+    } else if (visionRan && e.bestPhoto?.kind === "known") {
+      winnerPhoto = selectedFromKnown({
+        url: e.bestPhoto.url,
+        attributionText: null,
+        attributionHref: candidate.sourceUrl ?? null,
+        score: e.visionScore,
+      });
+    } else if (candidate.knownImageUrl) {
+      // Free tier: prefer the curated image directly.
+      winnerPhoto = selectedFromKnown({
+        url: candidate.knownImageUrl,
+        attributionText: null,
+        attributionHref: candidate.sourceUrl ?? null,
+        score: e.visionScore,
+      });
+    } else if (e.mapillary) {
+      winnerPhoto = selectedFromMapillary(e.mapillary, e.visionScore);
+    }
 
     const streetViewPhoto = selectedFromStreetView(sv, e.visionScore);
     const googlePhoto = place
       ? selectedFromGooglePlace(place, e.visionScore)
       : null;
 
-    // Photo priority: multi-shot WINNER first (already vision-confirmed),
-    // then Google Place Photo / GSV / closest-Mapillary as alternates so
-    // a "swap photo" UI in the future can offer them.
+    // Photo priority: winner first (curated knownImageUrl on free tier,
+    // multi-shot vision winner on deep tier). Then Google Place Photo /
+    // GSV / closest-Mapillary as alternates so a "swap photo" UI in the
+    // future can offer them.
     const photo = winnerPhoto ?? streetViewPhoto ?? googlePhoto ?? null;
     const alternates: SelectedPhoto[] = [];
     for (const p of [streetViewPhoto, googlePhoto]) {
@@ -1033,7 +1043,6 @@ export const POST = withAuth(async (req) => {
     const filmHistoryRun = await runFilmHistoryProviders({
       bbox: searchBbox,
       sceneTokens: [],
-      antiTokens: [],
       locationKind: null,
       osmTagsAlternatives: [],
     }).catch(() => null);
