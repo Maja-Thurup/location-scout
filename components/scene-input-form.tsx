@@ -65,7 +65,10 @@ type ProviderName =
   | "wikidata-filming-location"
   | "wikipedia-geosearch"
   | "nyc-scenes-from-the-city"
-  | "sf-film-locations";
+  | "sf-film-locations"
+  | "nps-places"
+  | "ridb-recreation"
+  | "unesco-heritage";
 
 type AssociatedFilm = {
   wikidataQid: string | null;

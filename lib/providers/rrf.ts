@@ -42,6 +42,13 @@ const DEFAULT_RRF_WEIGHTS: Record<ProviderName, number> = {
   osm: 0.6,
   "wikidata-landmark": 1.2,
   "wikipedia-geosearch": 1.2,
+  // M7: NPS /places is curated, photo-rich, has good descriptions —
+  // very high signal. UNESCO is small but every entry is globally
+  // significant. RIDB is utility-grade (campgrounds, rec areas) — useful
+  // for wilderness/scenic prompts but lower signal for famous landmarks.
+  "nps-places": 1.4,
+  "unesco-heritage": 1.5,
+  "ridb-recreation": 0.9,
   // Film-history sources never participate in RRF retrieval ranking —
   // see lib/providers/registry.ts (DEFAULT_CONTENT_PROVIDERS vs
   // FILM_HISTORY_PROVIDERS). Weights here are zero so any accidental
@@ -68,36 +75,55 @@ const INTENT_BOOSTS: Record<
     osm: 1.5,
     "wikidata-landmark": 0.8,
     "wikipedia-geosearch": 0.9,
+    "nps-places": 1.3,
+    "ridb-recreation": 1.5,
   },
   wilderness: {
     osm: 1.3,
     "wikidata-landmark": 0.8,
     "wikipedia-geosearch": 1.0,
+    // Wilderness is RIDB's wheelhouse (USFS/BLM lands, campgrounds,
+    // trailheads) and NPS's (national parks proper).
+    "nps-places": 1.7,
+    "ridb-recreation": 1.7,
+    "unesco-heritage": 1.3,
   },
   urban: {
     osm: 0.7,
     "wikidata-landmark": 1.3,
     "wikipedia-geosearch": 1.3,
+    "nps-places": 0.6, // few NPS sites in city centers
+    "ridb-recreation": 0.4,
+    "unesco-heritage": 1.1,
   },
   industrial: {
     osm: 1.2,
     "wikidata-landmark": 0.9,
     "wikipedia-geosearch": 0.9,
+    "nps-places": 0.5,
+    "ridb-recreation": 0.5,
   },
   waterfront: {
     osm: 1.0,
     "wikidata-landmark": 1.1,
     "wikipedia-geosearch": 1.1,
+    "nps-places": 1.2,
+    "ridb-recreation": 1.3,
   },
   suburban: {
     osm: 1.0,
     "wikidata-landmark": 1.0,
     "wikipedia-geosearch": 1.0,
+    "nps-places": 0.8,
+    "ridb-recreation": 0.7,
   },
   mixed: {
     osm: 1.0,
     "wikidata-landmark": 1.0,
     "wikipedia-geosearch": 1.0,
+    "nps-places": 1.0,
+    "ridb-recreation": 1.0,
+    "unesco-heritage": 1.0,
   },
 };
 

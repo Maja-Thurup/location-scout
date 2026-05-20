@@ -313,6 +313,12 @@ function sourcePillLabel(source: LocationSource): string {
       return "NYC Scenes";
     case "sf-film-locations":
       return "SF Films";
+    case "nps-places":
+      return "NPS";
+    case "ridb-recreation":
+      return "Recreation.gov";
+    case "unesco-heritage":
+      return "UNESCO";
   }
 }
 
@@ -327,6 +333,12 @@ function sourcePillClass(source: LocationSource): string {
       return "bg-blue-500/15 text-blue-200 border border-blue-500/20";
     case "wikipedia-geosearch":
       return "bg-sky-500/15 text-sky-200 border border-sky-500/20";
+    case "nps-places":
+      return "bg-emerald-500/15 text-emerald-200 border border-emerald-500/20";
+    case "ridb-recreation":
+      return "bg-teal-500/15 text-teal-200 border border-teal-500/20";
+    case "unesco-heritage":
+      return "bg-amber-500/15 text-amber-200 border border-amber-500/20";
     case "osm":
     default:
       return "bg-white/5 text-muted-foreground border border-white/10";

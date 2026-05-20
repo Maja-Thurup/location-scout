@@ -18,7 +18,13 @@ export type ProviderName =
   /** NYC "Scenes from the City" curated dataset (qb3k-n8mm). */
   | "nyc-scenes-from-the-city"
   /** SF film locations dataset (yitu-d5am). */
-  | "sf-film-locations";
+  | "sf-film-locations"
+  /** National Park Service /places + /parks. M7. */
+  | "nps-places"
+  /** Recreation.gov RIDB — federal facilities + recreation areas. M7. */
+  | "ridb-recreation"
+  /** UNESCO World Heritage List (WHC). M7. */
+  | "unesco-heritage";
 
 /**
  * Compact "famous films" reference attached to a candidate by the

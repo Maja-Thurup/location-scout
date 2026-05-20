@@ -15,18 +15,24 @@ import type {
  *
  * Rationale (most-priority first):
  * - NYC Scenes from the City: book-curated, hand-verified iconic scenes
+ * - UNESCO World Heritage: 1,248 globally significant places (handpicked)
  * - SF Film Locations: curated municipal dataset
+ * - NPS /places: curated US national park / scenic place metadata
  * - Wikidata P915: structured film-location property, citation-backed
  * - Wikidata generic: structured heritage/landmark data, less specific
  * - Wikipedia geosearch: notable places by virtue of having an article
+ * - RIDB recreation: utility-grade federal recreation data
  * - OSM: raw tag-driven, lowest curated signal
  */
 const SOURCE_PRIORITY: ReadonlyArray<ProviderName> = [
   "osm",
+  "ridb-recreation",
   "wikipedia-geosearch",
   "wikidata-landmark",
   "wikidata-filming-location",
+  "nps-places",
   "sf-film-locations",
+  "unesco-heritage",
   "nyc-scenes-from-the-city",
 ];
 

@@ -28,7 +28,14 @@ export type CacheNamespace =
   /** Cached snapshots of NYC qb3k-n8mm and SF yitu-d5am datasets. */
   | "openfilm:dataset"
   /** TMDb /find?wikidata_id and /movie/{id} lookups. */
-  | "tmdb:movie";
+  | "tmdb:movie"
+  // ---- M7 (free-tier scenic + heritage providers) ----
+  /** NPS /places + /parks per-state results. */
+  | "nps:dataset"
+  /** Recreation.gov RIDB facilities + recareas results. */
+  | "ridb:dataset"
+  /** UNESCO World Heritage Sites (full snapshot, refreshed monthly). */
+  | "unesco:dataset";
 
 export type TTLDays = 1 | 7 | 14 | 30 | 90 | 365;
 

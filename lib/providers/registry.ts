@@ -1,6 +1,8 @@
 import type { Bbox } from "@/lib/bbox";
 import { logger } from "@/lib/logger";
+import { npsPlacesProvider } from "@/lib/providers/nps-places";
 import { nycScenesProvider } from "@/lib/providers/nyc-scenes";
+import { ridbRecreationProvider } from "@/lib/providers/ridb-recreation";
 import { sfFilmLocationsProvider } from "@/lib/providers/sf-films";
 import type {
   CandidateProvider,
@@ -9,6 +11,7 @@ import type {
   ProviderResult,
   RawCandidate,
 } from "@/lib/providers/types";
+import { unescoHeritageProvider } from "@/lib/providers/unesco-heritage";
 import { wikidataFilmingLocationProvider } from "@/lib/providers/wikidata-filming-location";
 import { wikidataLandmarkProvider } from "@/lib/providers/wikidata-landmark";
 import { wikipediaGeosearchProvider } from "@/lib/providers/wikipedia-geosearch";
@@ -39,6 +42,11 @@ import { wikipediaGeosearchProvider } from "@/lib/providers/wikipedia-geosearch"
 export const DEFAULT_CONTENT_PROVIDERS: ReadonlyArray<CandidateProvider> = [
   wikidataLandmarkProvider,
   wikipediaGeosearchProvider,
+  // M7: scenic + heritage sources. Each gracefully no-ops when its
+  // optional API key is missing or the bbox is non-US (where applicable).
+  npsPlacesProvider,
+  ridbRecreationProvider,
+  unescoHeritageProvider,
 ];
 
 export const FILM_HISTORY_PROVIDERS: ReadonlyArray<CandidateProvider> = [

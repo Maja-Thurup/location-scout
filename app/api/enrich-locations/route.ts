@@ -60,6 +60,9 @@ const providerNameSchema = z.enum([
   "wikipedia-geosearch",
   "nyc-scenes-from-the-city",
   "sf-film-locations",
+  "nps-places",
+  "ridb-recreation",
+  "unesco-heritage",
 ]);
 
 const associatedFilmSchema = z.object({

@@ -86,7 +86,10 @@ export type LocationSource =
   | "wikidata-filming-location"
   | "wikipedia-geosearch"
   | "nyc-scenes-from-the-city"
-  | "sf-film-locations";
+  | "sf-film-locations"
+  | "nps-places"
+  | "ridb-recreation"
+  | "unesco-heritage";
 
 export type LocationCardProps = {
   id: string;

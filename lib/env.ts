@@ -38,6 +38,27 @@ const serverEnvSchema = z.object({
    * confirming a brief usage statement).
    */
   TMDB_READ_ACCESS_TOKEN: z.string().optional(),
+
+  /**
+   * National Park Service developer API key. Used by the nps-places
+   * provider to retrieve named viewpoints / scenic places / park
+   * polygons with curated photos. Optional — when absent the provider
+   * skips itself silently.
+   *
+   * Get one at https://www.nps.gov/subjects/developer/get-started.htm
+   * (free, instant signup).
+   */
+  NPS_API_KEY: z.string().optional(),
+
+  /**
+   * Recreation.gov RIDB API key. Used by the ridb-recreation provider
+   * to retrieve federal recreation sites (NPS + USFS + BLM facilities,
+   * recreation areas, campgrounds). Optional.
+   *
+   * Get one at https://ridb.recreation.gov/landing (free, requires
+   * a recreation.gov account).
+   */
+  RIDB_API_KEY: z.string().optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;
