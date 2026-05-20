@@ -141,6 +141,168 @@ LIMIT ${Math.max(1, Math.min(limit, 500))}
 `.trim();
 }
 
+/**
+ * Subject Q-id lookup table for `wdt:P180` (depicts) queries.
+ *
+ * Wikidata's "depicts" property links an artwork (sculpture, painting,
+ * etc.) to the THINGS it portrays. For "horse statue" we want every
+ * sculpture with `wdt:P180 = Q726 (horse)`. This is dramatically more
+ * precise than a free-text search.
+ *
+ * The table is intentionally small and high-value — common subjects
+ * that motion-picture scouts ask for. Unrecognized tokens fall through
+ * to the label-regex fallback below.
+ */
+const SUBJECT_QIDS: Record<string, string> = {
+  horse: "Q726",
+  dog: "Q144",
+  cat: "Q146",
+  lion: "Q140",
+  eagle: "Q2092297",
+  ship: "Q11446",
+  boat: "Q35872",
+  bicycle: "Q11442",
+  car: "Q1420",
+  airplane: "Q197",
+  woman: "Q467",
+  man: "Q8441",
+  child: "Q7569",
+  soldier: "Q4991371",
+  president: "Q11696",
+  general: "Q11774891",
+  king: "Q12097",
+  queen: "Q116",
+  buffalo: "Q156854",
+  bear: "Q3010",
+  tiger: "Q19939",
+  whale: "Q160", // generic mammal but covers many memorial sculptures
+  ship_wheel: "Q1142935",
+  cannon: "Q81210",
+  obelisk: "Q12277",
+  cross: "Q1366580", // Christian cross
+  angel: "Q235113",
+  fountain: "Q483453",
+  arch: "Q12277", // archway / triumphal arch
+};
+
+/**
+ * Build a P180 query that finds artworks (sculpture/monument/painting)
+ * inside the bbox whose `wdt:P180` matches one of `subjectQids`. Joins
+ * to the same wikibase:box service for spatial filtering.
+ */
+function buildP180Query(
+  bbox: Bbox,
+  subjectQids: ReadonlyArray<string>,
+  limit: number,
+): string {
+  const sw = `Point(${bbox.west} ${bbox.south})`;
+  const ne = `Point(${bbox.east} ${bbox.north})`;
+  const subjects = subjectQids.map((q) => `wd:${q}`).join(" ");
+  return `
+SELECT DISTINCT
+  ?item ?itemLabel ?itemDescription ?coord ?image ?article ?sitelinks
+WHERE {
+  SERVICE wikibase:box {
+    ?item wdt:P625 ?coord .
+    bd:serviceParam wikibase:cornerSouthWest "${sw}"^^geo:wktLiteral .
+    bd:serviceParam wikibase:cornerNorthEast "${ne}"^^geo:wktLiteral .
+  }
+  VALUES ?subject { ${subjects} }
+  ?item wdt:P180 ?subject .
+  FILTER NOT EXISTS {
+    ?item wdt:P31 ?excludedType .
+    VALUES ?excludedType { ${EXCLUDE_MACRO_TYPES.join(" ")} }
+  }
+  OPTIONAL { ?item wdt:P18 ?image . }
+  OPTIONAL { ?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> . }
+  OPTIONAL { ?item wikibase:sitelinks ?sitelinks . }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+}
+ORDER BY DESC(BOUND(?image)) DESC(?sitelinks) ?item
+LIMIT ${Math.max(1, Math.min(limit, 200))}
+`.trim();
+}
+
+/**
+ * Label-regex fallback: when scene_tokens contain a word we don't have
+ * a Q-id for, run a regex against the item's English label inside the
+ * bbox. Catches "lighthouse", "windmill", "carousel" (no canonical
+ * Q-id needed) and gives the same per-source ranking signal as the
+ * class-based and P180 queries.
+ */
+function buildLabelRegexQuery(
+  bbox: Bbox,
+  pattern: string,
+  limit: number,
+): string {
+  const sw = `Point(${bbox.west} ${bbox.south})`;
+  const ne = `Point(${bbox.east} ${bbox.north})`;
+  // Escape backslashes for SPARQL string literal.
+  const escaped = pattern.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `
+SELECT DISTINCT
+  ?item ?itemLabel ?itemDescription ?coord ?image ?article ?sitelinks
+WHERE {
+  SERVICE wikibase:box {
+    ?item wdt:P625 ?coord .
+    bd:serviceParam wikibase:cornerSouthWest "${sw}"^^geo:wktLiteral .
+    bd:serviceParam wikibase:cornerNorthEast "${ne}"^^geo:wktLiteral .
+  }
+  ?item rdfs:label ?label .
+  FILTER(LANG(?label) = "en")
+  FILTER(REGEX(LCASE(STR(?label)), "${escaped}", "i"))
+  FILTER NOT EXISTS {
+    ?item wdt:P31 ?excludedType .
+    VALUES ?excludedType { ${EXCLUDE_MACRO_TYPES.join(" ")} }
+  }
+  OPTIONAL { ?item wdt:P18 ?image . }
+  OPTIONAL { ?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> . }
+  OPTIONAL { ?item wikibase:sitelinks ?sitelinks . }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+}
+ORDER BY DESC(BOUND(?image)) DESC(?sitelinks) ?item
+LIMIT ${Math.max(1, Math.min(limit, 200))}
+`.trim();
+}
+
+/**
+ * Pull subject keywords from the user's scene_tokens. Returns matching
+ * Q-ids for P180 lookup AND any leftover keywords for the label-regex
+ * fallback.
+ */
+function extractSubjects(sceneTokens: ReadonlyArray<string>): {
+  qids: string[];
+  regexFallbackTerms: string[];
+} {
+  const qids = new Set<string>();
+  const fallback = new Set<string>();
+  for (const t of sceneTokens) {
+    const norm = t.trim().toLowerCase();
+    if (!norm) continue;
+    // Skip tokens that are too generic to be useful subjects.
+    if (
+      ["the", "a", "an", "of", "in", "with", "and", "or", "park", "tree",
+       "trees", "grass", "sky", "background", "outdoor", "exterior",
+       "interior", "building", "house"].includes(norm)
+    ) {
+      continue;
+    }
+    // Single words go through both pipelines; phrases just regex.
+    const isPhrase = /\s/.test(norm);
+    const lookup = SUBJECT_QIDS[norm];
+    if (lookup) {
+      qids.add(lookup);
+    } else if (!isPhrase && norm.length >= 4) {
+      // 4+ chars only — short words ("art", "old") match too broadly.
+      fallback.add(norm);
+    }
+  }
+  return {
+    qids: Array.from(qids),
+    regexFallbackTerms: Array.from(fallback).slice(0, 3),
+  };
+}
+
 const sparqlBindingsSchema = z.object({
   results: z.object({
     bindings: z.array(
@@ -205,17 +367,48 @@ function rewriteCommonsThumb(url: string, width = 1024): string {
   return url;
 }
 
+/**
+ * Parse a SPARQL response into RawCandidates. Pure helper.
+ */
+function parseSparqlBindings(raw: unknown): RawCandidate[] | null {
+  const parsed = sparqlBindingsSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const out: RawCandidate[] = [];
+  for (const b of parsed.data.results.bindings) {
+    const point = parseWktPoint(b.coord.value);
+    if (!point) continue;
+    const qid = qidFromUri(b.item.value);
+    out.push({
+      externalId: qid,
+      source: "wikidata-landmark",
+      lat: point.lat,
+      lng: point.lng,
+      name: b.itemLabel?.value ?? null,
+      description: b.itemDescription?.value ?? null,
+      knownImageUrl: b.image?.value ? rewriteCommonsThumb(b.image.value) : null,
+      tags: { "wikidata:qid": qid },
+      associatedFilms: [],
+      sourceUrl: b.article?.value ?? `https://www.wikidata.org/wiki/${qid}`,
+    });
+  }
+  return out;
+}
+
 export const wikidataLandmarkProvider: CandidateProvider = {
   name: "wikidata-landmark",
   supportsBbox: () => true,
   async search(input: ProviderInput): Promise<ProviderResult> {
     const t0 = Date.now();
-    const { bbox } = input;
+    const { bbox, sceneTokens } = input;
+
+    const subjects = extractSubjects(sceneTokens);
 
     const cKey = cacheKey("wikidata:sparql", {
-      kind: "landmark-v3-monuments-ordered",
+      kind: "landmark-v4-multi-query",
       bbox,
       classes: TARGET_CLASSES,
+      subjectQids: [...subjects.qids].sort(),
+      regexFallbackTerms: [...subjects.regexFallbackTerms].sort(),
     });
 
     const cached = await cacheGet<RawCandidate[]>(cKey);
@@ -223,56 +416,72 @@ export const wikidataLandmarkProvider: CandidateProvider = {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
     }
 
-    // Bumped to 500 + ORDER BY notability proxy (image-present then
-    // sitelinks DESC). NYC bbox has thousands of items in our class
-    // list; ordering ensures Sherman Monument / Joan of Arc / Bolívar
-    // make it into the response even when the cap kicks in.
-    const query = buildSparqlQuery(bbox, 500);
-    let raw: unknown;
-    try {
-      raw = await executeSparql(query);
-    } catch (err) {
-      logger.warn("wikidata-landmark provider: SPARQL fetch failed", {
-        err: err instanceof Error ? err.message : String(err),
+    // Build the queries we want to run in parallel:
+    //   1. Class-based bbox query (existing behaviour) — broad recall
+    //      across all monuments / buildings / heritage sites.
+    //   2. P180-depicts query — laser-precise for "horse statue" type
+    //      prompts when we recognise the subject.
+    //   3. Label-regex fallback — for prompts whose subject isn't in
+    //      our Q-id table ("lighthouse", "windmill") so the user's
+    //      keyword still drives retrieval.
+    const queries: Array<{ kind: string; sparql: string }> = [
+      { kind: "class-bbox", sparql: buildSparqlQuery(bbox, 500) },
+    ];
+    if (subjects.qids.length > 0) {
+      queries.push({
+        kind: "p180-depicts",
+        sparql: buildP180Query(bbox, subjects.qids, 200),
       });
-      return { candidates: [], elapsedMs: Date.now() - t0, error: String(err) };
     }
-
-    const parsed = sparqlBindingsSchema.safeParse(raw);
-    if (!parsed.success) {
-      logger.warn("wikidata-landmark provider: schema mismatch", {
-        issue: parsed.error.issues[0]?.message,
-      });
-      return {
-        candidates: [],
-        elapsedMs: Date.now() - t0,
-        error: "schema_mismatch",
-      };
-    }
-
-    const out: RawCandidate[] = [];
-    for (const b of parsed.data.results.bindings) {
-      const point = parseWktPoint(b.coord.value);
-      if (!point) continue;
-      const qid = qidFromUri(b.item.value);
-      out.push({
-        externalId: qid,
-        source: "wikidata-landmark",
-        lat: point.lat,
-        lng: point.lng,
-        name: b.itemLabel?.value ?? null,
-        description: b.itemDescription?.value ?? null,
-        knownImageUrl: b.image?.value ? rewriteCommonsThumb(b.image.value) : null,
-        tags: { "wikidata:qid": qid },
-        associatedFilms: [],
-        sourceUrl: b.article?.value ?? `https://www.wikidata.org/wiki/${qid}`,
+    if (subjects.regexFallbackTerms.length > 0) {
+      // Combine fallback terms into one disjunctive regex to keep us
+      // at one extra round-trip rather than N.
+      const pattern = subjects.regexFallbackTerms
+        .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("|");
+      queries.push({
+        kind: "label-regex",
+        sparql: buildLabelRegexQuery(bbox, pattern, 200),
       });
     }
 
-    // 7-day cache: SPARQL results don't change often and we want fast
-    // re-renders for the same bbox.
+    const results = await Promise.allSettled(
+      queries.map((q) => executeSparql(q.sparql).then((raw) => ({ kind: q.kind, raw }))),
+    );
+
+    const merged = new Map<string, RawCandidate>();
+    let anySucceeded = false;
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i]!;
+      if (r.status !== "fulfilled") {
+        logger.warn("wikidata-landmark provider: query failed", {
+          kind: queries[i]?.kind ?? "unknown",
+          err: r.reason instanceof Error ? r.reason.message : String(r.reason),
+        });
+        continue;
+      }
+      const parsed = parseSparqlBindings(r.value.raw);
+      if (!parsed) {
+        logger.warn("wikidata-landmark provider: schema mismatch", {
+          kind: r.value.kind,
+        });
+        continue;
+      }
+      anySucceeded = true;
+      // Earlier queries (class-bbox at index 0) take precedence on
+      // duplicates so the broad-recall results keep their Q-id ordering;
+      // P180 / label-regex fill in misses without overriding the seed.
+      for (const c of parsed) {
+        if (!merged.has(c.externalId)) merged.set(c.externalId, c);
+      }
+    }
+
+    if (!anySucceeded) {
+      return { candidates: [], elapsedMs: Date.now() - t0, error: "all_queries_failed" };
+    }
+
+    const out = Array.from(merged.values());
     await cacheSet(cKey, "wikidata:sparql", out, 7);
-
     return { candidates: out, elapsedMs: Date.now() - t0, error: null };
   },
 };

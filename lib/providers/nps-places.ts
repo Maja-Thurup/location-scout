@@ -143,21 +143,32 @@ const placesResponseSchema = z.object({
   data: z.array(placeSchema).default([]),
 });
 
-async function fetchPlacesForState(state: string): Promise<Place[]> {
-  const cKey = cacheKey("nps:dataset", { kind: "places", state });
+async function fetchPlacesForState(
+  state: string,
+  query?: string,
+): Promise<Place[]> {
+  const cKey = cacheKey("nps:dataset", {
+    kind: "places",
+    state,
+    q: query ?? "",
+  });
   const cached = await cacheGet<Place[]>(cKey);
   if (cached) return cached;
 
   const url = new URL(`${NPS_BASE}/places`);
   url.searchParams.set("stateCode", state);
   url.searchParams.set("limit", String(NPS_PAGE_LIMIT));
+  if (query && query.trim()) {
+    // NPS API supports ?q=<keyword> for full-text search across
+    // place title + body. Combined with stateCode this gives us a
+    // tightly-scoped retrieval per user keyword.
+    url.searchParams.set("q", query.trim());
+  }
   url.searchParams.set("api_key", env.NPS_API_KEY ?? "");
 
   let raw: unknown;
   try {
     const res = await fetch(url, {
-      // NPS docs say to pass the key as an X-Api-Key header. We send it
-      // both ways to be tolerant of either path being preferred.
       headers: env.NPS_API_KEY ? { "X-Api-Key": env.NPS_API_KEY } : {},
       signal: AbortSignal.timeout(NPS_TIMEOUT_MS),
     });
@@ -182,6 +193,35 @@ async function fetchPlacesForState(state: string): Promise<Place[]> {
   }
   await cacheSet(cKey, "nps:dataset", parsed.data.data, 14);
   return parsed.data.data;
+}
+
+/**
+ * Pull a single keyword from scene_tokens for the NPS ?q= param. NPS
+ * search is a single-string query against title+body; we pick the
+ * longest non-generic token (proxy for "most distinctive").
+ */
+function extractNpsQuery(sceneTokens: ReadonlyArray<string>): string | null {
+  const filtered = sceneTokens
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length >= 4)
+    .filter(
+      (t) =>
+        ![
+          "park",
+          "tree",
+          "trees",
+          "grass",
+          "building",
+          "house",
+          "outdoor",
+          "exterior",
+          "interior",
+          "background",
+        ].includes(t),
+    );
+  if (filtered.length === 0) return null;
+  const longest = [...filtered].sort((a, b) => b.length - a.length)[0]!;
+  return longest;
 }
 
 function placeCoord(p: Place): { lat: number; lng: number } | null {
@@ -241,12 +281,23 @@ export const npsPlacesProvider: CandidateProvider = {
       return { candidates: [], elapsedMs: Date.now() - t0, error: null };
     }
 
+    const npsQuery = extractNpsQuery(input.sceneTokens);
+
     const allPlaces: Place[] = [];
     try {
-      const perState = await Promise.all(
-        states.map((s) => fetchPlacesForState(s).catch(() => [])),
-      );
-      for (const list of perState) {
+      // Always fetch the broad state slice; ALSO fetch a keyword-
+      // narrowed slice when scene_tokens give us something distinctive.
+      // The keyword slice surfaces hits that wouldn't fit in the 200-
+      // result state cap (e.g. a specific obscure equestrian statue).
+      const fetches: Array<Promise<Place[]>> = [];
+      for (const s of states) {
+        fetches.push(fetchPlacesForState(s).catch(() => []));
+        if (npsQuery) {
+          fetches.push(fetchPlacesForState(s, npsQuery).catch(() => []));
+        }
+      }
+      const results = await Promise.all(fetches);
+      for (const list of results) {
         allPlaces.push(...list);
       }
     } catch (err) {

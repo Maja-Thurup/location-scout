@@ -109,110 +109,228 @@ const combinedResponseSchema = z.object({
     .default({ pages: {} }),
 });
 
+/**
+ * Build a `generator=geosearch` URL — pages with coords inside the bbox.
+ */
+function buildGeosearchUrl(bbox: ProviderInput["bbox"]): URL {
+  const gsbbox = `${bbox.north}|${bbox.west}|${bbox.south}|${bbox.east}`;
+  const url = new URL(WIKIPEDIA_API);
+  url.searchParams.set("action", "query");
+  url.searchParams.set("format", "json");
+  url.searchParams.set("origin", "*");
+  url.searchParams.set("generator", "geosearch");
+  url.searchParams.set("ggsbbox", gsbbox);
+  url.searchParams.set("ggslimit", "500");
+  url.searchParams.set("ggsprop", "type|name");
+  url.searchParams.set("prop", "pageimages|pageterms|pageprops|coordinates");
+  url.searchParams.set("piprop", "thumbnail|original");
+  url.searchParams.set("pithumbsize", "1024");
+  url.searchParams.set("wbptterms", "description");
+  url.searchParams.set("ppprop", "wikibase_item");
+  return url;
+}
+
+/**
+ * Build a `generator=search` URL — full-text search over Wikipedia
+ * articles, sorted by distance from the bbox center, with the same
+ * pageimages/pageterms/coordinates props attached. The `srsort=relevance`
+ * mode combined with our post-filter (article must have coords INSIDE
+ * the bbox) gives us the user's keyword as a real retrieval signal,
+ * not just a tag-overlap reranker.
+ */
+function buildFullTextSearchUrl(
+  bbox: ProviderInput["bbox"],
+  searchTerm: string,
+): URL {
+  const url = new URL(WIKIPEDIA_API);
+  url.searchParams.set("action", "query");
+  url.searchParams.set("format", "json");
+  url.searchParams.set("origin", "*");
+  url.searchParams.set("generator", "search");
+  url.searchParams.set("gsrsearch", searchTerm);
+  url.searchParams.set("gsrnamespace", "0");
+  // 50 results — the searchresult relevance ordering is high-quality
+  // even at low limit, and we still post-filter by bbox so we don't
+  // want a giant working set.
+  url.searchParams.set("gsrlimit", "50");
+  url.searchParams.set("gsrsort", "relevance");
+  url.searchParams.set("prop", "pageimages|pageterms|pageprops|coordinates");
+  url.searchParams.set("piprop", "thumbnail|original");
+  url.searchParams.set("pithumbsize", "1024");
+  url.searchParams.set("wbptterms", "description");
+  url.searchParams.set("ppprop", "wikibase_item");
+  // Coords prop: if a page has multiple coords (rare), keep the primary.
+  url.searchParams.set("colimit", "max");
+  return url;
+}
+
+async function fetchAndParse(
+  url: URL,
+): Promise<z.infer<typeof combinedResponseSchema> | { error: string }> {
+  let raw: unknown;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "LocationScout/0.1 (+https://github.com/Maja-Thurup/location-scout)",
+      },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    raw = await res.json();
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+  const parsed = combinedResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { error: `schema_mismatch:${parsed.error.issues[0]?.message ?? ""}` };
+  }
+  return parsed.data;
+}
+
+function pageToCandidate(
+  pageIdStr: string,
+  page: z.infer<typeof combinedResponseSchema>["query"]["pages"][string],
+  bbox: ProviderInput["bbox"],
+): RawCandidate | null {
+  if (pageIdStr.startsWith("-")) return null;
+  const coord = page.coordinates?.[0];
+  if (!coord) return null;
+  // CRITICAL post-filter: full-text search returns articles with coords
+  // ANYWHERE on Earth that match the keyword. We only want the ones
+  // physically inside the bbox.
+  if (
+    coord.lat < bbox.south ||
+    coord.lat > bbox.north ||
+    coord.lon < bbox.west ||
+    coord.lon > bbox.east
+  ) {
+    return null;
+  }
+  if (coord.type && !KEEP_TYPES.has(coord.type)) return null;
+
+  const description = page.terms?.description?.[0] ?? null;
+  const thumb = page.thumbnail?.source ?? page.original?.source ?? null;
+  const qid = page.pageprops?.wikibase_item ?? null;
+  const tags: Record<string, string> = {};
+  if (coord.type) tags["wikipedia:type"] = coord.type;
+  if (qid) tags["wikidata:qid"] = qid;
+
+  return {
+    externalId: String(page.pageid),
+    source: "wikipedia-geosearch",
+    lat: coord.lat,
+    lng: coord.lon,
+    name: coord.name ?? page.title,
+    description,
+    knownImageUrl: thumb,
+    tags,
+    associatedFilms: [],
+    sourceUrl: `https://en.wikipedia.org/?curid=${page.pageid}`,
+  };
+}
+
+/**
+ * Build the keyword string for the full-text search from scene_tokens.
+ * We OR-combine the strongest signals: distinctive single-word tokens
+ * plus the longest phrase token. MediaWiki's search uses BM25 internally
+ * so an OR query with the user's actual words gives much better recall
+ * than an AND-of-everything query that would no-op when one word is rare.
+ */
+function buildSearchTerm(sceneTokens: ReadonlyArray<string>): string | null {
+  if (sceneTokens.length === 0) return null;
+  // De-dupe and lowercase.
+  const uniq = Array.from(
+    new Set(sceneTokens.map((t) => t.trim().toLowerCase()).filter((t) => t.length > 0)),
+  );
+  // Strip generic background tokens we know don't discriminate.
+  const filtered = uniq.filter(
+    (t) =>
+      ![
+        "the",
+        "a",
+        "an",
+        "of",
+        "in",
+        "with",
+        "and",
+        "or",
+        "park",
+        "tree",
+        "trees",
+        "grass",
+        "sky",
+        "background",
+        "outdoor",
+        "exterior",
+        "interior",
+        "building",
+      ].includes(t),
+  );
+  if (filtered.length === 0) return null;
+  // Pick the 3 most distinctive tokens by length (rough proxy for IDF).
+  const ranked = [...filtered].sort((a, b) => b.length - a.length).slice(0, 3);
+  return ranked.join(" ");
+}
+
 export const wikipediaGeosearchProvider: CandidateProvider = {
   name: "wikipedia-geosearch",
   supportsBbox: () => true,
   async search(input: ProviderInput): Promise<ProviderResult> {
     const t0 = Date.now();
-    const { bbox } = input;
+    const { bbox, sceneTokens } = input;
 
-    // v2 cache namespace bump: response now has Q-id + thumbnail in one shot.
-    const cKey = cacheKey("wikipedia:geosearch", { kind: "v3-limit500", bbox });
+    const searchTerm = buildSearchTerm(sceneTokens);
+
+    const cKey = cacheKey("wikipedia:geosearch", {
+      kind: "v4-geosearch+fulltext",
+      bbox,
+      searchTerm: searchTerm ?? "",
+    });
     const cached = await cacheGet<RawCandidate[]>(cKey);
     if (cached) {
       return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
     }
 
-    // gsbbox format: "top|left|bottom|right" = N|W|S|E
-    const gsbbox = `${bbox.north}|${bbox.west}|${bbox.south}|${bbox.east}`;
-    const url = new URL(WIKIPEDIA_API);
-    url.searchParams.set("action", "query");
-    url.searchParams.set("format", "json");
-    url.searchParams.set("origin", "*");
-    // Generator: every page with coords inside the bbox.
-    url.searchParams.set("generator", "geosearch");
-    url.searchParams.set("ggsbbox", gsbbox);
-    // gslimit max is 500 per the MediaWiki API. NYC-sized bboxes have
-    // hundreds of geo-tagged landmark articles; 50 was sparse and
-    // dropped legitimate horse-statue articles before they could
-    // contribute to the candidate pool.
-    url.searchParams.set("ggslimit", "500");
-    url.searchParams.set("ggsprop", "type|name");
-    // Props: image + description + Wikidata Q-id, all in this request.
-    url.searchParams.set("prop", "pageimages|pageterms|pageprops|coordinates");
-    url.searchParams.set("piprop", "thumbnail|original");
-    url.searchParams.set("pithumbsize", "1024");
-    url.searchParams.set("wbptterms", "description");
-    url.searchParams.set("ppprop", "wikibase_item");
+    // Run geosearch (broad bbox sweep) + optionally full-text search
+    // (keyword-driven, post-filtered to bbox) in parallel.
+    type FetchResult = Awaited<ReturnType<typeof fetchAndParse>>;
+    const requests: Array<Promise<FetchResult>> = [
+      fetchAndParse(buildGeosearchUrl(bbox)),
+    ];
+    if (searchTerm) {
+      requests.push(fetchAndParse(buildFullTextSearchUrl(bbox, searchTerm)));
+    }
+    const settled = await Promise.allSettled(requests);
 
-    let raw: unknown;
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent": "LocationScout/0.1 (+https://github.com/Maja-Thurup/location-scout)",
-        },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
-      if (!res.ok) {
-        logger.warn("wikipedia-geosearch HTTP error", { status: res.status });
-        return {
-          candidates: [],
-          elapsedMs: Date.now() - t0,
-          error: `HTTP ${res.status}`,
-        };
+    const merged = new Map<string, RawCandidate>();
+    let anySucceeded = false;
+    for (let i = 0; i < settled.length; i++) {
+      const r = settled[i]!;
+      const kind = i === 0 ? "geosearch" : "fulltext";
+      if (r.status !== "fulfilled") {
+        logger.warn("wikipedia-geosearch query failed", {
+          kind,
+          err: r.reason instanceof Error ? r.reason.message : String(r.reason),
+        });
+        continue;
       }
-      raw = await res.json();
-    } catch (err) {
-      logger.warn("wikipedia-geosearch fetch failed", {
-        err: err instanceof Error ? err.message : String(err),
-      });
-      return { candidates: [], elapsedMs: Date.now() - t0, error: String(err) };
+      if ("error" in r.value) {
+        logger.warn("wikipedia-geosearch query error", { kind, err: r.value.error });
+        continue;
+      }
+      anySucceeded = true;
+      for (const [pageIdStr, page] of Object.entries(r.value.query.pages)) {
+        const c = pageToCandidate(pageIdStr, page, bbox);
+        if (!c) continue;
+        if (!merged.has(c.externalId)) merged.set(c.externalId, c);
+      }
     }
 
-    const parsed = combinedResponseSchema.safeParse(raw);
-    if (!parsed.success) {
-      logger.warn("wikipedia-geosearch schema mismatch", {
-        issue: parsed.error.issues[0]?.message,
-      });
-      return {
-        candidates: [],
-        elapsedMs: Date.now() - t0,
-        error: "schema_mismatch",
-      };
+    if (!anySucceeded) {
+      return { candidates: [], elapsedMs: Date.now() - t0, error: "all_queries_failed" };
     }
 
-    const out: RawCandidate[] = [];
-    for (const [pageIdStr, page] of Object.entries(parsed.data.query.pages)) {
-      // The "missing" / "invalid" sentinel pages have negative ids.
-      if (pageIdStr.startsWith("-")) continue;
-      // Pull coords from the geosearch generator output (under `coordinates`).
-      const coord = page.coordinates?.[0];
-      if (!coord) continue;
-      // Skip overly broad types (cities, countries, ...).
-      if (coord.type && !KEEP_TYPES.has(coord.type)) continue;
-
-      const description = page.terms?.description?.[0] ?? null;
-      const thumb = page.thumbnail?.source ?? page.original?.source ?? null;
-      const qid = page.pageprops?.wikibase_item ?? null;
-
-      const tags: Record<string, string> = {};
-      if (coord.type) tags["wikipedia:type"] = coord.type;
-      if (qid) tags["wikidata:qid"] = qid;
-
-      out.push({
-        externalId: String(page.pageid),
-        source: "wikipedia-geosearch",
-        lat: coord.lat,
-        lng: coord.lon,
-        name: coord.name ?? page.title,
-        description,
-        knownImageUrl: thumb,
-        tags,
-        associatedFilms: [],
-        sourceUrl: `https://en.wikipedia.org/?curid=${page.pageid}`,
-      });
-    }
-
+    const out = Array.from(merged.values());
     await cacheSet(cKey, "wikipedia:geosearch", out, 7);
     return { candidates: out, elapsedMs: Date.now() - t0, error: null };
   },

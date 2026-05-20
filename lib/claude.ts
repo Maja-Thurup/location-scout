@@ -270,6 +270,45 @@ Guidance for fields:
          { "leisure": "nature_reserve" }
        ]
 
+  NAME-KEYWORD ALTERNATIVES — when the prompt names a SPECIFIC subject
+  whose match is more likely to be in the feature's NAME than its
+  classifier tag (statues, monuments, lighthouses, windmills, named
+  parks). Use the special key "name" with a regex of pipe-separated
+  alternatives. The value is matched against the OSM "name" tag
+  case-insensitively as a substring, so include synonyms.
+
+  Examples:
+
+    Scene: "horse statue in a park" (subject is in the feature name,
+                                     not building=warehouse)
+    -> [
+         { "tourism": "artwork" },
+         { "historic": "memorial" },
+         { "historic": "monument" },
+         { "name": "horse|equestrian|cavalry|jockey|rider" },
+         { "leisure": "park" }
+       ]
+
+    Scene: "old lighthouse on a cliff"
+    -> [
+         { "man_made": "lighthouse" },
+         { "name": "lighthouse|light station|beacon" },
+         { "natural": "cliff" }
+       ]
+
+    Scene: "dutch windmill in a field"
+    -> [
+         { "man_made": "windmill" },
+         { "name": "windmill|mill" },
+         { "landuse": "farmland" }
+       ]
+
+  Use name-regex alternatives ONLY when the prompt's subject is
+  typically captured in the OSM name (proper nouns, monument
+  subjects, lighthouse/windmill names). Do not use them for generic
+  building types — building=house is a far better filter than
+  name=house.
+
     Scene: "old stone church in a small town"
     -> [
          { "building": "church" },

@@ -91,8 +91,18 @@ const CASE_INSENSITIVE_KEYS = new Set([
  */
 const PREFIX_KEYS = new Set<string>();
 
+/**
+ * Regex meta-characters that, when present in a value, switch the
+ * filter from "exact match" to Overpass's `~` (regex) operator.
+ *
+ * This is how Claude can emit a name-keyword alternative like:
+ *   { "name": "horse|equestrian|cavalry" }
+ * which expands to `["name"~"horse|equestrian|cavalry",i]` and
+ * matches any feature whose `name` tag contains one of those words.
+ */
+const REGEX_META = /[|()^$.*+?\\[\]]/;
+
 function tagFilter(key: string, value: string): string {
-  // Quote everything; OSM is fine with quoted strings.
   const safeKey = key.replace(/"/g, '\\"');
   const safeValue = value.replace(/"/g, '\\"');
 
@@ -101,6 +111,14 @@ function tagFilter(key: string, value: string): string {
   }
   if (CASE_INSENSITIVE_KEYS.has(key)) {
     return `["${safeKey}"~"^${safeValue}$",i]`;
+  }
+  // Free-text keys (name, description, ...) with regex meta -> regex match.
+  // This makes name-keyword alternatives work without a separate API.
+  if (
+    (key === "name" || key === "name:en" || key === "description") &&
+    REGEX_META.test(value)
+  ) {
+    return `["${safeKey}"~"${safeValue}",i]`;
   }
   return `["${safeKey}"="${safeValue}"]`;
 }

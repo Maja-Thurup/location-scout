@@ -106,6 +106,7 @@ async function fetchPagedRidb<T>(
   endpoint: "facilities" | "recareas",
   bbox: Bbox,
   schema: z.ZodType<{ RECDATA: T[] }>,
+  query?: string,
 ): Promise<T[]> {
   const center = bboxCenter(bbox);
   const radius = bboxRadiusMiles(bbox);
@@ -114,6 +115,7 @@ async function fetchPagedRidb<T>(
     lat: Math.round(center.lat * 100) / 100,
     lng: Math.round(center.lng * 100) / 100,
     radius,
+    query: query ?? "",
   });
   const cached = await cacheGet<T[]>(cKey);
   if (cached) return cached;
@@ -126,6 +128,11 @@ async function fetchPagedRidb<T>(
     url.searchParams.set("radius", String(radius));
     url.searchParams.set("limit", String(RIDB_PAGE_LIMIT));
     url.searchParams.set("offset", String(page * RIDB_PAGE_LIMIT));
+    if (query && query.trim()) {
+      // RIDB API accepts ?query=<keyword> for full-text search across
+      // facility/recarea names + descriptions + keywords.
+      url.searchParams.set("query", query.trim());
+    }
     url.searchParams.set("apikey", env.RIDB_API_KEY ?? "");
 
     let raw: unknown;
@@ -154,6 +161,29 @@ async function fetchPagedRidb<T>(
 
   await cacheSet(cKey, "ridb:dataset", all, 14);
   return all;
+}
+
+function extractRidbQuery(sceneTokens: ReadonlyArray<string>): string | null {
+  const filtered = sceneTokens
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length >= 4)
+    .filter(
+      (t) =>
+        ![
+          "park",
+          "tree",
+          "trees",
+          "grass",
+          "building",
+          "house",
+          "outdoor",
+          "exterior",
+          "interior",
+          "background",
+        ].includes(t),
+    );
+  if (filtered.length === 0) return null;
+  return [...filtered].sort((a, b) => b.length - a.length)[0]!;
 }
 
 function facilityToCandidate(f: Facility): RawCandidate | null {
@@ -228,11 +258,41 @@ export const ridbRecreationProvider: CandidateProvider = {
     if (!env.RIDB_API_KEY) {
       return { candidates: [], elapsedMs: Date.now() - t0, error: null };
     }
+    const ridbQuery = extractRidbQuery(input.sceneTokens);
+
     try {
-      const [facilities, recAreas] = await Promise.all([
+      // Run unfiltered + keyword-filtered passes in parallel. The
+      // unfiltered slice maintains broad coverage; the keyword slice
+      // surfaces specific hits that wouldn't fit in the page cap.
+      const fetches: Array<Promise<Facility[] | RecArea[]>> = [
         fetchPagedRidb<Facility>("facilities", input.bbox, facilityResponseSchema),
         fetchPagedRidb<RecArea>("recareas", input.bbox, recAreaResponseSchema),
-      ]);
+      ];
+      if (ridbQuery) {
+        fetches.push(
+          fetchPagedRidb<Facility>(
+            "facilities",
+            input.bbox,
+            facilityResponseSchema,
+            ridbQuery,
+          ),
+          fetchPagedRidb<RecArea>(
+            "recareas",
+            input.bbox,
+            recAreaResponseSchema,
+            ridbQuery,
+          ),
+        );
+      }
+      const all = await Promise.all(fetches);
+      const facilities: Facility[] = [
+        ...(all[0] as Facility[]),
+        ...((all[2] as Facility[] | undefined) ?? []),
+      ];
+      const recAreas: RecArea[] = [
+        ...(all[1] as RecArea[]),
+        ...((all[3] as RecArea[] | undefined) ?? []),
+      ];
 
       const out: RawCandidate[] = [];
       for (const f of facilities) {
