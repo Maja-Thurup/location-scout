@@ -1,3 +1,4 @@
+import { synonymsFor } from "@/lib/subject-synonyms";
 import type { MergedCandidate } from "@/lib/providers/types";
 
 // ---------------------------------------------------------------------------
@@ -235,6 +236,18 @@ function tokenAlternates(token: string): string[] {
   if (lower.length === 0) return [];
   const flat = lower.replace(/_/g, " ");
   const variants = new Set<string>([lower, flat, flat.replace(/\s+/g, "-")]);
+  // Layer in synonyms from the dictionary — "horse" picks up
+  // "equestrian", "horseback", "rider", "cavalry", ... so a candidate
+  // whose text contains those words still scores positive. Without
+  // this layer the IDF-weighted overlap would silently miss a third
+  // of horse-statue candidates whose Wikidata description literally
+  // says "equestrian statue of ...".
+  const syn = synonymsFor(lower);
+  if (syn) {
+    for (const s of syn) {
+      if (s && s.length > 0) variants.add(s);
+    }
+  }
   return [...variants];
 }
 
