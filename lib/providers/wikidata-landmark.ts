@@ -107,18 +107,41 @@ const EXCLUDE_MACRO_TYPES = [
   "wd:Q35657",     // US state
 ];
 
+/**
+ * Wikidata properties pulled in OPTIONAL blocks so we surface card-
+ * ready facts (year built, sculptor, material, genre, named-after,
+ * Commons gallery) without losing candidates that don't have them.
+ *
+ *   P571   inception (year built / created)
+ *   P170   creator (sculptor / artist)
+ *   P84    architect
+ *   P5398  building period architect (used for older heritage)
+ *   P186   made from material (bronze, marble, stone)
+ *   P136   genre (art / architecture genre)
+ *   P138   named after (statue named after a person)
+ *   P361   part of (parent location, e.g. Central Park)
+ *   P527   has part (sub-elements; rarely useful)
+ *   P373   Commons category (gallery slug)
+ *
+ * GROUP_CONCAT collapses multiple values per item into a single
+ * delimited string so SPARQL still returns one row per item.
+ */
 function buildSparqlQuery(bbox: Bbox, limit: number): string {
   const sw = `Point(${bbox.west} ${bbox.south})`;
   const ne = `Point(${bbox.east} ${bbox.north})`;
-  // ORDER BY surfaces FAMOUS items first when we hit LIMIT in dense
-  // bboxes like NYC. Scoring by (image-present, sitelinks) approximates
-  // notability:
-  //   - having a Wikimedia Commons image (P18) means somebody photographed it
-  //   - sitelinks count = how many language Wikipedias have an article
-  // Both correlate strongly with "is this a famous landmark".
   return `
 SELECT DISTINCT
   ?item ?itemLabel ?itemDescription ?coord ?image ?article ?sitelinks
+  ?inception ?commonsCat
+  (GROUP_CONCAT(DISTINCT ?creatorLabel; SEPARATOR="|") AS ?creators)
+  (GROUP_CONCAT(DISTINCT ?architectLabel; SEPARATOR="|") AS ?architects)
+  (GROUP_CONCAT(DISTINCT ?materialLabel; SEPARATOR="|") AS ?materials)
+  (GROUP_CONCAT(DISTINCT ?genreLabel; SEPARATOR="|") AS ?genres)
+  (GROUP_CONCAT(DISTINCT ?depictsLabel; SEPARATOR="|") AS ?depicts)
+  (GROUP_CONCAT(DISTINCT ?namedAfterLabel; SEPARATOR="|") AS ?namedAfter)
+  (GROUP_CONCAT(DISTINCT ?partOfLabel; SEPARATOR="|") AS ?partOf)
+  (GROUP_CONCAT(DISTINCT ?hasPartLabel; SEPARATOR="|") AS ?hasParts)
+  (GROUP_CONCAT(DISTINCT ?altLabel; SEPARATOR="|") AS ?altLabels)
 WHERE {
   SERVICE wikibase:box {
     ?item wdt:P625 ?coord .
@@ -134,8 +157,30 @@ WHERE {
   OPTIONAL { ?item wdt:P18 ?image . }
   OPTIONAL { ?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> . }
   OPTIONAL { ?item wikibase:sitelinks ?sitelinks . }
+  OPTIONAL { ?item wdt:P571 ?inception . }
+  OPTIONAL { ?item wdt:P373 ?commonsCat . }
+  OPTIONAL { ?item wdt:P170 ?creator .
+             ?creator rdfs:label ?creatorLabel . FILTER(LANG(?creatorLabel) = "en") }
+  OPTIONAL { ?item wdt:P84 ?architect .
+             ?architect rdfs:label ?architectLabel . FILTER(LANG(?architectLabel) = "en") }
+  OPTIONAL { ?item wdt:P5398 ?architect2 .
+             ?architect2 rdfs:label ?architectLabel . FILTER(LANG(?architectLabel) = "en") }
+  OPTIONAL { ?item wdt:P186 ?material .
+             ?material rdfs:label ?materialLabel . FILTER(LANG(?materialLabel) = "en") }
+  OPTIONAL { ?item wdt:P136 ?genre .
+             ?genre rdfs:label ?genreLabel . FILTER(LANG(?genreLabel) = "en") }
+  OPTIONAL { ?item wdt:P180 ?depicts .
+             ?depicts rdfs:label ?depictsLabel . FILTER(LANG(?depictsLabel) = "en") }
+  OPTIONAL { ?item wdt:P138 ?namedAfter .
+             ?namedAfter rdfs:label ?namedAfterLabel . FILTER(LANG(?namedAfterLabel) = "en") }
+  OPTIONAL { ?item wdt:P361 ?partOf .
+             ?partOf rdfs:label ?partOfLabel . FILTER(LANG(?partOfLabel) = "en") }
+  OPTIONAL { ?item wdt:P527 ?hasPart .
+             ?hasPart rdfs:label ?hasPartLabel . FILTER(LANG(?hasPartLabel) = "en") }
+  OPTIONAL { ?item skos:altLabel ?altLabel . FILTER(LANG(?altLabel) = "en") }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
 }
+GROUP BY ?item ?itemLabel ?itemDescription ?coord ?image ?article ?sitelinks ?inception ?commonsCat
 ORDER BY DESC(BOUND(?image)) DESC(?sitelinks) ?item
 LIMIT ${Math.max(1, Math.min(limit, 500))}
 `.trim();
@@ -313,10 +358,56 @@ const sparqlBindingsSchema = z.object({
         coord: z.object({ value: z.string() }),
         image: z.object({ value: z.string() }).optional(),
         article: z.object({ value: z.string() }).optional(),
+        // Card-ready Wikidata facts (all OPTIONAL — most items only
+        // fill a subset). GROUP_CONCAT delimits multi-value props with
+        // "|" so we can split client-side without re-fetching.
+        inception: z.object({ value: z.string() }).optional(),
+        commonsCat: z.object({ value: z.string() }).optional(),
+        creators: z.object({ value: z.string() }).optional(),
+        architects: z.object({ value: z.string() }).optional(),
+        materials: z.object({ value: z.string() }).optional(),
+        genres: z.object({ value: z.string() }).optional(),
+        depicts: z.object({ value: z.string() }).optional(),
+        namedAfter: z.object({ value: z.string() }).optional(),
+        partOf: z.object({ value: z.string() }).optional(),
+        hasParts: z.object({ value: z.string() }).optional(),
+        altLabels: z.object({ value: z.string() }).optional(),
       }),
     ),
   }),
 });
+
+/**
+ * Split a SPARQL GROUP_CONCAT-delimited string ("a|b|c") into a unique,
+ * trimmed, max-3-element array. Keeps the card payload light — three
+ * creators / materials / genres is plenty for any UI surface.
+ */
+function splitFacts(s: string | undefined, max = 3): string[] {
+  if (!s) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of s.split("|")) {
+    const t = raw.trim();
+    if (!t) continue;
+    const norm = t.toLowerCase();
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(t);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/**
+ * Normalise an inception literal to a 4-digit year string when
+ * possible. SPARQL returns ISO datetimes ("1885-10-28T00:00:00Z") for
+ * P571 — we surface the year only on the card.
+ */
+function normaliseInception(s: string | undefined): string | null {
+  if (!s) return null;
+  const yearMatch = s.match(/^-?(\d{1,4})/);
+  return yearMatch ? yearMatch[1]! : s;
+}
 
 const POINT_RE = /^Point\(([-0-9.]+)\s+([-0-9.]+)\)$/;
 
@@ -369,6 +460,11 @@ function rewriteCommonsThumb(url: string, width = 1024): string {
 
 /**
  * Parse a SPARQL response into RawCandidates. Pure helper.
+ *
+ * Populates the Wikidata facts payload from the OPTIONAL props
+ * harvested by the SPARQL query so the card can surface year built,
+ * sculptor, material, genre, named-after, Commons gallery, and alt
+ * labels without an extra REST round-trip per candidate.
  */
 function parseSparqlBindings(raw: unknown): RawCandidate[] | null {
   const parsed = sparqlBindingsSchema.safeParse(raw);
@@ -378,6 +474,19 @@ function parseSparqlBindings(raw: unknown): RawCandidate[] | null {
     const point = parseWktPoint(b.coord.value);
     if (!point) continue;
     const qid = qidFromUri(b.item.value);
+    const facts = {
+      inception: normaliseInception(b.inception?.value),
+      creators: splitFacts(b.creators?.value),
+      architects: splitFacts(b.architects?.value),
+      materials: splitFacts(b.materials?.value),
+      genres: splitFacts(b.genres?.value),
+      depicts: splitFacts(b.depicts?.value, 5),
+      namedAfter: splitFacts(b.namedAfter?.value),
+      partOf: splitFacts(b.partOf?.value),
+      hasParts: splitFacts(b.hasParts?.value),
+      commonsCategory: b.commonsCat?.value ?? null,
+      altLabels: splitFacts(b.altLabels?.value, 6),
+    };
     out.push({
       externalId: qid,
       source: "wikidata-landmark",
@@ -389,6 +498,7 @@ function parseSparqlBindings(raw: unknown): RawCandidate[] | null {
       tags: { "wikidata:qid": qid },
       associatedFilms: [],
       sourceUrl: b.article?.value ?? `https://www.wikidata.org/wiki/${qid}`,
+      wikidataFacts: facts,
     });
   }
   return out;
@@ -404,7 +514,7 @@ export const wikidataLandmarkProvider: CandidateProvider = {
     const subjects = extractSubjects(sceneTokens);
 
     const cKey = cacheKey("wikidata:sparql", {
-      kind: "landmark-v4-multi-query",
+      kind: "landmark-v5-facts-enriched",
       bbox,
       classes: TARGET_CLASSES,
       subjectQids: [...subjects.qids].sort(),

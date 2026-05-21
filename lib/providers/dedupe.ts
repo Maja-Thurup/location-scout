@@ -4,6 +4,7 @@ import type {
   MergedCandidate,
   ProviderName,
   RawCandidate,
+  WikidataFacts,
 } from "@/lib/providers/types";
 
 /**
@@ -144,6 +145,11 @@ export function mergeCandidates(
       cluster.sourceUrl = cluster.sourceUrl ?? raw.sourceUrl;
       cluster.tags = unionTags(cluster.tags, raw.tags);
       cluster.associatedFilms = mergeFilms(cluster.associatedFilms, raw.associatedFilms);
+      // Wikidata facts: prefer the cluster's existing facts (Wikidata
+      // landmark provider runs early and has the canonical SPARQL
+      // payload); fill nulls/empties from the joining raw so an OSM
+      // record that arrived first doesn't shadow Wikidata's data.
+      cluster.wikidataFacts = mergeFacts(cluster.wikidataFacts, raw.wikidataFacts);
       // Coord precision: prefer the contributing record with the most
       // precise coords. OSM nodes (`node/...`) are typically point-
       // precise (1 m). UNESCO and Wikipedia coords are often centroids
@@ -173,6 +179,7 @@ export function mergeCandidates(
         tags: { ...raw.tags },
         associatedFilms: raw.associatedFilms,
         sourceUrl: raw.sourceUrl,
+        wikidataFacts: raw.wikidataFacts,
         _coordOwner: raw.source,
       };
       merged.push(fresh);
@@ -285,6 +292,52 @@ function unionTags(
     if (!out[k] && v) out[k] = v;
   }
   return out;
+}
+
+/**
+ * Field-wise merge of two Wikidata fact payloads. The cluster's
+ * existing fact wins on string fields (inception, commonsCategory) so
+ * the canonical Wikidata source isn't shadowed by a downstream raw
+ * with sparser data; for array fields we union, dedupe, and cap.
+ */
+function mergeFacts(
+  a: WikidataFacts | undefined,
+  b: WikidataFacts | undefined,
+): WikidataFacts | undefined {
+  if (!a && !b) return undefined;
+  if (!a) return b;
+  if (!b) return a;
+  const merge = (
+    x: ReadonlyArray<string>,
+    y: ReadonlyArray<string>,
+    cap = 5,
+  ): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const v of [...x, ...y]) {
+      const norm = v.trim();
+      if (!norm) continue;
+      const key = norm.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(norm);
+      if (out.length >= cap) break;
+    }
+    return out;
+  };
+  return {
+    inception: a.inception ?? b.inception,
+    commonsCategory: a.commonsCategory ?? b.commonsCategory,
+    creators: merge(a.creators, b.creators),
+    architects: merge(a.architects, b.architects),
+    materials: merge(a.materials, b.materials),
+    genres: merge(a.genres, b.genres),
+    depicts: merge(a.depicts, b.depicts, 6),
+    namedAfter: merge(a.namedAfter, b.namedAfter),
+    partOf: merge(a.partOf, b.partOf),
+    hasParts: merge(a.hasParts, b.hasParts),
+    altLabels: merge(a.altLabels, b.altLabels, 8),
+  };
 }
 
 /** Dedupe films by Wikidata Q-id when present, otherwise by title+year. */

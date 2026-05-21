@@ -20,13 +20,19 @@ import { logger } from "@/lib/logger";
 import {
   countDetectionsNearPoint,
   findBestImageNear,
+  findBestPanoNear,
   findDetectionsInBbox,
   findImagesNear,
   type MapillaryDetection,
   type MapillaryImage,
 } from "@/lib/mapillary";
 import { runFilmHistoryProviders } from "@/lib/providers/registry";
-import type { AssociatedFilm, RawCandidate } from "@/lib/providers/types";
+import type {
+  AssociatedFilm,
+  RawCandidate,
+  WikidataFacts,
+} from "@/lib/providers/types";
+import { enrichWikidataFacts } from "@/lib/wikidata-rest";
 import { checkDeepCredit, consumeDeepCredit } from "@/lib/search-tier";
 import { buildThumbUrl } from "@/lib/street-view";
 import {
@@ -71,6 +77,20 @@ const associatedFilmSchema = z.object({
   imdbId: z.string().nullable(),
 });
 
+const wikidataFactsSchema = z.object({
+  inception: z.string().nullable(),
+  creators: z.array(z.string()).default([]),
+  architects: z.array(z.string()).default([]),
+  materials: z.array(z.string()).default([]),
+  genres: z.array(z.string()).default([]),
+  depicts: z.array(z.string()).default([]),
+  namedAfter: z.array(z.string()).default([]),
+  partOf: z.array(z.string()).default([]),
+  hasParts: z.array(z.string()).default([]),
+  commonsCategory: z.string().nullable(),
+  altLabels: z.array(z.string()).default([]),
+});
+
 const candidateSchema = z.object({
   id: z.string(),
   type: z.enum(["node", "way", "relation"]),
@@ -85,6 +105,8 @@ const candidateSchema = z.object({
   knownImageUrl: z.string().nullable().optional(),
   associatedFilms: z.array(associatedFilmSchema).optional().default([]),
   sourceUrl: z.string().nullable().optional(),
+  /** Optional Wikidata facts pre-populated by search-osm. */
+  wikidataFacts: wikidataFactsSchema.optional(),
 });
 
 const requestSchema = z.object({
@@ -170,6 +192,14 @@ export type SelectedPhoto = {
   attributionHref: string | null;
   visionScore: number | null;
   visionReason: string | null;
+  /**
+   * Mapillary-only metadata that the carousel uses for hero badges
+   * (panorama indicator, compass needle) and for sorting tiebreakers.
+   * Optional + nullable so non-Mapillary photos pass through unchanged.
+   */
+  isPanorama?: boolean;
+  qualityScore?: number | null;
+  compassAngle?: number | null;
 };
 
 /**
@@ -233,6 +263,13 @@ export type EnrichedLocation = {
   sourceUrl: string | null;
   /** Films associated with this location (after TMDb poster enrichment). */
   films: ReadonlyArray<SurfacedFilm>;
+  /**
+   * Optional Wikidata facts (year built, creator, material, ...). Filled
+   * either at search-osm time (Wikidata SPARQL provider) or at
+   * enrichment time via the Wikidata REST client when a candidate has
+   * a Q-id but no facts payload yet.
+   */
+  wikidataFacts?: WikidataFacts;
 };
 
 type EnrichResponse = {
@@ -375,11 +412,12 @@ async function gatherFreeSignals(
   targetColor: ColorWord | null,
   altLimit: number,
 ): Promise<FreeSignals> {
-  // Pull both the closest single image (legacy semantics for color check)
-  // and a small pool of nearby alternates for multi-shot vision scoring.
-  // Both are free (Mapillary tokens are unlimited at our scale) but we
-  // cache aggressively.
-  const [closest, alternates] = await Promise.all([
+  // Pull the closest single image (legacy semantics for color check),
+  // a small pool of nearby alternates for multi-shot scoring, AND a
+  // 360° panorama when available — panoramas are gold for film
+  // scouting because they show the surroundings without committing
+  // to a particular direction. All cached aggressively.
+  const [closest, alternates, panorama] = await Promise.all([
     findBestImageNear(candidate.lat, candidate.lng).catch(() => null),
     altLimit > 1
       ? findImagesNear({
@@ -389,14 +427,24 @@ async function gatherFreeSignals(
           limit: Math.max(altLimit, 2),
         }).catch(() => [] as MapillaryImage[])
       : Promise.resolve([] as MapillaryImage[]),
+    findBestPanoNear(candidate.lat, candidate.lng).catch(
+      () => null as MapillaryImage | null,
+    ),
   ]);
 
-  // Build a deduped list with the closest first, then alternates by recency.
+  // Build a deduped list with the closest first, then panorama, then
+  // alternates by recency. The panorama lands second so the carousel's
+  // hero slot stays the closest forward-facing photo while the pano is
+  // a swipe away.
   const seen = new Set<string>();
   const ordered: MapillaryImage[] = [];
   if (closest) {
     ordered.push(closest);
     seen.add(closest.id);
+  }
+  if (panorama && !seen.has(panorama.id)) {
+    ordered.push(panorama);
+    seen.add(panorama.id);
   }
   for (const img of alternates) {
     if (seen.has(img.id)) continue;
@@ -598,6 +646,9 @@ function selectedFromMapillary(
     attributionHref: m.href,
     visionScore: score?.score ?? null,
     visionReason: score?.reason ?? null,
+    isPanorama: m.isPanorama ?? false,
+    qualityScore: m.qualityScore ?? null,
+    compassAngle: m.compassAngle,
   };
 }
 
@@ -986,6 +1037,10 @@ export const POST = withAuth(async (req) => {
       description: candidate.description ?? null,
       sourceUrl: candidate.sourceUrl ?? null,
       films,
+      // Wikidata facts: forwarded from search-osm when present.
+      // Card-time fill-in for Q-id-only candidates happens below in
+      // the post-mapping enrichment pass.
+      wikidataFacts: candidate.wikidataFacts,
     };
   });
 
@@ -994,6 +1049,29 @@ export const POST = withAuth(async (req) => {
   // Phase 1 quality bar: every card must show something the user can
   // actually look at.
   const withPhoto = locations.filter((loc) => loc.photos.length > 0);
+
+  // -------- Wikidata REST card-time enrichment --------
+  // For any surviving card that has a Wikidata Q-id but no facts
+  // payload (typically OSM nodes tagged `wikidata=Q1234` that didn't
+  // pass through the SPARQL provider), fetch the facts via the REST
+  // API. Cheap because most cards either already have facts or have
+  // no Q-id at all. Cached server-side.
+  const qidByLocId = new Map<string, string>();
+  for (const c of candidates) {
+    const qid = c.tags?.["wikidata"] ?? c.tags?.["wikidata:qid"];
+    if (qid && /^Q\d+$/.test(qid)) qidByLocId.set(c.id, qid);
+  }
+  await Promise.all(
+    withPhoto.map(async (loc) => {
+      const qid = qidByLocId.get(loc.id);
+      if (!qid) return;
+      const enriched = await enrichWikidataFacts({
+        qid,
+        existing: loc.wikidataFacts,
+      });
+      if (enriched) loc.wikidataFacts = enriched;
+    }),
+  );
 
   // -------- Phase 5.5: film-history POST-CARD enrichment --------
   // Films should NEVER drive search ranking — they're metadata on a card,

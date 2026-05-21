@@ -53,6 +53,58 @@ export type AssociatedFilm = {
 };
 
 /**
+ * Structured facts pulled from Wikidata for a candidate that has a
+ * Wikidata Q-id. Every field is optional — most Q-items only fill a
+ * subset. The SPARQL query at lib/providers/wikidata-landmark.ts
+ * collects these in OPTIONAL clauses so missing values don't drop
+ * candidates from the result set.
+ *
+ * Surfaced on the location card: year built (P571), creator/sculptor
+ * (P170), architect (P84/P5398), material (P186), genre (P136),
+ * subject (P180), and named-after (P138). Used both as user-visible
+ * facts AND as ranking signals (e.g. material match against scene
+ * tokens, named-after match against subject filter).
+ */
+export type WikidataFacts = {
+  /** Year the place / artwork was created (Wikidata P571 inception, ISO date or year). */
+  inception: string | null;
+  /** Sculptor / creator (Wikidata P170). Up to 3 names. */
+  creators: ReadonlyArray<string>;
+  /** Architect (Wikidata P84 / P5398). Up to 3 names. */
+  architects: ReadonlyArray<string>;
+  /** Material the artwork is made from (Wikidata P186). e.g. "bronze", "marble". */
+  materials: ReadonlyArray<string>;
+  /** Art / building genre (Wikidata P136). e.g. "neoclassical", "Art Deco". */
+  genres: ReadonlyArray<string>;
+  /** Subject of the artwork (Wikidata P180 depicts). e.g. "horse", "George Washington". */
+  depicts: ReadonlyArray<string>;
+  /** Named after (Wikidata P138). e.g. statue named after a historical figure. */
+  namedAfter: ReadonlyArray<string>;
+  /** Higher-level item this is part of (Wikidata P361). e.g. "Central Park". */
+  partOf: ReadonlyArray<string>;
+  /** Sub-parts (Wikidata P527). Rarely useful but cheap to carry. */
+  hasParts: ReadonlyArray<string>;
+  /** Wikimedia Commons category for a multi-photo gallery (Wikidata P373). */
+  commonsCategory: string | null;
+  /** Alternative names / aliases. Used for the subject filter without Claude. */
+  altLabels: ReadonlyArray<string>;
+};
+
+export const EMPTY_WIKIDATA_FACTS: WikidataFacts = Object.freeze({
+  inception: null,
+  creators: [],
+  architects: [],
+  materials: [],
+  genres: [],
+  depicts: [],
+  namedAfter: [],
+  partOf: [],
+  hasParts: [],
+  commonsCategory: null,
+  altLabels: [],
+});
+
+/**
  * Single candidate location returned by any provider. Providers vary in
  * how richly they fill these fields — OSM has tags but no description,
  * Wikidata has descriptions + images, NYC Scenes has films attached.
@@ -81,6 +133,15 @@ export type RawCandidate = {
 
   /** Origin URL, when applicable (Wikipedia article, NYC Open Data record, ...). */
   sourceUrl: string | null;
+
+  /**
+   * Optional structured Wikidata facts. Populated by the Wikidata
+   * landmark provider's enriched SPARQL query and by the on-demand
+   * `enrichWikidataFacts` REST client during card generation. Shape
+   * is open and additive: missing fields are simply omitted, and
+   * downstream code must treat every property as nullable.
+   */
+  wikidataFacts?: WikidataFacts;
 };
 
 /**

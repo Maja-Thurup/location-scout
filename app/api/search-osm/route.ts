@@ -23,6 +23,7 @@ import {
 } from "@/lib/overpass";
 import { mergeCandidates } from "@/lib/providers/dedupe";
 import { runProviders } from "@/lib/providers/registry";
+import { expandSubjectKeywords } from "@/lib/subject-synonyms";
 import { rrfRank } from "@/lib/providers/rrf";
 import {
   MIN_USEFUL_OVERLAP_SCORE,
@@ -36,6 +37,7 @@ import type {
   MergedCandidate,
   ProviderName,
   RawCandidate,
+  WikidataFacts,
 } from "@/lib/providers/types";
 
 export const runtime = "nodejs";
@@ -153,6 +155,13 @@ type RankedCandidate = {
   tagOverlapScore: number;
   /** Distinctive tokens that matched (for UI badge). */
   matchedTokens: ReadonlyArray<string>;
+  /**
+   * Card-ready Wikidata facts (year built, sculptor, material, …).
+   * Populated when any contributing source supplied them; absent
+   * otherwise. Surfaced on the location card and consumed by the
+   * card-time enricher to fill gaps via the Wikidata REST API.
+   */
+  wikidataFacts?: WikidataFacts;
 };
 
 export type ExtendedMatchMode = MatchMode | "google_text_fallback";
@@ -338,16 +347,16 @@ function collectSubjectKeywords(
   subjectNameRegex: string | null,
   sceneTokens: ReadonlyArray<string>,
 ): string[] {
-  const out = new Set<string>();
+  const seeds = new Set<string>();
   if (subjectNameRegex && subjectNameRegex.trim().length > 0) {
     for (const part of subjectNameRegex.split("|")) {
       const norm = part.trim().toLowerCase();
       if (norm.length >= 3 && !NON_SUBJECT_TOKENS.has(norm)) {
-        out.add(norm);
+        seeds.add(norm);
       }
     }
   }
-  if (out.size === 0) {
+  if (seeds.size === 0) {
     for (const t of sceneTokens) {
       const norm = t.trim().toLowerCase();
       if (
@@ -355,8 +364,21 @@ function collectSubjectKeywords(
         !norm.includes(" ") &&
         !NON_SUBJECT_TOKENS.has(norm)
       ) {
-        out.add(norm);
+        seeds.add(norm);
       }
+    }
+  }
+  // Expand each seed via the synonyms dictionary (hand-curated +
+  // taginfo) so the subject filter accepts "equestrian" / "horseback"
+  // / "rider" when the user typed "horse". Keeps non-discriminative
+  // generic tokens out via the same NON_SUBJECT_TOKENS check.
+  const expanded = expandSubjectKeywords(Array.from(seeds), {
+    maxExpansionsPerToken: 6,
+  });
+  const out = new Set<string>();
+  for (const e of expanded) {
+    if (e.length >= 3 && !NON_SUBJECT_TOKENS.has(e)) {
+      out.add(e);
     }
   }
   return Array.from(out);
@@ -795,6 +817,7 @@ export const POST = withAuth(async (req) => {
         rrfScore: m.rrfScore,
         tagOverlapScore: overlap.score,
         matchedTokens: overlap.matched,
+        wikidataFacts: m.wikidataFacts,
       };
     })
     .sort((a, b) => {
