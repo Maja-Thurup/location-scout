@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildCandidateText,
+  compareByTagHits,
   combinedRank,
+  countOsmAlternativeHits,
   isHighConfidence,
   tagOverlapScore,
 } from "@/lib/providers/tag-overlap";
@@ -103,32 +105,52 @@ describe("tagOverlapScore", () => {
     expect(tagOverlapScore(c3, tokens).score).toBeGreaterThan(0);
   });
 
-  // ---------------------------------------------------------------------
-  // Subject-name boost (the horse-statue-vs-Statue-of-Liberty case)
-  // ---------------------------------------------------------------------
-
-  it("subject regex matches NAME -> 2.5x score (Joan of Arc beats Statue of Liberty)", () => {
+  it("hitCount ranks multi-token matches above single-token (bars vs statues)", () => {
     const subjectNameRegex = "horse|equestrian|cavalry|jockey|rider";
+    const alts: Record<string, string>[] = [
+      { tourism: "artwork" },
+      { historic: "memorial" },
+      { leisure: "park" },
+      { name: subjectNameRegex },
+    ];
 
     const joan = merged({
       name: "Equestrian Statue of Joan of Arc",
-      description: "statue by Anna Hyatt Huntington in New York City",
+      description: "equestrian statue in Central Park",
+      tags: { tourism: "artwork", historic: "memorial", leisure: "park" },
     });
-    const liberty = merged({
-      name: "Statue of Liberty",
-      description: "Made in Paris by the French sculptor Bartholdi",
+    const bar = merged({
+      name: "Light Horse Tavern",
+      description: "amenity bar",
+      tags: { amenity: "restaurant" },
     });
 
-    const joanScore = tagOverlapScore(joan, horseTokens, { subjectNameRegex });
-    const libertyScore = tagOverlapScore(liberty, horseTokens, {
+    const joanScore = tagOverlapScore(joan, horseTokens, {
       subjectNameRegex,
+      osmTagsAlternatives: alts,
+    });
+    const barScore = tagOverlapScore(bar, horseTokens, {
+      subjectNameRegex,
+      osmTagsAlternatives: alts,
     });
 
-    expect(joanScore.subjectNameMatched).toBe(true);
-    expect(libertyScore.subjectNameMatched).toBe(false);
-    // Joan should comfortably outscore Liberty even though Liberty matches
-    // the common token "statue".
-    expect(joanScore.score).toBeGreaterThan(libertyScore.score * 2);
+    expect(joanScore.hitCount).toBeGreaterThan(barScore.hitCount);
+    expect(
+      compareByTagHits(
+        {
+          hitCount: joanScore.hitCount,
+          tagOverlapScore: joanScore.score,
+          rrfScore: 0.01,
+          distanceMeters: 100,
+        },
+        {
+          hitCount: barScore.hitCount,
+          tagOverlapScore: barScore.score,
+          rrfScore: 0.05,
+          distanceMeters: 10,
+        },
+      ),
+    ).toBeLessThan(0);
   });
 
   it("subject regex does NOT match in description-only -> no boost", () => {
@@ -160,6 +182,20 @@ describe("tagOverlapScore", () => {
     expect(b.score).toBeCloseTo(a.score + 0.5, 5);
   });
 
+  it("countOsmAlternativeHits matches classifier tags on the node", () => {
+    const c = merged({
+      tags: { tourism: "artwork", historic: "memorial" },
+    });
+    const { count, matched } = countOsmAlternativeHits(
+      c,
+      [{ tourism: "artwork" }, { historic: "memorial" }, { leisure: "park" }],
+      null,
+    );
+    expect(count).toBe(2);
+    expect(matched).toContain("tourism=artwork");
+    expect(matched).toContain("historic=memorial");
+  });
+
   it("malformed regex does not crash -> no boost", () => {
     const c = merged({ name: "Equestrian Statue" });
     const score = tagOverlapScore(c, horseTokens, {
@@ -177,16 +213,28 @@ describe("tagOverlapScore", () => {
 
 describe("combinedRank", () => {
   it("higher RRF + higher overlap => higher combined score", () => {
-    const low = combinedRank(0.01, { matched: [], score: 0 });
+    const low = combinedRank(0.01, {
+      matched: [],
+      matchedOsmAlternatives: [],
+      hitCount: 0,
+      score: 0,
+    });
     const high = combinedRank(0.05, {
       matched: ["a", "b", "c"],
+      matchedOsmAlternatives: [],
+      hitCount: 3,
       score: 3,
     });
     expect(high).toBeGreaterThan(low);
   });
 
   it("score=0 produces no boost (just rrfScore returned)", () => {
-    const zeroOverlap = combinedRank(0.05, { matched: [], score: 0 });
+    const zeroOverlap = combinedRank(0.05, {
+      matched: [],
+      matchedOsmAlternatives: [],
+      hitCount: 0,
+      score: 0,
+    });
     expect(zeroOverlap).toBe(0.05);
   });
 });
@@ -196,11 +244,18 @@ describe("combinedRank", () => {
 // ---------------------------------------------------------------------------
 
 describe("isHighConfidence", () => {
-  it("triggers when top overlap >= 2.0 + at least 6 candidates with overlap >= 0.5 + 4+ tokens", () => {
+  it("triggers when top has 3+ tag hits, score >= 2.0, 6+ pool overlaps, 4+ tokens", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a", "b", "c"], score: 3.5 },
+      topOverlap: {
+        matched: ["a", "b", "c"],
+        matchedOsmAlternatives: [],
+        hitCount: 3,
+        score: 3.5,
+      },
       poolOverlaps: Array.from({ length: 8 }, () => ({
         matched: ["x"],
+        matchedOsmAlternatives: [],
+        hitCount: 1,
         score: 0.8,
       })),
       sceneTokens: ["horse", "statue", "monument", "equestrian"],
@@ -210,9 +265,16 @@ describe("isHighConfidence", () => {
 
   it("returns false when scene tokens are vague (<4 distinctive)", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a", "b", "c"], score: 3.5 },
+      topOverlap: {
+        matched: ["a", "b", "c"],
+        matchedOsmAlternatives: [],
+        hitCount: 3,
+        score: 3.5,
+      },
       poolOverlaps: Array.from({ length: 8 }, () => ({
         matched: ["x"],
+        matchedOsmAlternatives: [],
+        hitCount: 1,
         score: 0.8,
       })),
       sceneTokens: ["urban", "day"], // both generic
@@ -220,11 +282,37 @@ describe("isHighConfidence", () => {
     expect(result).toBe(false);
   });
 
+  it("returns false when top has fewer than 3 tag hits", () => {
+    const result = isHighConfidence({
+      topOverlap: {
+        matched: ["a", "b"],
+        matchedOsmAlternatives: [],
+        hitCount: 2,
+        score: 3.5,
+      },
+      poolOverlaps: Array.from({ length: 8 }, () => ({
+        matched: ["x"],
+        matchedOsmAlternatives: [],
+        hitCount: 1,
+        score: 0.8,
+      })),
+      sceneTokens: ["horse", "statue", "monument", "equestrian"],
+    });
+    expect(result).toBe(false);
+  });
+
   it("returns false when top overlap is weak (< 2.0 IDF-weighted)", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a"], score: 0.8 },
+      topOverlap: {
+        matched: ["a"],
+        matchedOsmAlternatives: [],
+        hitCount: 3,
+        score: 0.8,
+      },
       poolOverlaps: Array.from({ length: 8 }, () => ({
         matched: ["a"],
+        matchedOsmAlternatives: [],
+        hitCount: 1,
         score: 0.8,
       })),
       sceneTokens: ["horse", "statue", "monument", "equestrian"],
@@ -234,24 +322,43 @@ describe("isHighConfidence", () => {
 
   it("returns false when fewer than 6 candidates have meaningful overlap", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["a", "b", "c"], score: 3.5 },
+      topOverlap: {
+        matched: ["a", "b", "c"],
+        matchedOsmAlternatives: [],
+        hitCount: 3,
+        score: 3.5,
+      },
       poolOverlaps: [
-        { matched: ["a"], score: 0.8 },
-        { matched: ["a"], score: 0.8 },
+        {
+          matched: ["a"],
+          matchedOsmAlternatives: [],
+          hitCount: 1,
+          score: 0.8,
+        },
+        {
+          matched: ["a"],
+          matchedOsmAlternatives: [],
+          hitCount: 1,
+          score: 0.8,
+        },
       ],
       sceneTokens: ["horse", "statue", "monument", "equestrian"],
     });
     expect(result).toBe(false);
   });
 
-  it("uses IDF weighting — rare tokens like 'equestrian' alone clear the bar", () => {
-    // A candidate with the SINGLE rare match "equestrian" (weight 3.0)
-    // should already exceed the top-score threshold (2.0). This is the
-    // payoff of TF-IDF: one strong discriminator beats five fluff words.
+  it("uses IDF weighting — rare tokens like 'equestrian' alone clear the score bar", () => {
     const result = isHighConfidence({
-      topOverlap: { matched: ["equestrian"], score: 3.0 },
+      topOverlap: {
+        matched: ["equestrian", "horse", "statue"],
+        matchedOsmAlternatives: [],
+        hitCount: 3,
+        score: 3.0,
+      },
       poolOverlaps: Array.from({ length: 7 }, () => ({
         matched: ["statue"],
+        matchedOsmAlternatives: [],
+        hitCount: 1,
         score: 1.5,
       })),
       sceneTokens: ["horse", "statue", "monument", "equestrian"],

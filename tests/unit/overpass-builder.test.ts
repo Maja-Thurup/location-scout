@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { bboxFromRadius, isReasonableBbox } from "@/lib/bbox";
-import { buildOverpassQuery, buildUnionOverpassQuery } from "@/lib/overpass";
+import {
+  buildOverpassQuery,
+  buildUnionOverpassQuery,
+  wrapNameRegexWithWordBoundaries,
+} from "@/lib/overpass";
 
 const BROOKLYN_BBOX = {
   south: 40.5707,
@@ -117,6 +121,19 @@ describe("buildUnionOverpassQuery (Path A: rich-tag candidate generation)", () =
     expect(union).toContain('way["building"="warehouse"]');
     expect(union).toContain('relation["building"="warehouse"]');
     expect(single).toContain('node["building"="warehouse"]');
+  });
+
+  it("uses word boundaries on name-keyword alternatives (horse statue prompts)", () => {
+    const q = buildUnionOverpassQuery({
+      bbox: BROOKLYN_BBOX,
+      osmTagsAlternatives: [
+        { name: "horse|equestrian|cavalry" },
+      ],
+    });
+    expect(q).toContain('["name"~"\\bhorse\\b|\\bequestrian\\b|\\bcavalry\\b",i]');
+    expect(wrapNameRegexWithWordBoundaries("horse|equestrian")).toBe(
+      "\\bhorse\\b|\\bequestrian\\b",
+    );
   });
 
   it("preserves tagFilter case-insensitivity rules across alternatives", () => {

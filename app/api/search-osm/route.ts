@@ -12,6 +12,7 @@ import {
 } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { forwardGeocode } from "@/lib/geocode";
+import { shouldExcludeOsmCommercialOnSculptureScene } from "@/lib/osm-scene-filter";
 import { type GooglePlace, searchText } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
 import { findDetectionsInBbox } from "@/lib/mapillary";
@@ -23,15 +24,10 @@ import {
 } from "@/lib/overpass";
 import { mergeCandidates } from "@/lib/providers/dedupe";
 import { runProviders } from "@/lib/providers/registry";
-import {
-  compareRelevanceTiers,
-  computeRelevanceTier,
-} from "@/lib/providers/relevance-tier";
-import { expandSubjectKeywords } from "@/lib/subject-synonyms";
 import { rrfRank } from "@/lib/providers/rrf";
 import {
   MIN_USEFUL_OVERLAP_SCORE,
-  combinedRank,
+  compareByTagHits,
   isHighConfidence,
   tagOverlapScore,
   type TagOverlapScore,
@@ -157,8 +153,12 @@ type RankedCandidate = {
   rrfScore: number;
   /** IDF-weighted tag overlap with scene_tokens. */
   tagOverlapScore: number;
-  /** Distinctive tokens that matched (for UI badge). */
+  /** Scene + OSM-alternative tag hits — primary sort key. */
+  tagHitCount: number;
+  /** Distinctive scene_tokens that matched (for UI badge). */
   matchedTokens: ReadonlyArray<string>;
+  /** OSM alternatives that matched (e.g. tourism=artwork). */
+  matchedOsmAlternatives: ReadonlyArray<string>;
   /**
    * Card-ready Wikidata facts (year built, sculptor, material, …).
    * Populated when any contributing source supplied them; absent
@@ -282,96 +282,6 @@ function inferOsmId(externalIds: Record<string, string | undefined>): number {
   if (!osmExt) return 0;
   const m = /^(?:node|way|relation)\/(\d+)$/.exec(osmExt);
   return m ? Number(m[1]) : 0;
-}
-
-/**
- * Tokens that are too generic to be a "subject" we'd require in a
- * candidate. The user might write them but they don't carve out a
- * specific thing — every memorial mentions "park"/"statue"/"monument"
- * incidentally.
- */
-const NON_SUBJECT_TOKENS = new Set([
-  "park",
-  "statue",
-  "sculpture",
-  "monument",
-  "memorial",
-  "artwork",
-  "building",
-  "house",
-  "tree",
-  "trees",
-  "grass",
-  "sky",
-  "background",
-  "outdoor",
-  "exterior",
-  "interior",
-  "the",
-  "a",
-  "an",
-  "of",
-  "in",
-  "with",
-  "and",
-  "or",
-  "old",
-  "new",
-  "big",
-  "small",
-  "large",
-  "tiny",
-]);
-
-/**
- * Collect the literal subject keywords used by the subject-required
- * filter. Pulls them from two places:
- *   1. The pipe-separated `name` regex Claude emitted (e.g.
- *      "horse|equestrian|cavalry|jockey|rider"). These are the
- *      authoritative subject synonyms.
- *   2. As a fallback (when there's no name regex), any single-word
- *      scene_token that isn't in the generic-noun blacklist. Short
- *      words and category nouns are dropped.
- */
-function collectSubjectKeywords(
-  subjectNameRegex: string | null,
-  sceneTokens: ReadonlyArray<string>,
-): string[] {
-  const seeds = new Set<string>();
-  if (subjectNameRegex && subjectNameRegex.trim().length > 0) {
-    for (const part of subjectNameRegex.split("|")) {
-      const norm = part.trim().toLowerCase();
-      if (norm.length >= 3 && !NON_SUBJECT_TOKENS.has(norm)) {
-        seeds.add(norm);
-      }
-    }
-  }
-  if (seeds.size === 0) {
-    for (const t of sceneTokens) {
-      const norm = t.trim().toLowerCase();
-      if (
-        norm.length >= 4 &&
-        !norm.includes(" ") &&
-        !NON_SUBJECT_TOKENS.has(norm)
-      ) {
-        seeds.add(norm);
-      }
-    }
-  }
-  // Expand each seed via the synonyms dictionary (hand-curated +
-  // taginfo) so the subject filter accepts "equestrian" / "horseback"
-  // / "rider" when the user typed "horse". Keeps non-discriminative
-  // generic tokens out via the same NON_SUBJECT_TOKENS check.
-  const expanded = expandSubjectKeywords(Array.from(seeds), {
-    maxExpansionsPerToken: 6,
-  });
-  const out = new Set<string>();
-  for (const e of expanded) {
-    if (e.length >= 3 && !NON_SUBJECT_TOKENS.has(e)) {
-      out.add(e);
-    }
-  }
-  return Array.from(out);
 }
 
 export const POST = withAuth(async (req) => {
@@ -571,7 +481,16 @@ export const POST = withAuth(async (req) => {
   const googleTextResults = await googleTextPromise;
 
   let effectiveBbox = osmResult.effectiveBbox;
-  const osmCandidates = osmResult.candidates;
+  const osmCandidates = osmResult.candidates.filter(
+    (c) => !shouldExcludeOsmCommercialOnSculptureScene(c.tags, sceneTokens),
+  );
+  const droppedOsmCommercial =
+    osmResult.candidates.length - osmCandidates.length;
+  if (droppedOsmCommercial > 0) {
+    logger.info("search-osm dropped commercial OSM name-regex false positives", {
+      droppedOsmCommercial,
+    });
+  }
   let finalMatchMode: ExtendedMatchMode = osmResult.matchMode;
   let finalExpansion: 1 | 2 | 4 = osmResult.expansionMultiplier;
   let finalPrimaryTag = osmResult.primaryTag;
@@ -706,7 +625,10 @@ export const POST = withAuth(async (req) => {
   const rrfRanked = rrfRank(filteredMerged, locationKind);
   const overlapByCandidate = new Map<string, TagOverlapScore>();
   for (const c of rrfRanked) {
-    const overlap = tagOverlapScore(c, sceneTokens, { subjectNameRegex });
+    const overlap = tagOverlapScore(c, sceneTokens, {
+      subjectNameRegex,
+      osmTagsAlternatives: effectiveAlternatives,
+    });
     overlapByCandidate.set(c.id, overlap);
   }
 
@@ -729,34 +651,16 @@ export const POST = withAuth(async (req) => {
     : rrfRanked;
   const droppedZeroOverlap = rrfRanked.length - afterTagFilter.length;
 
-  // 5.9) Subject keywords for tiered ranking (horse first, other statues
-  // second, everything else last). We no longer hard-drop non-subject
-  // hits — the fail-safe used to restore Statue of Liberty when only two
-  // candidates mentioned "horse" in text.
-  const subjectKeywords = collectSubjectKeywords(
-    subjectNameRegex,
-    sceneTokens,
-  );
-  const tierByCandidate = new Map<string, ReturnType<typeof computeRelevanceTier>>();
-  for (const c of afterTagFilter) {
-    tierByCandidate.set(
-      c.id,
-      computeRelevanceTier({
-        candidate: c,
-        subjectTerms: subjectKeywords,
-        subjectNameRegex,
-      }),
-    );
-  }
-
-  // 6) Convert to RankedCandidate[], rank by relevance tier then RRF +
-  // tag-overlap, then distance.
-  // score (descending), then break ties by distance from search center.
+  // 6) Rank by total prompt tag hits (scene_tokens + matching OSM
+  // alternatives), then IDF score, RRF, distance. One weak hit (e.g.
+  // "horse" in a bar name) cannot outrank a statue matching horse+statue+park.
   const center = bboxCenter(effectiveBbox);
   const ranked: RankedCandidate[] = afterTagFilter
     .map((m) => {
       const overlap = overlapByCandidate.get(m.id) ?? {
         matched: [],
+        matchedOsmAlternatives: [],
+        hitCount: 0,
         score: 0,
       };
       return {
@@ -777,27 +681,28 @@ export const POST = withAuth(async (req) => {
         distanceMeters: distanceMeters(center, { lat: m.lat, lng: m.lng }),
         rrfScore: m.rrfScore,
         tagOverlapScore: overlap.score,
+        tagHitCount: overlap.hitCount,
         matchedTokens: overlap.matched,
+        matchedOsmAlternatives: overlap.matchedOsmAlternatives,
         wikidataFacts: m.wikidataFacts,
       };
     })
-    .sort((a, b) => {
-      const aTier = tierByCandidate.get(a.id) ?? 2;
-      const bTier = tierByCandidate.get(b.id) ?? 2;
-      const tierCmp = compareRelevanceTiers(aTier, bTier);
-      if (tierCmp !== 0) return tierCmp;
-
-      const aCombined = combinedRank(a.rrfScore, {
-        matched: a.matchedTokens,
-        score: a.tagOverlapScore,
-      });
-      const bCombined = combinedRank(b.rrfScore, {
-        matched: b.matchedTokens,
-        score: b.tagOverlapScore,
-      });
-      if (bCombined !== aCombined) return bCombined - aCombined;
-      return a.distanceMeters - b.distanceMeters;
-    })
+    .sort((a, b) =>
+      compareByTagHits(
+        {
+          hitCount: a.tagHitCount,
+          tagOverlapScore: a.tagOverlapScore,
+          rrfScore: a.rrfScore,
+          distanceMeters: a.distanceMeters,
+        },
+        {
+          hitCount: b.tagHitCount,
+          tagOverlapScore: b.tagOverlapScore,
+          rrfScore: b.rrfScore,
+          distanceMeters: b.distanceMeters,
+        },
+      ),
+    )
     .slice(0, MAX_OUTPUT_CANDIDATES);
 
   // 6.5) Decide whether vision scoring is necessary at enrichment time.
@@ -819,9 +724,7 @@ export const POST = withAuth(async (req) => {
       droppedOsmNoise,
       droppedZeroOverlap,
       applyHardFilter,
-      subjectKeywords,
-      tier0: ranked.filter((r) => tierByCandidate.get(r.id) === 0).length,
-      tier1: ranked.filter((r) => tierByCandidate.get(r.id) === 1).length,
+      topHitCount: ranked[0]?.tagHitCount ?? 0,
       finalCount: ranked.length,
     });
   }

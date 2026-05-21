@@ -1,3 +1,4 @@
+import { nameMatchesSubjectTerms } from "@/lib/osm-scene-filter";
 import { synonymsFor } from "@/lib/subject-synonyms";
 import type { MergedCandidate } from "@/lib/providers/types";
 
@@ -288,46 +289,66 @@ function countMatches(
 }
 
 export type TagOverlapScore = {
-  /** Distinctive scene tokens matched in name+description+tags. */
+  /** Distinctive scene_tokens matched in name+description+tags. */
   matched: ReadonlyArray<string>;
   /**
-   * Whether the candidate's NAME (not description, not tags) contains
-   * one of the user's subject keywords. When true, the candidate is the
-   * literal thing the user asked for; we apply a 2.5x multiplier to the
-   * raw IDF score before returning. Optional for backwards-compat with
-   * mock literals in tests.
+   * OSM classifier alternatives from Claude that match this candidate's
+   * tags (e.g. tourism=artwork, leisure=park).
    */
-  subjectNameMatched?: boolean;
-  /** Whether the candidate has a curated knownImageUrl. */
-  hasImage?: boolean;
+  matchedOsmAlternatives: ReadonlyArray<string>;
   /**
-   * IDF-weighted score with subject-name and image bonuses applied.
-   *
-   * Approximate ranges:
-   *   - 0      no useful overlap
-   *   - 0.5-2  common matches only ("park", "house")
-   *   - 2-5    one rare match ("equestrian", "obelisk", "abandoned")
-   *   - 5-12   the user's subject IS the candidate's name (rare match × 2.5)
-   *   - 12+    multiple rare matches AND the subject is in the name
+   * Total prompt tag hits = scene token matches + OSM alternative matches.
+   * Primary sort key: more hits rank higher (3 beats 1).
    */
+  hitCount: number;
+  /** Whether the candidate's NAME matches the subject name-regex. Metadata only. */
+  subjectNameMatched?: boolean;
+  hasImage?: boolean;
+  /** IDF-weighted score — tiebreaker after hitCount, not a 2.5× name boost. */
   score: number;
 };
 
 export type TagOverlapOptions = {
-  /**
-   * A pipe-separated regex of subject synonyms emitted by Claude as the
-   * `name` alternative in osm_tags_alternatives. e.g. for "horse statue":
-   *   "horse|equestrian|cavalry|jockey|rider"
-   *
-   * When this regex matches the candidate's NAME (case-insensitive,
-   * substring), we multiply the IDF score by 2.5 — the candidate is
-   * literally the kind of thing the user asked for, ahead of generic
-   * "memorial" / "monument" hits whose names contain the user's words
-   * incidentally (Statue of Liberty matches "statue" but not the
-   * subject regex).
-   */
+  /** Claude `osm_tags_alternatives` — each matching key=value adds one hit. */
+  osmTagsAlternatives?: ReadonlyArray<Record<string, string>>;
+  /** Pipe-separated name synonyms from the `name` alternative. */
   subjectNameRegex?: string | null;
 };
+
+/**
+ * Count how many Overpass alternatives match the candidate's OSM tags
+ * (and optionally the name-regex alternative).
+ */
+export function countOsmAlternativeHits(
+  candidate: MergedCandidate,
+  alternatives: ReadonlyArray<Record<string, string>>,
+  subjectNameRegex: string | null | undefined,
+): { matched: string[]; count: number } {
+  const matched: string[] = [];
+  for (const alt of alternatives) {
+    for (const [k, v] of Object.entries(alt)) {
+      if (!k || !v) continue;
+      if (k === "name") {
+        if (candidate.name && subjectNameRegex) {
+          try {
+            const parts = subjectNameRegex.split("|").map((p) => p.trim());
+            if (nameMatchesSubjectTerms(candidate.name, parts)) {
+              matched.push("name≈subject");
+            }
+          } catch {
+            /* bad regex */
+          }
+        }
+        continue;
+      }
+      const tagVal = candidate.tags[k];
+      if (tagVal && tagVal.toLowerCase() === v.toLowerCase()) {
+        matched.push(`${k}=${v}`);
+      }
+    }
+  }
+  return { matched, count: matched.length };
+}
 
 export function tagOverlapScore(
   candidate: MergedCandidate,
@@ -360,28 +381,30 @@ export function tagOverlapScore(
   let subjectNameMatched = false;
   if (opts.subjectNameRegex && candidate.name) {
     try {
-      const re = new RegExp(opts.subjectNameRegex, "i");
-      subjectNameMatched = re.test(candidate.name);
+      const parts = opts.subjectNameRegex.split("|").map((p) => p.trim());
+      subjectNameMatched = nameMatchesSubjectTerms(candidate.name, parts);
     } catch {
-      // Bad regex from Claude — ignore the boost rather than crash.
       subjectNameMatched = false;
     }
   }
 
   const hasImage = Boolean(candidate.knownImageUrl);
 
-  // Apply boosts:
-  //   - subject in name = 2.5x multiplier on the IDF score (huge —
-  //     dominates RRF for non-subject candidates).
-  //   - image present = +0.5 flat (small — breaks ties between
-  //     candidates that score equally on text but only one has a
-  //     curated photo).
+  const osmHits = countOsmAlternativeHits(
+    candidate,
+    opts.osmTagsAlternatives ?? [],
+    opts.subjectNameRegex,
+  );
+
+  const hitCount = positive.matched.length + osmHits.count;
+
   let score = positive.weightedScore + artworkSubjectBoost;
-  if (subjectNameMatched) score *= 2.5;
   if (hasImage) score += 0.5;
 
   return {
     matched: positive.matched,
+    matchedOsmAlternatives: osmHits.matched,
+    hitCount,
     subjectNameMatched,
     hasImage,
     score,
@@ -389,15 +412,32 @@ export function tagOverlapScore(
 }
 
 /**
- * Combined score for sorting: RRF rank-score + tag-overlap multiplier.
- *
- * The 0.5 multiplier on the overlap score gives tag-overlap real
- * influence: a candidate with the subject IN its name (overlap.score
- * already pre-multiplied by 2.5x in tagOverlapScore) gets a 0.5 ×
- * (rare 3.0 × 2.5) = +3.75 boost, easily leapfrogging a high-RRF
- * candidate (like Statue of Liberty stacking UNESCO + Wikipedia + OSM)
- * that doesn't match the subject. Tunable.
+ * Compare candidates for final ranking: most prompt tag hits first, then
+ * IDF-weighted score, then RRF, then distance.
  */
+export function compareByTagHits(
+  a: {
+    hitCount: number;
+    tagOverlapScore: number;
+    rrfScore: number;
+    distanceMeters: number;
+  },
+  b: {
+    hitCount: number;
+    tagOverlapScore: number;
+    rrfScore: number;
+    distanceMeters: number;
+  },
+): number {
+  if (b.hitCount !== a.hitCount) return b.hitCount - a.hitCount;
+  if (b.tagOverlapScore !== a.tagOverlapScore) {
+    return b.tagOverlapScore - a.tagOverlapScore;
+  }
+  if (b.rrfScore !== a.rrfScore) return b.rrfScore - a.rrfScore;
+  return a.distanceMeters - b.distanceMeters;
+}
+
+/** @deprecated Sort with compareByTagHits — hit count is the primary key. */
 export function combinedRank(
   rrfScore: number,
   overlap: TagOverlapScore,
@@ -438,7 +478,10 @@ export function isHighConfidence(args: {
     (t) => !GENERIC_TOKENS.has(t.toLowerCase()),
   );
   if (distinctiveTokens.length < 4) return false;
-  if (!args.topOverlap || args.topOverlap.score < HIGH_CONFIDENCE_TOP_SCORE) {
+  if (!args.topOverlap || args.topOverlap.hitCount < 3) {
+    return false;
+  }
+  if (args.topOverlap.score < HIGH_CONFIDENCE_TOP_SCORE) {
     return false;
   }
   const withOverlap = args.poolOverlaps.filter(

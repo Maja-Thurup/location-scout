@@ -102,6 +102,25 @@ const PREFIX_KEYS = new Set<string>();
  */
 const REGEX_META = /[|()^$.*+?\\[\]]/;
 
+/**
+ * Turn `horse|equestrian|cavalry` into `\bhorse\b|\bequestrian\b|\bcavalry\b`
+ * so Overpass does not return "Seahorse" or "Horseshoe Bar".
+ * Multi-word alternatives (if any) are left as plain substrings.
+ */
+export function wrapNameRegexWithWordBoundaries(pattern: string): string {
+  return pattern
+    .split("|")
+    .map((part) => {
+      const t = part.trim();
+      if (t.length === 0) return "";
+      if (/\s/.test(t) || t.includes("\\b")) return t;
+      const escaped = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return `\\b${escaped}\\b`;
+    })
+    .filter((p) => p.length > 0)
+    .join("|");
+}
+
 function tagFilter(key: string, value: string): string {
   const safeKey = key.replace(/"/g, '\\"');
   const safeValue = value.replace(/"/g, '\\"');
@@ -118,7 +137,11 @@ function tagFilter(key: string, value: string): string {
     (key === "name" || key === "name:en" || key === "description") &&
     REGEX_META.test(value)
   ) {
-    return `["${safeKey}"~"${safeValue}",i]`;
+    const namePattern =
+      key === "name" || key === "name:en"
+        ? wrapNameRegexWithWordBoundaries(safeValue)
+        : safeValue;
+    return `["${safeKey}"~"${namePattern}",i]`;
   }
   return `["${safeKey}"="${safeValue}"]`;
 }
