@@ -111,6 +111,50 @@ export type LocationCardPhoto = {
   attributionHref: string | null;
   visionScore: number | null;
   visionReason: string | null;
+  /**
+   * Optional Mapillary panorama flag. When true the renderer can show
+   * the photo with a 360°-style frame and (eventually) wire it into
+   * the embedded MapillaryJS viewer for swipeable views.
+   */
+  isPanorama?: boolean;
+  /**
+   * Mapillary `quality_score` (0..1) when the source is Mapillary.
+   * Used to pick the visually-strongest photo as the primary thumbnail
+   * even when a more recent capture exists.
+   */
+  qualityScore?: number | null;
+  /**
+   * Compass heading the camera was pointing in degrees (0=N, 90=E,
+   * 180=S, 270=W). When present, the carousel can display a small
+   * compass needle so the scout knows what direction the photo faces.
+   */
+  compassAngle?: number | null;
+};
+
+/**
+ * Card-ready facts pulled from Wikidata for landmark-y candidates.
+ * Mirrors the WikidataFacts type in lib/providers/types.ts but is
+ * defined here so the components contract stays pure-frontend.
+ */
+export type LocationFacts = {
+  /** Year built / inception (4-digit string, e.g. "1885"). */
+  inception?: string;
+  /** Sculptor / artist names. */
+  creators?: ReadonlyArray<string>;
+  /** Architect names. */
+  architects?: ReadonlyArray<string>;
+  /** Materials, e.g. "bronze", "marble". */
+  materials?: ReadonlyArray<string>;
+  /** Genre, e.g. "neoclassical", "Art Deco". */
+  genres?: ReadonlyArray<string>;
+  /** Subjects depicted, e.g. "horse", "George Washington". */
+  depicts?: ReadonlyArray<string>;
+  /** Named after, e.g. "Theodore Roosevelt". */
+  namedAfter?: ReadonlyArray<string>;
+  /** Parent place, e.g. "Central Park". */
+  partOf?: ReadonlyArray<string>;
+  /** Wikimedia Commons category (gallery slug). */
+  commonsCategory?: string;
 };
 
 export type LocationCardProps = {
@@ -158,6 +202,13 @@ export type LocationCardProps = {
   sourceUrl?: string;
   /** Films known to have been shot here. Up to 3 surfaced in the strip. */
   films?: ReadonlyArray<SurfacedFilm>;
+
+  /**
+   * Optional Wikidata facts (year built, sculptor, material, genre,
+   * named-after, Commons gallery). Rendered as a compact fact list
+   * below the description when any are present.
+   */
+  facts?: LocationFacts;
 
   isSaved?: boolean;
   isSelected?: boolean;

@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 
 import type {
   LocationCardPhoto,
   LocationCardProps,
+  LocationFacts,
   LocationSource,
   SurfacedFilm,
 } from "@/components/contracts";
@@ -70,6 +71,7 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
     description,
     sourceUrl,
     films,
+    facts,
   } = props;
 
   const [activeTab, setActiveTab] = useState<"photos" | "map">("photos");
@@ -175,6 +177,8 @@ export function LocationCard(props: LocationCardProps & LocationCardExtraProps) 
           />
         )}
 
+        {facts && hasAnyFact(facts) && <FactsList facts={facts} />}
+
         {badges && badges.length > 0 && (
           <div className="flex flex-wrap gap-1">
             {badges.map((b, i) => (
@@ -248,6 +252,14 @@ function PhotosTab(props: {
         <span className="rounded-md bg-black/70 px-2 py-0.5 text-[10px] font-medium tracking-wide text-white uppercase backdrop-blur">
           {sourceLabel(photo.source)}
         </span>
+        {photo.isPanorama && (
+          <span
+            title="360° panorama — gold for film scouting"
+            className="rounded-md bg-amber-500/80 px-2 py-0.5 text-[10px] font-bold tracking-wide text-black uppercase backdrop-blur"
+          >
+            360°
+          </span>
+        )}
         {visionScore != null && (
           <span
             title={visionReason ?? undefined}
@@ -581,6 +593,85 @@ function sourcePillClass(source: LocationSource): string {
     default:
       return "bg-white/5 text-muted-foreground border border-white/10";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Wikidata facts list — compact one-line-per-row table beneath the
+// description. Shows year built, sculptor, architect, material,
+// genre, named-after, parent place when present.
+// ---------------------------------------------------------------------------
+
+function hasAnyFact(facts: LocationFacts): boolean {
+  return Boolean(
+    facts.inception ||
+      (facts.creators && facts.creators.length > 0) ||
+      (facts.architects && facts.architects.length > 0) ||
+      (facts.materials && facts.materials.length > 0) ||
+      (facts.genres && facts.genres.length > 0) ||
+      (facts.namedAfter && facts.namedAfter.length > 0) ||
+      (facts.partOf && facts.partOf.length > 0) ||
+      (facts.depicts && facts.depicts.length > 0),
+  );
+}
+
+function FactsList({ facts }: { facts: LocationFacts }) {
+  const rows: Array<{ label: string; value: string }> = [];
+  if (facts.inception) rows.push({ label: "Built", value: facts.inception });
+  if (facts.creators && facts.creators.length > 0) {
+    rows.push({ label: "By", value: facts.creators.join(", ") });
+  }
+  if (facts.architects && facts.architects.length > 0) {
+    rows.push({ label: "Architect", value: facts.architects.join(", ") });
+  }
+  if (facts.materials && facts.materials.length > 0) {
+    rows.push({ label: "Material", value: facts.materials.join(", ") });
+  }
+  if (facts.genres && facts.genres.length > 0) {
+    rows.push({ label: "Style", value: facts.genres.join(", ") });
+  }
+  if (facts.namedAfter && facts.namedAfter.length > 0) {
+    rows.push({ label: "Named after", value: facts.namedAfter.join(", ") });
+  }
+  if (facts.depicts && facts.depicts.length > 0) {
+    rows.push({ label: "Depicts", value: facts.depicts.slice(0, 3).join(", ") });
+  }
+  if (facts.partOf && facts.partOf.length > 0) {
+    rows.push({ label: "Part of", value: facts.partOf.join(", ") });
+  }
+  if (rows.length === 0) return null;
+  return (
+    <dl
+      className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-[11px] leading-relaxed"
+      onClick={(e) => e.stopPropagation()}
+    >
+      {rows.map((r) => (
+        <Fragment key={r.label}>
+          <dt className="font-medium tracking-wide text-muted-foreground uppercase text-[10px]">
+            {r.label}
+          </dt>
+          <dd className="text-foreground/90">{r.value}</dd>
+        </Fragment>
+      ))}
+      {facts.commonsCategory && (
+        <Fragment>
+          <dt className="font-medium tracking-wide text-muted-foreground uppercase text-[10px]">
+            Gallery
+          </dt>
+          <dd>
+            <a
+              href={`https://commons.wikimedia.org/wiki/Category:${encodeURIComponent(facts.commonsCategory)}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-foreground/90 underline-offset-4 hover:underline"
+              onClick={(e) => e.stopPropagation()}
+            >
+              Wikimedia Commons ↗
+            </a>
+          </dd>
+        </Fragment>
+      )}
+    </dl>
+  );
 }
 
 // ---------------------------------------------------------------------------

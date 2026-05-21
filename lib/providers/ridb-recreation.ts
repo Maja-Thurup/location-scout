@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Bbox } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { env } from "@/lib/env";
+import { extractKeywords } from "@/lib/providers/keywords";
 import { logger } from "@/lib/logger";
 import type {
   CandidateProvider,
@@ -163,27 +164,22 @@ async function fetchPagedRidb<T>(
   return all;
 }
 
-function extractRidbQuery(sceneTokens: ReadonlyArray<string>): string | null {
-  const filtered = sceneTokens
-    .map((t) => t.trim().toLowerCase())
-    .filter((t) => t.length >= 4)
-    .filter(
-      (t) =>
-        ![
-          "park",
-          "tree",
-          "trees",
-          "grass",
-          "building",
-          "house",
-          "outdoor",
-          "exterior",
-          "interior",
-          "background",
-        ].includes(t),
-    );
-  if (filtered.length === 0) return null;
-  return [...filtered].sort((a, b) => b.length - a.length)[0]!;
+/**
+ * Build the RIDB ?query= keyword string from scene_tokens. The RIDB
+ * full-text search runs over FacilityName + FacilityDescription +
+ * Keywords (and the equivalent for RecAreas); like MediaWiki it does
+ * an OR-style match so a multi-token query gives strictly higher
+ * recall than the single-longest token we sent before.
+ */
+function extractRidbQuery(sceneTokens: ReadonlyArray<string>): {
+  joined: string | null;
+  list: string[];
+} {
+  const { list, joined } = extractKeywords(sceneTokens, {
+    minLength: 4,
+    maxTokens: 3,
+  });
+  return { joined: joined.length > 0 ? joined : null, list };
 }
 
 function facilityToCandidate(f: Facility): RawCandidate | null {
@@ -248,6 +244,106 @@ function recAreaToCandidate(r: RecArea): RawCandidate | null {
   };
 }
 
+// ---------------------------------------------------------------------------
+// /media endpoint — per-facility / per-recarea media list. Returns more
+// images than the embedded `MEDIA[]` field on the parent record, with
+// titles + credits. Used at card-time by the enrich-locations route to
+// build a richer photos carousel.
+// ---------------------------------------------------------------------------
+
+const mediaItemSchema = z.object({
+  EntityMediaID: z.union([z.string(), z.number()]).transform((v) => String(v)),
+  EntityID: z.union([z.string(), z.number()]).optional().transform((v) =>
+    v == null ? null : String(v),
+  ),
+  EntityType: z.string().optional(),
+  MediaType: z.string().optional(),
+  URL: z.string().optional(),
+  Title: z.string().optional(),
+  Subtitle: z.string().optional(),
+  Description: z.string().optional(),
+  Credits: z.string().optional(),
+  IsPrimary: z.boolean().optional(),
+  IsPreview: z.boolean().optional(),
+});
+
+export type RidbMedia = {
+  id: string;
+  url: string;
+  title: string | null;
+  credit: string | null;
+  isPrimary: boolean;
+};
+
+const mediaResponseSchema = z.object({
+  RECDATA: z.array(mediaItemSchema).default([]),
+});
+
+/**
+ * Fetch the media list for a single RIDB entity (facility or recarea).
+ * Cached 14 days. Returns up to ~20 images per entity (the API caps at
+ * 50; we trim to keep payloads light). When the API key is missing or
+ * the entity has no media we return an empty array silently.
+ */
+export async function fetchRidbMedia(input: {
+  entityKind: "facilities" | "recareas";
+  entityId: string;
+}): Promise<RidbMedia[]> {
+  if (!env.RIDB_API_KEY) return [];
+  const cKey = cacheKey("ridb:dataset", {
+    kind: "media",
+    entityKind: input.entityKind,
+    entityId: input.entityId,
+  });
+  const cached = await cacheGet<RidbMedia[]>(cKey);
+  if (cached) return cached;
+
+  const url = new URL(`${RIDB_BASE}/${input.entityKind}/${input.entityId}/media`);
+  url.searchParams.set("limit", "20");
+  url.searchParams.set("apikey", env.RIDB_API_KEY ?? "");
+
+  try {
+    const res = await fetch(url, {
+      headers: env.RIDB_API_KEY ? { "X-Api-Key": env.RIDB_API_KEY } : {},
+      signal: AbortSignal.timeout(RIDB_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      await cacheSet(cKey, "ridb:dataset", [], 1);
+      return [];
+    }
+    const raw = await res.json();
+    const parsed = mediaResponseSchema.safeParse(raw);
+    if (!parsed.success) {
+      await cacheSet(cKey, "ridb:dataset", [], 1);
+      return [];
+    }
+    const out: RidbMedia[] = [];
+    for (const m of parsed.data.RECDATA) {
+      if (!m.URL) continue;
+      // RIDB returns videos / pdfs / fact sheets too; keep only images.
+      if (m.MediaType && !m.MediaType.toLowerCase().includes("image")) continue;
+      out.push({
+        id: m.EntityMediaID,
+        url: m.URL,
+        title: m.Title ?? m.Subtitle ?? null,
+        credit: m.Credits ?? null,
+        isPrimary: m.IsPrimary ?? false,
+      });
+    }
+    // Sort primary-first so callers can use [0] as the canonical image.
+    out.sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary));
+    await cacheSet(cKey, "ridb:dataset", out, 14);
+    return out;
+  } catch (err) {
+    logger.warn("ridb media fetch failed", {
+      entityKind: input.entityKind,
+      entityId: input.entityId,
+      err: String(err),
+    });
+    return [];
+  }
+}
+
 export const ridbRecreationProvider: CandidateProvider = {
   name: "ridb-recreation",
   // Federal recreation data is US-only; the radius search just won't
@@ -264,35 +360,59 @@ export const ridbRecreationProvider: CandidateProvider = {
       // Run unfiltered + keyword-filtered passes in parallel. The
       // unfiltered slice maintains broad coverage; the keyword slice
       // surfaces specific hits that wouldn't fit in the page cap.
-      const fetches: Array<Promise<Facility[] | RecArea[]>> = [
+      // We also fan out per-token slices when the user's prompt has
+      // multiple distinctive nouns to insure against BM25 dominance
+      // collapses (one keyword suppressing the other in ranking).
+      const facilityFetches: Array<Promise<Facility[]>> = [
         fetchPagedRidb<Facility>("facilities", input.bbox, facilityResponseSchema),
+      ];
+      const recAreaFetches: Array<Promise<RecArea[]>> = [
         fetchPagedRidb<RecArea>("recareas", input.bbox, recAreaResponseSchema),
       ];
-      if (ridbQuery) {
-        fetches.push(
+      if (ridbQuery.joined) {
+        facilityFetches.push(
           fetchPagedRidb<Facility>(
             "facilities",
             input.bbox,
             facilityResponseSchema,
-            ridbQuery,
+            ridbQuery.joined,
           ),
+        );
+        recAreaFetches.push(
           fetchPagedRidb<RecArea>(
             "recareas",
             input.bbox,
             recAreaResponseSchema,
-            ridbQuery,
+            ridbQuery.joined,
           ),
         );
+        if (ridbQuery.list.length > 1) {
+          for (const tok of ridbQuery.list) {
+            facilityFetches.push(
+              fetchPagedRidb<Facility>(
+                "facilities",
+                input.bbox,
+                facilityResponseSchema,
+                tok,
+              ),
+            );
+            recAreaFetches.push(
+              fetchPagedRidb<RecArea>(
+                "recareas",
+                input.bbox,
+                recAreaResponseSchema,
+                tok,
+              ),
+            );
+          }
+        }
       }
-      const all = await Promise.all(fetches);
-      const facilities: Facility[] = [
-        ...(all[0] as Facility[]),
-        ...((all[2] as Facility[] | undefined) ?? []),
-      ];
-      const recAreas: RecArea[] = [
-        ...(all[1] as RecArea[]),
-        ...((all[3] as RecArea[] | undefined) ?? []),
-      ];
+      const [facilityChunks, recAreaChunks] = await Promise.all([
+        Promise.all(facilityFetches),
+        Promise.all(recAreaFetches),
+      ]);
+      const facilities: Facility[] = facilityChunks.flat();
+      const recAreas: RecArea[] = recAreaChunks.flat();
 
       const out: RawCandidate[] = [];
       for (const f of facilities) {

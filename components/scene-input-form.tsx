@@ -79,6 +79,20 @@ type AssociatedFilm = {
   imdbId: string | null;
 };
 
+type WikidataFactsClient = {
+  inception: string | null;
+  creators: ReadonlyArray<string>;
+  architects: ReadonlyArray<string>;
+  materials: ReadonlyArray<string>;
+  genres: ReadonlyArray<string>;
+  depicts: ReadonlyArray<string>;
+  namedAfter: ReadonlyArray<string>;
+  partOf: ReadonlyArray<string>;
+  hasParts: ReadonlyArray<string>;
+  commonsCategory: string | null;
+  altLabels: ReadonlyArray<string>;
+};
+
 type RankedCandidate = OsmCandidate & {
   distanceMeters: number;
   // Phase 2a additions, all optional for backwards compat with cached entries.
@@ -88,6 +102,14 @@ type RankedCandidate = OsmCandidate & {
   knownImageUrl?: string | null;
   associatedFilms?: ReadonlyArray<AssociatedFilm>;
   sourceUrl?: string | null;
+  /** Optional Wikidata facts, populated when any source had a Q-id. */
+  wikidataFacts?: WikidataFactsClient;
+};
+
+type ProviderStat = {
+  count: number;
+  ms: number;
+  error: string | null;
 };
 
 type SearchOsmResponse = {
@@ -109,6 +131,8 @@ type SearchOsmResponse = {
   alternativesTried: number;
   alternativesSucceeded: number;
   highConfidence?: boolean;
+  /** Per-provider source counts + timing, used by the debug panel. */
+  providerStats?: Partial<Record<ProviderName, ProviderStat>>;
 };
 
 type SelectedPhoto = {
@@ -119,6 +143,10 @@ type SelectedPhoto = {
   attributionHref: string | null;
   visionScore: number | null;
   visionReason: string | null;
+  /** Mapillary-only enrichment fields. */
+  isPanorama?: boolean;
+  qualityScore?: number | null;
+  compassAngle?: number | null;
 };
 
 type SurfacedFilm = {
@@ -154,6 +182,8 @@ type EnrichedLocation = {
   description: string | null;
   sourceUrl: string | null;
   films: ReadonlyArray<SurfacedFilm>;
+  /** Optional Wikidata facts (year built, sculptor, material, ...). */
+  wikidataFacts?: WikidataFactsClient;
 };
 
 type EnrichResponse = {
@@ -230,6 +260,7 @@ async function enrichLocationsRequest(input: {
     knownImageUrl?: string | null;
     associatedFilms?: ReadonlyArray<AssociatedFilm>;
     sourceUrl?: string | null;
+    wikidataFacts?: WikidataFactsClient;
   }>;
   searchCenter?: { lat: number; lng: number };
   searchBbox?: { south: number; west: number; north: number; east: number };
@@ -504,6 +535,7 @@ export function SceneInputForm({
           knownImageUrl: c.knownImageUrl,
           associatedFilms: c.associatedFilms,
           sourceUrl: c.sourceUrl,
+          wikidataFacts: c.wikidataFacts,
         })),
         searchCenter: osm.center,
         searchBbox: osm.bbox,
@@ -863,7 +895,51 @@ function SearchSummaryPanel({
       </header>
 
       {osm.matchMode !== "strict" && <RelaxationExplainer osm={osm} />}
+      <ProviderStatsPanel stats={osm.providerStats} />
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ProviderStatsPanel — surfaces per-provider candidate counts and timing
+// so users see at a glance which sources contributed (and which silently
+// returned zero — usually because the optional API key is missing or the
+// bbox is non-US).
+// ---------------------------------------------------------------------------
+
+function ProviderStatsPanel({
+  stats,
+}: {
+  stats?: SearchOsmResponse["providerStats"];
+}) {
+  if (!stats) return null;
+  const entries = (Object.entries(stats) as Array<[ProviderName, ProviderStat]>)
+    .filter(([, v]) => v && (v.count > 0 || v.error))
+    .sort((a, b) => b[1].count - a[1].count);
+  if (entries.length === 0) return null;
+  return (
+    <details className="text-xs text-muted-foreground">
+      <summary className="cursor-pointer select-none">
+        Sources ({entries.reduce((acc, [, v]) => acc + v.count, 0)} candidates from
+        {" "}{entries.length} provider{entries.length === 1 ? "" : "s"})
+      </summary>
+      <ul className="mt-2 grid gap-1 sm:grid-cols-2">
+        {entries.map(([name, v]) => (
+          <li
+            key={name}
+            className="flex items-center justify-between gap-2 rounded bg-white/5 px-2 py-1"
+          >
+            <span className="font-medium text-foreground/80">{name}</span>
+            <span className="tabular-nums">
+              {v.count} · {v.ms}ms
+              {v.error && (
+                <span className="ml-1 text-rose-300" title={v.error}>· error</span>
+              )}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
@@ -964,6 +1040,22 @@ function ResultCardsPanel({
               description={loc.description ?? undefined}
               sourceUrl={loc.sourceUrl ?? undefined}
               films={loc.films}
+              facts={
+                loc.wikidataFacts
+                  ? {
+                      inception: loc.wikidataFacts.inception ?? undefined,
+                      creators: loc.wikidataFacts.creators,
+                      architects: loc.wikidataFacts.architects,
+                      materials: loc.wikidataFacts.materials,
+                      genres: loc.wikidataFacts.genres,
+                      depicts: loc.wikidataFacts.depicts,
+                      namedAfter: loc.wikidataFacts.namedAfter,
+                      partOf: loc.wikidataFacts.partOf,
+                      commonsCategory:
+                        loc.wikidataFacts.commonsCategory ?? undefined,
+                    }
+                  : undefined
+              }
             />
           ))}
         </div>

@@ -5,6 +5,7 @@ import { nycScenesProvider } from "@/lib/providers/nyc-scenes";
 import { ownDbProvider } from "@/lib/providers/own-db";
 import { ridbRecreationProvider } from "@/lib/providers/ridb-recreation";
 import { sfFilmLocationsProvider } from "@/lib/providers/sf-films";
+import { socrataMunicipalProvider } from "@/lib/providers/socrata-municipal";
 import type {
   CandidateProvider,
   ProviderInput,
@@ -54,6 +55,10 @@ export const DEFAULT_CONTENT_PROVIDERS: ReadonlyArray<CandidateProvider> = [
   npsPlacesProvider,
   ridbRecreationProvider,
   unescoHeritageProvider,
+  // Socrata municipal datasets — NYC public art / landmarks, SF
+  // historic sites, Chicago landmarks. Empty fast-path when bbox
+  // doesn't overlap any registered dataset.
+  socrataMunicipalProvider,
 ];
 
 export const FILM_HISTORY_PROVIDERS: ReadonlyArray<CandidateProvider> = [

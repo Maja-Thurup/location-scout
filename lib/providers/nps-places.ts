@@ -3,6 +3,7 @@ import { z } from "zod";
 import { isBboxOverlapping, type Bbox } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { env } from "@/lib/env";
+import { extractKeywords } from "@/lib/providers/keywords";
 import { logger } from "@/lib/logger";
 import type {
   CandidateProvider,
@@ -196,32 +197,24 @@ async function fetchPlacesForState(
 }
 
 /**
- * Pull a single keyword from scene_tokens for the NPS ?q= param. NPS
- * search is a single-string query against title+body; we pick the
- * longest non-generic token (proxy for "most distinctive").
+ * Build the NPS ?q= keyword string from scene_tokens. NPS full-text
+ * search runs OR-style BM25 over title + bodyText, so a multi-word
+ * query gives much better recall than picking a single token: for
+ * "horse statue" we now send "statue horse" instead of just "statue".
+ *
+ * Returns the joined query AND the individual token list so the caller
+ * can also fan out per-token requests when each one is highly
+ * discriminative (e.g. ["lighthouse"] alone is enough).
  */
-function extractNpsQuery(sceneTokens: ReadonlyArray<string>): string | null {
-  const filtered = sceneTokens
-    .map((t) => t.trim().toLowerCase())
-    .filter((t) => t.length >= 4)
-    .filter(
-      (t) =>
-        ![
-          "park",
-          "tree",
-          "trees",
-          "grass",
-          "building",
-          "house",
-          "outdoor",
-          "exterior",
-          "interior",
-          "background",
-        ].includes(t),
-    );
-  if (filtered.length === 0) return null;
-  const longest = [...filtered].sort((a, b) => b.length - a.length)[0]!;
-  return longest;
+function extractNpsQuery(sceneTokens: ReadonlyArray<string>): {
+  joined: string | null;
+  list: string[];
+} {
+  const { list, joined } = extractKeywords(sceneTokens, {
+    minLength: 4,
+    maxTokens: 3,
+  });
+  return { joined: joined.length > 0 ? joined : null, list };
 }
 
 function placeCoord(p: Place): { lat: number; lng: number } | null {
@@ -240,7 +233,7 @@ function placeToCandidate(p: Place): RawCandidate | null {
     p.listingDescription ??
     (p.bodyText ? p.bodyText.slice(0, 280).replace(/\s+/g, " ") : null);
   const image = p.images?.find((i) => i.url)?.url ?? null;
-  const tags: Record<string, string> = { "nps:place_id": p.id };
+  const tags: Record<string, string> = { "nps:place_id": p.id, "nps:type": "place" };
   if (p.tags && p.tags.length > 0) {
     tags["nps:tags"] = p.tags.slice(0, 6).join(", ");
   }
@@ -248,7 +241,7 @@ function placeToCandidate(p: Place): RawCandidate | null {
     tags["nps:park_code"] = p.relatedParks[0]!.parkCode;
   }
   return {
-    externalId: p.id,
+    externalId: `place-${p.id}`,
     source: "nps-places",
     lat: coord.lat,
     lng: coord.lng,
@@ -258,6 +251,416 @@ function placeToCandidate(p: Place): RawCandidate | null {
     tags,
     associatedFilms: [],
     sourceUrl: p.url ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /parks endpoint — full national parks with at least 5 photos each.
+// Adds wide coverage for natural / historical sites where /places is
+// sparse: Yellowstone, Yosemite, Independence Hall, etc. Lat/lng on
+// the park record is the headquarters / canonical center.
+// ---------------------------------------------------------------------------
+
+const parkSchema = z.object({
+  id: z.string(),
+  parkCode: z.string(),
+  fullName: z.string(),
+  description: z.string().optional(),
+  designation: z.string().optional(),
+  states: z.string().optional(),
+  latitude: z.string().optional(),
+  longitude: z.string().optional(),
+  url: z.string().optional(),
+  images: z.array(placeImageSchema).optional(),
+});
+type Park = z.infer<typeof parkSchema>;
+
+const parksResponseSchema = z.object({
+  total: z.union([z.string(), z.number()]).optional(),
+  data: z.array(parkSchema).default([]),
+});
+
+async function fetchParksForState(
+  state: string,
+  query?: string,
+): Promise<Park[]> {
+  const cKey = cacheKey("nps:dataset", { kind: "parks", state, q: query ?? "" });
+  const cached = await cacheGet<Park[]>(cKey);
+  if (cached) return cached;
+  const url = new URL(`${NPS_BASE}/parks`);
+  url.searchParams.set("stateCode", state);
+  url.searchParams.set("limit", String(NPS_PAGE_LIMIT));
+  if (query) url.searchParams.set("q", query.trim());
+  url.searchParams.set("api_key", env.NPS_API_KEY ?? "");
+  try {
+    const res = await fetch(url, {
+      headers: env.NPS_API_KEY ? { "X-Api-Key": env.NPS_API_KEY } : {},
+      signal: AbortSignal.timeout(NPS_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    const raw = await res.json();
+    const parsed = parksResponseSchema.safeParse(raw);
+    if (!parsed.success) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    await cacheSet(cKey, "nps:dataset", parsed.data.data, 14);
+    return parsed.data.data;
+  } catch (err) {
+    logger.warn("nps parks fetch failed", { state, err: String(err) });
+    return [];
+  }
+}
+
+function parkToCandidate(p: Park): RawCandidate | null {
+  if (!p.latitude || !p.longitude) return null;
+  const lat = Number(p.latitude);
+  const lng = Number(p.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat === 0 && lng === 0) return null;
+  const image = p.images?.find((i) => i.url)?.url ?? null;
+  const tags: Record<string, string> = {
+    "nps:park_code": p.parkCode,
+    "nps:type": "park",
+  };
+  if (p.designation) tags["nps:designation"] = p.designation;
+  if (p.states) tags["nps:states"] = p.states;
+  return {
+    externalId: `park-${p.id}`,
+    source: "nps-places",
+    lat,
+    lng,
+    name: p.fullName,
+    description: p.description?.slice(0, 280) ?? null,
+    knownImageUrl: image,
+    tags,
+    associatedFilms: [],
+    sourceUrl: p.url ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /articles endpoint — themed content articles, one of NPS's
+// highest-quality narrative sources. "Civil War battlefields" /
+// "Lighthouses of New England" / "Buffalo herds in the West" type
+// listicles, each with hand-curated images and bodies. We attach
+// each article that has a related park's coords (or a placement
+// lat/lng — many articles do) as a candidate.
+// ---------------------------------------------------------------------------
+
+const articleSchema = z.object({
+  id: z.string(),
+  url: z.string().optional(),
+  title: z.string(),
+  listingDescription: z.string().optional(),
+  bodyText: z.string().optional(),
+  geometryPoiId: z.string().optional(),
+  images: z.array(placeImageSchema).optional(),
+  // Articles have lat/lng either as siteAccessLocations[].coords or as
+  // a single latitude/longitude pair on the relatedParks. We try both.
+  latitude: z.string().optional(),
+  longitude: z.string().optional(),
+  relatedParks: z
+    .array(
+      z.object({
+        parkCode: z.string(),
+        latitude: z.string().optional(),
+        longitude: z.string().optional(),
+      }),
+    )
+    .optional(),
+  tags: z.array(z.string()).optional(),
+});
+type Article = z.infer<typeof articleSchema>;
+
+const articlesResponseSchema = z.object({
+  data: z.array(articleSchema).default([]),
+});
+
+async function fetchArticlesForState(
+  state: string,
+  query?: string,
+): Promise<Article[]> {
+  const cKey = cacheKey("nps:dataset", { kind: "articles", state, q: query ?? "" });
+  const cached = await cacheGet<Article[]>(cKey);
+  if (cached) return cached;
+  const url = new URL(`${NPS_BASE}/articles`);
+  url.searchParams.set("stateCode", state);
+  url.searchParams.set("limit", String(NPS_PAGE_LIMIT));
+  if (query) url.searchParams.set("q", query.trim());
+  url.searchParams.set("api_key", env.NPS_API_KEY ?? "");
+  try {
+    const res = await fetch(url, {
+      headers: env.NPS_API_KEY ? { "X-Api-Key": env.NPS_API_KEY } : {},
+      signal: AbortSignal.timeout(NPS_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    const raw = await res.json();
+    const parsed = articlesResponseSchema.safeParse(raw);
+    if (!parsed.success) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    await cacheSet(cKey, "nps:dataset", parsed.data.data, 14);
+    return parsed.data.data;
+  } catch (err) {
+    logger.warn("nps articles fetch failed", { state, err: String(err) });
+    return [];
+  }
+}
+
+function articleCoord(a: Article): { lat: number; lng: number } | null {
+  if (a.latitude && a.longitude) {
+    const lat = Number(a.latitude);
+    const lng = Number(a.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lng) && (lat || lng)) {
+      return { lat, lng };
+    }
+  }
+  for (const rp of a.relatedParks ?? []) {
+    if (rp.latitude && rp.longitude) {
+      const lat = Number(rp.latitude);
+      const lng = Number(rp.longitude);
+      if (Number.isFinite(lat) && Number.isFinite(lng) && (lat || lng)) {
+        return { lat, lng };
+      }
+    }
+  }
+  return null;
+}
+
+function articleToCandidate(a: Article): RawCandidate | null {
+  const coord = articleCoord(a);
+  if (!coord) return null;
+  const description =
+    a.listingDescription ??
+    (a.bodyText ? a.bodyText.slice(0, 280).replace(/\s+/g, " ") : null);
+  const image = a.images?.find((i) => i.url)?.url ?? null;
+  const tags: Record<string, string> = {
+    "nps:article_id": a.id,
+    "nps:type": "article",
+  };
+  if (a.tags && a.tags.length > 0) {
+    tags["nps:tags"] = a.tags.slice(0, 6).join(", ");
+  }
+  return {
+    externalId: `article-${a.id}`,
+    source: "nps-places",
+    lat: coord.lat,
+    lng: coord.lng,
+    name: a.title,
+    description,
+    knownImageUrl: image,
+    tags,
+    associatedFilms: [],
+    sourceUrl: a.url ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /people endpoint — historical figures and biographical entries with
+// portraits + biographies. Connects "statue of Lincoln" to NPS's own
+// Lincoln biography (with portrait photo) when prompts mention named
+// people. Geographic anchor is the park associated with the person.
+// ---------------------------------------------------------------------------
+
+const personSchema = z.object({
+  id: z.string(),
+  url: z.string().optional(),
+  title: z.string(),
+  listingDescription: z.string().optional(),
+  bodyText: z.string().optional(),
+  images: z.array(placeImageSchema).optional(),
+  latitude: z.string().optional(),
+  longitude: z.string().optional(),
+  relatedParks: z
+    .array(
+      z.object({
+        parkCode: z.string(),
+        latitude: z.string().optional(),
+        longitude: z.string().optional(),
+      }),
+    )
+    .optional(),
+  tags: z.array(z.string()).optional(),
+});
+type Person = z.infer<typeof personSchema>;
+
+const peopleResponseSchema = z.object({
+  data: z.array(personSchema).default([]),
+});
+
+async function fetchPeopleForState(
+  state: string,
+  query?: string,
+): Promise<Person[]> {
+  const cKey = cacheKey("nps:dataset", { kind: "people", state, q: query ?? "" });
+  const cached = await cacheGet<Person[]>(cKey);
+  if (cached) return cached;
+  const url = new URL(`${NPS_BASE}/people`);
+  url.searchParams.set("stateCode", state);
+  url.searchParams.set("limit", String(NPS_PAGE_LIMIT));
+  if (query) url.searchParams.set("q", query.trim());
+  url.searchParams.set("api_key", env.NPS_API_KEY ?? "");
+  try {
+    const res = await fetch(url, {
+      headers: env.NPS_API_KEY ? { "X-Api-Key": env.NPS_API_KEY } : {},
+      signal: AbortSignal.timeout(NPS_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    const raw = await res.json();
+    const parsed = peopleResponseSchema.safeParse(raw);
+    if (!parsed.success) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    await cacheSet(cKey, "nps:dataset", parsed.data.data, 14);
+    return parsed.data.data;
+  } catch (err) {
+    logger.warn("nps people fetch failed", { state, err: String(err) });
+    return [];
+  }
+}
+
+function personCoord(p: Person): { lat: number; lng: number } | null {
+  if (p.latitude && p.longitude) {
+    const lat = Number(p.latitude);
+    const lng = Number(p.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lng) && (lat || lng)) {
+      return { lat, lng };
+    }
+  }
+  for (const rp of p.relatedParks ?? []) {
+    if (rp.latitude && rp.longitude) {
+      const lat = Number(rp.latitude);
+      const lng = Number(rp.longitude);
+      if (Number.isFinite(lat) && Number.isFinite(lng) && (lat || lng)) {
+        return { lat, lng };
+      }
+    }
+  }
+  return null;
+}
+
+function personToCandidate(p: Person): RawCandidate | null {
+  const coord = personCoord(p);
+  if (!coord) return null;
+  const description =
+    p.listingDescription ??
+    (p.bodyText ? p.bodyText.slice(0, 280).replace(/\s+/g, " ") : null);
+  const image = p.images?.find((i) => i.url)?.url ?? null;
+  return {
+    externalId: `person-${p.id}`,
+    source: "nps-places",
+    lat: coord.lat,
+    lng: coord.lng,
+    name: p.title,
+    description,
+    knownImageUrl: image,
+    tags: {
+      "nps:person_id": p.id,
+      "nps:type": "person",
+      ...(p.tags && p.tags.length > 0
+        ? { "nps:tags": p.tags.slice(0, 6).join(", ") }
+        : {}),
+    },
+    associatedFilms: [],
+    sourceUrl: p.url ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /campgrounds endpoint — campgrounds with location, amenities,
+// accessibility info, and curated photos. Useful for wilderness /
+// "secluded campsite by a river" prompts.
+// ---------------------------------------------------------------------------
+
+const campgroundSchema = z.object({
+  id: z.string(),
+  url: z.string().optional(),
+  name: z.string(),
+  description: z.string().optional(),
+  latitude: z.string().optional(),
+  longitude: z.string().optional(),
+  parkCode: z.string().optional(),
+  images: z.array(placeImageSchema).optional(),
+});
+type Campground = z.infer<typeof campgroundSchema>;
+
+const campgroundsResponseSchema = z.object({
+  data: z.array(campgroundSchema).default([]),
+});
+
+async function fetchCampgroundsForState(
+  state: string,
+  query?: string,
+): Promise<Campground[]> {
+  const cKey = cacheKey("nps:dataset", {
+    kind: "campgrounds",
+    state,
+    q: query ?? "",
+  });
+  const cached = await cacheGet<Campground[]>(cKey);
+  if (cached) return cached;
+  const url = new URL(`${NPS_BASE}/campgrounds`);
+  url.searchParams.set("stateCode", state);
+  url.searchParams.set("limit", String(NPS_PAGE_LIMIT));
+  if (query) url.searchParams.set("q", query.trim());
+  url.searchParams.set("api_key", env.NPS_API_KEY ?? "");
+  try {
+    const res = await fetch(url, {
+      headers: env.NPS_API_KEY ? { "X-Api-Key": env.NPS_API_KEY } : {},
+      signal: AbortSignal.timeout(NPS_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    const raw = await res.json();
+    const parsed = campgroundsResponseSchema.safeParse(raw);
+    if (!parsed.success) {
+      await cacheSet(cKey, "nps:dataset", [], 1);
+      return [];
+    }
+    await cacheSet(cKey, "nps:dataset", parsed.data.data, 14);
+    return parsed.data.data;
+  } catch (err) {
+    logger.warn("nps campgrounds fetch failed", { state, err: String(err) });
+    return [];
+  }
+}
+
+function campgroundToCandidate(c: Campground): RawCandidate | null {
+  if (!c.latitude || !c.longitude) return null;
+  const lat = Number(c.latitude);
+  const lng = Number(c.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat === 0 && lng === 0) return null;
+  const image = c.images?.find((i) => i.url)?.url ?? null;
+  return {
+    externalId: `campground-${c.id}`,
+    source: "nps-places",
+    lat,
+    lng,
+    name: c.name,
+    description: c.description?.slice(0, 280) ?? null,
+    knownImageUrl: image,
+    tags: {
+      "nps:campground_id": c.id,
+      "nps:type": "campground",
+      ...(c.parkCode ? { "nps:park_code": c.parkCode } : {}),
+    },
+    associatedFilms: [],
+    sourceUrl: c.url ?? null,
   };
 }
 
@@ -283,23 +686,48 @@ export const npsPlacesProvider: CandidateProvider = {
 
     const npsQuery = extractNpsQuery(input.sceneTokens);
 
-    const allPlaces: Place[] = [];
-    try {
-      // Always fetch the broad state slice; ALSO fetch a keyword-
-      // narrowed slice when scene_tokens give us something distinctive.
-      // The keyword slice surfaces hits that wouldn't fit in the 200-
-      // result state cap (e.g. a specific obscure equestrian statue).
-      const fetches: Array<Promise<Place[]>> = [];
+    /**
+     * Build the per-state fetch fan-out for one endpoint. Always
+     * fetches the broad state slice; layers a combined-OR query and
+     * per-token queries when scene_tokens are distinctive.
+     */
+    function fanOut<T>(
+      fetchFn: (state: string, query?: string) => Promise<T[]>,
+    ): Array<Promise<T[]>> {
+      const fetches: Array<Promise<T[]>> = [];
       for (const s of states) {
-        fetches.push(fetchPlacesForState(s).catch(() => []));
-        if (npsQuery) {
-          fetches.push(fetchPlacesForState(s, npsQuery).catch(() => []));
+        fetches.push(fetchFn(s).catch(() => []));
+        if (npsQuery.joined) {
+          fetches.push(fetchFn(s, npsQuery.joined).catch(() => []));
+          if (npsQuery.list.length > 1) {
+            for (const tok of npsQuery.list) {
+              fetches.push(fetchFn(s, tok).catch(() => []));
+            }
+          }
         }
       }
-      const results = await Promise.all(fetches);
-      for (const list of results) {
-        allPlaces.push(...list);
-      }
+      return fetches;
+    }
+
+    const allPlaces: Place[] = [];
+    const allParks: Park[] = [];
+    const allArticles: Article[] = [];
+    const allPeople: Person[] = [];
+    const allCampgrounds: Campground[] = [];
+    try {
+      const [placesResults, parksResults, articlesResults, peopleResults, campResults] =
+        await Promise.all([
+          Promise.all(fanOut<Place>(fetchPlacesForState)),
+          Promise.all(fanOut<Park>(fetchParksForState)),
+          Promise.all(fanOut<Article>(fetchArticlesForState)),
+          Promise.all(fanOut<Person>(fetchPeopleForState)),
+          Promise.all(fanOut<Campground>(fetchCampgroundsForState)),
+        ]);
+      for (const list of placesResults) allPlaces.push(...list);
+      for (const list of parksResults) allParks.push(...list);
+      for (const list of articlesResults) allArticles.push(...list);
+      for (const list of peopleResults) allPeople.push(...list);
+      for (const list of campResults) allCampgrounds.push(...list);
     } catch (err) {
       return {
         candidates: [],
@@ -308,24 +736,65 @@ export const npsPlacesProvider: CandidateProvider = {
       };
     }
 
+    /**
+     * Apply the bbox filter to a candidate that has lat/lng already
+     * normalised. Drops out-of-area entries silently (per-state
+     * fetches are union-of-state, not bbox-bound).
+     */
+    function inBbox(c: { lat: number; lng: number } | null): boolean {
+      if (!c) return false;
+      return (
+        c.lat >= input.bbox.south &&
+        c.lat <= input.bbox.north &&
+        c.lng >= input.bbox.west &&
+        c.lng <= input.bbox.east
+      );
+    }
+
     const out: RawCandidate[] = [];
     const seen = new Set<string>();
+
     for (const place of allPlaces) {
-      if (seen.has(place.id)) continue;
-      seen.add(place.id);
-      const coord = placeCoord(place);
-      if (!coord) continue;
-      // In-bbox filter.
-      if (
-        coord.lat < input.bbox.south ||
-        coord.lat > input.bbox.north ||
-        coord.lng < input.bbox.west ||
-        coord.lng > input.bbox.east
-      ) {
-        continue;
-      }
+      const dedupeKey = `place-${place.id}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      if (!inBbox(placeCoord(place))) continue;
       const c = placeToCandidate(place);
       if (c) out.push(c);
+    }
+
+    for (const park of allParks) {
+      const dedupeKey = `park-${park.id}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      const c = parkToCandidate(park);
+      if (c && inBbox({ lat: c.lat, lng: c.lng })) out.push(c);
+    }
+
+    for (const article of allArticles) {
+      const dedupeKey = `article-${article.id}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      if (!inBbox(articleCoord(article))) continue;
+      const c = articleToCandidate(article);
+      if (c) out.push(c);
+    }
+
+    for (const person of allPeople) {
+      const dedupeKey = `person-${person.id}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      if (!inBbox(personCoord(person))) continue;
+      const c = personToCandidate(person);
+      if (c) out.push(c);
+    }
+
+    for (const camp of allCampgrounds) {
+      const dedupeKey = `campground-${camp.id}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      const c = campgroundToCandidate(camp);
+      if (c && inBbox({ lat: c.lat, lng: c.lng })) out.push(c);
     }
 
     return { candidates: out, elapsedMs: Date.now() - t0, error: null };
