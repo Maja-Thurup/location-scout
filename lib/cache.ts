@@ -35,7 +35,16 @@ export type CacheNamespace =
   /** Recreation.gov RIDB facilities + recareas results. */
   | "ridb:dataset"
   /** UNESCO World Heritage Sites (full snapshot, refreshed monthly). */
-  | "unesco:dataset";
+  | "unesco:dataset"
+  // ---- Multi-tier provider expansion (M8) ----
+  /** Mapillary coverage tile checks (low-zoom protobuf body sizes). */
+  | "mapillary:coverage"
+  /** Wikidata REST API single-Q-item enrichment. */
+  | "wikidata:rest"
+  /** taginfo OpenStreetMap statistics responses. */
+  | "taginfo"
+  /** Generic Socrata SoQL query results across NYC / SF / Chicago. */
+  | "socrata";
 
 export type TTLDays = 1 | 7 | 14 | 30 | 90 | 365;
 

@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { logger } from "@/lib/logger";
+import { extractKeywords } from "@/lib/providers/keywords";
 import type {
   CandidateProvider,
   ProviderInput,
@@ -231,45 +232,18 @@ function pageToCandidate(
 
 /**
  * Build the keyword string for the full-text search from scene_tokens.
- * We OR-combine the strongest signals: distinctive single-word tokens
- * plus the longest phrase token. MediaWiki's search uses BM25 internally
- * so an OR query with the user's actual words gives much better recall
- * than an AND-of-everything query that would no-op when one word is rare.
+ * Delegates to the shared multi-token helper so NPS, RIDB, and we all
+ * speak the same dialect — top-3 distinctive tokens, joined with
+ * spaces. MediaWiki's BM25 ranks pages by how many of these tokens
+ * hit; a multi-token query gives strictly higher recall than picking
+ * a single longest token.
  */
 function buildSearchTerm(sceneTokens: ReadonlyArray<string>): string | null {
-  if (sceneTokens.length === 0) return null;
-  // De-dupe and lowercase.
-  const uniq = Array.from(
-    new Set(sceneTokens.map((t) => t.trim().toLowerCase()).filter((t) => t.length > 0)),
-  );
-  // Strip generic background tokens we know don't discriminate.
-  const filtered = uniq.filter(
-    (t) =>
-      ![
-        "the",
-        "a",
-        "an",
-        "of",
-        "in",
-        "with",
-        "and",
-        "or",
-        "park",
-        "tree",
-        "trees",
-        "grass",
-        "sky",
-        "background",
-        "outdoor",
-        "exterior",
-        "interior",
-        "building",
-      ].includes(t),
-  );
-  if (filtered.length === 0) return null;
-  // Pick the 3 most distinctive tokens by length (rough proxy for IDF).
-  const ranked = [...filtered].sort((a, b) => b.length - a.length).slice(0, 3);
-  return ranked.join(" ");
+  const { joined } = extractKeywords(sceneTokens, {
+    minLength: 3,
+    maxTokens: 3,
+  });
+  return joined.length > 0 ? joined : null;
 }
 
 export const wikipediaGeosearchProvider: CandidateProvider = {

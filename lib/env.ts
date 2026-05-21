@@ -71,6 +71,16 @@ const serverEnvSchema = z.object({
    * ID" 25-char string).
    */
   SOCRATA_APP_TOKEN: z.string().optional(),
+  /**
+   * Socrata App Token Secret. Pairs with SOCRATA_APP_TOKEN for the
+   * privileged Basic Auth flow that lifts per-token rate limits and
+   * unlocks private datasets. Optional — when absent we fall back to
+   * unauthenticated `?$$app_token=...` query-string mode.
+   *
+   * Get from the same developer-settings page — the "Secret Token"
+   * field shown alongside the App Token / Key ID.
+   */
+  SOCRATA_APP_TOKEN_SECRET: z.string().optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;
