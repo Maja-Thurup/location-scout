@@ -16,7 +16,6 @@ import type {
  *
  * Rationale (most-priority first):
  * - NYC Scenes from the City: book-curated, hand-verified iconic scenes
- * - UNESCO World Heritage: 1,248 globally significant places (handpicked)
  * - SF Film Locations: curated municipal dataset
  * - NPS /places: curated US national park / scenic place metadata
  * - Wikidata P915: structured film-location property, citation-backed
@@ -36,7 +35,6 @@ const SOURCE_PRIORITY: ReadonlyArray<ProviderName> = [
   "nps-places",
   "sf-film-locations",
   "nhl",
-  "unesco-heritage",
   "nyc-scenes-from-the-city",
 ];
 
@@ -58,6 +56,35 @@ function priorityOf(p: ProviderName): number {
 // (Wikidata Q-id + OSM node + Wikipedia article for the same statue)
 // are virtually always within 10-15m.
 const DEFAULT_PROXIMITY_METERS = 30;
+
+/** Looser radius when normalized display names match (Wikipedia centroid vs OSM pin). */
+const NAME_MATCH_PROXIMITY_METERS = 50;
+
+/**
+ * Normalize a place name for cross-source dedupe. Strips parentheticals,
+ * punctuation, and diacritics so "Equestrian Statue of George Washington
+ * (New York City)" matches Wikipedia/Wikidata variants.
+ */
+export function normalizePlaceName(name: string | null | undefined): string | null {
+  if (!name) return null;
+  const base = name
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return base.length > 0 ? base : null;
+}
+
+/** True when two normalized names are the same place (equality or long substring). */
+export function namesMatchForMerge(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  if (shorter.length < 10) return false;
+  return longer.includes(shorter);
+}
 
 /**
  * Merge a list of raw candidates from multiple providers into a
@@ -127,6 +154,22 @@ export function mergeCandidates(
           distanceMeters({ lat: m.lat, lng: m.lng }, { lat: raw.lat, lng: raw.lng }) <
           proximityMeters,
       );
+    }
+
+    const normRawName = normalizePlaceName(raw.name);
+    if (!cluster && normRawName) {
+      cluster = merged.find((m) => {
+        const normCluster = normalizePlaceName(m.name);
+        if (!normCluster || !namesMatchForMerge(normRawName, normCluster)) {
+          return false;
+        }
+        return (
+          distanceMeters(
+            { lat: m.lat, lng: m.lng },
+            { lat: raw.lat, lng: raw.lng },
+          ) < NAME_MATCH_PROXIMITY_METERS
+        );
+      });
     }
 
     if (cluster) {
@@ -257,7 +300,6 @@ function coordPrecisionRank(input: {
   if (source === "nyc-scenes-from-the-city") return 3;
   if (source === "own-db") return 3;
   if (source === "wikipedia-geosearch") return 2;
-  if (source === "unesco-heritage") return 1;
   return 0;
 }
 

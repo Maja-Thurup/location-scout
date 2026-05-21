@@ -47,11 +47,12 @@ const DEFAULT_RRF_WEIGHTS: Record<ProviderName, number> = {
   // significant. RIDB is utility-grade (campgrounds, rec areas) — useful
   // for wilderness/scenic prompts but lower signal for famous landmarks.
   "nps-places": 1.4,
-  "unesco-heritage": 1.5,
   "ridb-recreation": 0.9,
+  // Live UNESCO provider removed from search; weight 0 for own-db imports.
+  "unesco-heritage": 0,
   // M6 own-db: candidates from our consolidated DB. Most of them
-  // re-map at read time to their original source (nps-places, unesco-
-  // heritage, ...) so they pick up THOSE weights. NRHP / NHL stay as
+  // re-map at read time to their original source (nps-places, nrhp, …)
+  // so they pick up THOSE weights. NRHP / NHL stay as
   // own-db-emitted ProviderNames and use these direct weights.
   "own-db": 1.0,
   "nrhp": 1.3, // National Register listing = vetted historic significance
@@ -93,7 +94,6 @@ const INTENT_BOOSTS: Record<
     // trailheads) and NPS's (national parks proper).
     "nps-places": 1.7,
     "ridb-recreation": 1.7,
-    "unesco-heritage": 1.3,
   },
   urban: {
     osm: 0.7,
@@ -101,7 +101,6 @@ const INTENT_BOOSTS: Record<
     "wikipedia-geosearch": 1.3,
     "nps-places": 0.6, // few NPS sites in city centers
     "ridb-recreation": 0.4,
-    "unesco-heritage": 1.1,
   },
   industrial: {
     osm: 1.2,
@@ -130,7 +129,6 @@ const INTENT_BOOSTS: Record<
     "wikipedia-geosearch": 1.0,
     "nps-places": 1.0,
     "ridb-recreation": 1.0,
-    "unesco-heritage": 1.0,
   },
 };
 

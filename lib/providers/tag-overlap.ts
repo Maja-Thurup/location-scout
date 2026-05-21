@@ -220,9 +220,17 @@ export function buildCandidateText(c: MergedCandidate): string {
   const parts: string[] = [];
   if (c.name) parts.push(c.name);
   if (c.description) parts.push(c.description);
+  if (c.wikidataFacts?.depicts?.length) {
+    parts.push(...c.wikidataFacts.depicts);
+  }
+  if (c.wikidataFacts?.altLabels?.length) {
+    parts.push(...c.wikidataFacts.altLabels);
+  }
   for (const v of Object.values(c.tags)) {
     if (typeof v === "string" && v.length > 0) parts.push(v);
   }
+  const artworkSubject = c.tags["artwork_subject"];
+  if (artworkSubject) parts.push(`artwork_subject=${artworkSubject}`);
   return parts.join(" \u2022 ").toLowerCase();
 }
 
@@ -329,6 +337,23 @@ export function tagOverlapScore(
   const blob = buildCandidateText(candidate);
   const positive = countMatches(sceneTokens, blob);
 
+  // OSM `artwork_subject=*` is the community's subject tag (taginfo).
+  // When it matches a scene token, add a strong flat boost — often present
+  // on horse/eagle sculptures where the name omits the animal.
+  const artworkSubject = candidate.tags["artwork_subject"]?.trim().toLowerCase();
+  let artworkSubjectBoost = 0;
+  if (artworkSubject) {
+    for (const t of sceneTokens) {
+      const norm = t.toLowerCase().trim();
+      if (norm.length < 3 || GENERIC_TOKENS.has(norm)) continue;
+      const variants = tokenAlternates(norm);
+      if (variants.some((v) => artworkSubject.includes(v))) {
+        artworkSubjectBoost = Math.max(artworkSubjectBoost, idfWeight(norm) * 1.5);
+        break;
+      }
+    }
+  }
+
   // Subject-name match: does the candidate's NAME match Claude's
   // synonym regex? "Equestrian Statue of George Washington" → YES;
   // "Statue of Liberty" → NO; "Pulitzer Memorial Fountain" → NO.
@@ -351,7 +376,7 @@ export function tagOverlapScore(
   //   - image present = +0.5 flat (small — breaks ties between
   //     candidates that score equally on text but only one has a
   //     curated photo).
-  let score = positive.weightedScore;
+  let score = positive.weightedScore + artworkSubjectBoost;
   if (subjectNameMatched) score *= 2.5;
   if (hasImage) score += 0.5;
 

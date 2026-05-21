@@ -23,6 +23,10 @@ import {
 } from "@/lib/overpass";
 import { mergeCandidates } from "@/lib/providers/dedupe";
 import { runProviders } from "@/lib/providers/registry";
+import {
+  compareRelevanceTiers,
+  computeRelevanceTier,
+} from "@/lib/providers/relevance-tier";
 import { expandSubjectKeywords } from "@/lib/subject-synonyms";
 import { rrfRank } from "@/lib/providers/rrf";
 import {
@@ -281,20 +285,6 @@ function inferOsmId(externalIds: Record<string, string | undefined>): number {
 }
 
 /**
- * Concatenate a candidate's name + description + tag values into one
- * lowercased text blob for substring matching.
- */
-function candidateBlob(c: MergedCandidate): string {
-  const parts: string[] = [];
-  if (c.name) parts.push(c.name);
-  if (c.description) parts.push(c.description);
-  for (const v of Object.values(c.tags)) {
-    if (typeof v === "string" && v.length > 0) parts.push(v);
-  }
-  return parts.join(" \u2022 ").toLowerCase();
-}
-
-/**
  * Tokens that are too generic to be a "subject" we'd require in a
  * candidate. The user might write them but they don't carve out a
  * specific thing — every memorial mentions "park"/"statue"/"monument"
@@ -382,19 +372,6 @@ function collectSubjectKeywords(
     }
   }
   return Array.from(out);
-}
-
-/**
- * Build a regex that matches any of `keywords` as a word-substring in
- * a lowercased blob. Returns null when there are no usable keywords —
- * the caller should skip the filter in that case.
- */
-function buildSubjectMatcher(keywords: ReadonlyArray<string>): RegExp | null {
-  const escaped = keywords.map((k) =>
-    k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-  );
-  if (escaped.length === 0) return null;
-  return new RegExp(`(?:${escaped.join("|")})`, "i");
 }
 
 export const POST = withAuth(async (req) => {
@@ -752,47 +729,31 @@ export const POST = withAuth(async (req) => {
     : rrfRanked;
   const droppedZeroOverlap = rrfRanked.length - afterTagFilter.length;
 
-  // 5.9) SUBJECT-REQUIRED HARD FILTER. This is the "Statue of Liberty
-  // is not a horse statue" rule.
-  //
-  // When the user's prompt has a clear SUBJECT noun (Claude emitted a
-  // "name" alternative in osm_tags_alternatives, or scene_tokens
-  // contains a high-IDF subject word like "horse"/"lighthouse"), every
-  // surviving candidate MUST physically reference that subject — the
-  // candidate's name OR description OR tag values must contain the
-  // subject noun OR one of its synonyms from the regex.
-  //
-  // Without this filter:
-  //   - UNESCO Statue of Liberty (text: "Made in Paris by Bartholdi...")
-  //     passes because it matches "statue" via tag-overlap
-  //   - JQA Ward standing-Washington (text: "bronze statue on Wall St")
-  //     passes for the same reason
-  //
-  // With this filter, both drop because their text contains zero
-  // horse-synonym tokens.
+  // 5.9) Subject keywords for tiered ranking (horse first, other statues
+  // second, everything else last). We no longer hard-drop non-subject
+  // hits — the fail-safe used to restore Statue of Liberty when only two
+  // candidates mentioned "horse" in text.
   const subjectKeywords = collectSubjectKeywords(
     subjectNameRegex,
     sceneTokens,
   );
-  const subjectMatcher = buildSubjectMatcher(subjectKeywords);
-  const subjectFiltered = subjectMatcher
-    ? afterTagFilter.filter((c) => {
-        const blob = candidateBlob(c).toLowerCase();
-        return subjectMatcher.test(blob);
-      })
-    : afterTagFilter;
-  // Don't apply the filter if it would empty the pool — prefer 12
-  // marginal results to zero results.
-  const finalAfterSubject =
-    subjectMatcher && subjectFiltered.length >= 3
-      ? subjectFiltered
-      : afterTagFilter;
-  const droppedNoSubject = afterTagFilter.length - finalAfterSubject.length;
+  const tierByCandidate = new Map<string, ReturnType<typeof computeRelevanceTier>>();
+  for (const c of afterTagFilter) {
+    tierByCandidate.set(
+      c.id,
+      computeRelevanceTier({
+        candidate: c,
+        subjectTerms: subjectKeywords,
+        subjectNameRegex,
+      }),
+    );
+  }
 
-  // 6) Convert to RankedCandidate[], rank by combined RRF + tag-overlap
+  // 6) Convert to RankedCandidate[], rank by relevance tier then RRF +
+  // tag-overlap, then distance.
   // score (descending), then break ties by distance from search center.
   const center = bboxCenter(effectiveBbox);
-  const ranked: RankedCandidate[] = finalAfterSubject
+  const ranked: RankedCandidate[] = afterTagFilter
     .map((m) => {
       const overlap = overlapByCandidate.get(m.id) ?? {
         matched: [],
@@ -821,6 +782,11 @@ export const POST = withAuth(async (req) => {
       };
     })
     .sort((a, b) => {
+      const aTier = tierByCandidate.get(a.id) ?? 2;
+      const bTier = tierByCandidate.get(b.id) ?? 2;
+      const tierCmp = compareRelevanceTiers(aTier, bTier);
+      if (tierCmp !== 0) return tierCmp;
+
       const aCombined = combinedRank(a.rrfScore, {
         matched: a.matchedTokens,
         score: a.tagOverlapScore,
@@ -848,13 +814,14 @@ export const POST = withAuth(async (req) => {
     sceneTokens,
   });
 
-  if (droppedOsmNoise > 0 || droppedZeroOverlap > 0 || droppedNoSubject > 0) {
+  if (droppedOsmNoise > 0 || droppedZeroOverlap > 0) {
     logger.info("search-osm filter stats", {
       droppedOsmNoise,
       droppedZeroOverlap,
-      droppedNoSubject,
       applyHardFilter,
       subjectKeywords,
+      tier0: ranked.filter((r) => tierByCandidate.get(r.id) === 0).length,
+      tier1: ranked.filter((r) => tierByCandidate.get(r.id) === 1).length,
       finalCount: ranked.length,
     });
   }

@@ -29,7 +29,8 @@
     "import:sf-films": "tsx scripts/import-sf-films.ts",
     "import:nrhp": "tsx scripts/import-nrhp.ts",
     "import:all": "npm run import:unesco && npm run import:nyc-scenes && npm run import:sf-films && npm run import:nrhp",
-    "build-taginfo-dict": "tsx scripts/build-taginfo-dict.ts"
+    "build-taginfo-dict": "tsx scripts/build-taginfo-dict.ts",
+    "check:keys": "tsx scripts/check-api-keys.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",

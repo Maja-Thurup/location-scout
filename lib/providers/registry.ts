@@ -13,7 +13,6 @@ import type {
   ProviderResult,
   RawCandidate,
 } from "@/lib/providers/types";
-import { unescoHeritageProvider } from "@/lib/providers/unesco-heritage";
 import { wikidataFilmingLocationProvider } from "@/lib/providers/wikidata-filming-location";
 import { wikidataLandmarkProvider } from "@/lib/providers/wikidata-landmark";
 import { wikipediaGeosearchProvider } from "@/lib/providers/wikipedia-geosearch";
@@ -50,11 +49,10 @@ export const DEFAULT_CONTENT_PROVIDERS: ReadonlyArray<CandidateProvider> = [
   ownDbProvider,
   wikidataLandmarkProvider,
   wikipediaGeosearchProvider,
-  // M7: scenic + heritage live sources. Each gracefully no-ops when its
-  // optional API key is missing or the bbox is non-US (where applicable).
+  // M7: scenic live sources. Each gracefully no-ops when its optional API
+  // key is missing or the bbox is non-US (where applicable).
   npsPlacesProvider,
   ridbRecreationProvider,
-  unescoHeritageProvider,
   // Socrata municipal datasets — NYC public art / landmarks, SF
   // historic sites, Chicago landmarks. Empty fast-path when bbox
   // doesn't overlap any registered dataset.

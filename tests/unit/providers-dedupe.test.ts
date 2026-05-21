@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { mergeCandidates } from "@/lib/providers/dedupe";
+import {
+  mergeCandidates,
+  namesMatchForMerge,
+  normalizePlaceName,
+} from "@/lib/providers/dedupe";
 import type { RawCandidate } from "@/lib/providers/types";
 
 // ---------------------------------------------------------------------------
@@ -219,5 +223,42 @@ describe("mergeCandidates", () => {
 
   it("handles empty input gracefully", () => {
     expect(mergeCandidates([])).toEqual([]);
+  });
+
+  it("merges same display name within 50m across providers", () => {
+    const out = mergeCandidates([
+      raw({
+        source: "wikipedia-geosearch",
+        externalId: "page-1",
+        lat: 40.6892,
+        lng: -74.0445,
+        name: "Statue of Liberty",
+        tags: { "wikidata:qid": "Q142" },
+      }),
+      raw({
+        source: "wikidata-landmark",
+        externalId: "Q142",
+        lat: 40.68925,
+        lng: -74.0446,
+        name: "Statue of Liberty",
+      }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.sources).toContain("wikipedia-geosearch");
+    expect(out[0]!.sources).toContain("wikidata-landmark");
+  });
+});
+
+describe("normalizePlaceName / namesMatchForMerge", () => {
+  it("strips parentheticals", () => {
+    expect(
+      normalizePlaceName("Equestrian Statue of George Washington (New York City)"),
+    ).toBe("equestrian statue of george washington");
+  });
+
+  it("matches long substring names", () => {
+    const a = normalizePlaceName("Statue of Liberty")!;
+    const b = normalizePlaceName("The Statue of Liberty National Monument")!;
+    expect(namesMatchForMerge(a, b)).toBe(true);
   });
 });
