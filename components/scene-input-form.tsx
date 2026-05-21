@@ -13,7 +13,6 @@ import type { OsmCandidate } from "@/lib/overpass";
 import type {
   DeepLinks,
   LocationSource,
-  PhotoAttribution,
   PhotoSource,
 } from "@/components/contracts";
 import { LocationCard } from "@/components/location-card";
@@ -145,14 +144,7 @@ type EnrichedLocation = {
   editorialSummary: string | null;
   googleMapsUri: string | null;
   websiteUri: string | null;
-  photo: SelectedPhoto | null;
-  alternatePhotos: ReadonlyArray<SelectedPhoto>;
-  streetView: {
-    available: boolean;
-    capturedAt: string | null;
-    thumbUrl: string | null;
-    copyright: string | null;
-  };
+  photos: ReadonlyArray<SelectedPhoto>;
   deepLinks: DeepLinks;
   badges: ReadonlyArray<{ key: string; value: string }>;
   enrichmentSparse: boolean;
@@ -959,24 +951,11 @@ function ResultCardsPanel({
               lat={loc.lat}
               lng={loc.lng}
               rating={loc.rating ?? undefined}
-              photoUrl={loc.photo?.url}
-              photoSource={loc.photo?.source ?? null}
-              photoCapturedAt={loc.photo?.capturedAt ?? undefined}
-              photoAttribution={
-                loc.photo
-                  ? ({
-                      source: loc.photo.source,
-                      text: loc.photo.attributionText,
-                      href: loc.photo.attributionHref ?? undefined,
-                    } satisfies PhotoAttribution)
-                  : undefined
-              }
-              streetViewThumbUrl={loc.streetView.thumbUrl ?? undefined}
-              hasInteractiveStreetView={loc.streetView.available}
+              photos={loc.photos}
               deepLinks={loc.deepLinks}
               badges={loc.badges.map((b) => `${b.key}=${b.value}`)}
-              visionScore={loc.photo?.visionScore ?? undefined}
-              visionReason={loc.photo?.visionReason ?? undefined}
+              visionScore={loc.photos[0]?.visionScore ?? undefined}
+              visionReason={loc.photos[0]?.visionReason ?? undefined}
               sources={
                 loc.sources && loc.sources.length > 0
                   ? (loc.sources as ReadonlyArray<LocationSource>)

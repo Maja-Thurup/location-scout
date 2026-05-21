@@ -28,12 +28,7 @@ import {
 import { runFilmHistoryProviders } from "@/lib/providers/registry";
 import type { AssociatedFilm, RawCandidate } from "@/lib/providers/types";
 import { checkDeepCredit, consumeDeepCredit } from "@/lib/search-tier";
-import {
-  buildThumbUrl,
-  probeStreetView,
-  probeStreetViewWithHeading,
-  type StreetViewProbe,
-} from "@/lib/street-view";
+import { buildThumbUrl } from "@/lib/street-view";
 import {
   findMovieByImdb,
   findMovieByWikidata,
@@ -210,12 +205,17 @@ export type EnrichedLocation = {
   googleMapsUri: string | null;
   websiteUri: string | null;
 
-  /** Primary thumbnail (GSV when imagery exists at Mapillary's coord, else Mapillary). */
-  photo: SelectedPhoto | null;
-  /** Other candidate photos for a future "more views" UI. */
-  alternatePhotos: ReadonlyArray<SelectedPhoto>;
-  /** Street View probe so the card can offer the interactive panorama. */
-  streetView: StreetViewProbe;
+  /**
+   * Unified list of all photos available for this location, ordered by
+   * usefulness: curated first (Wikidata P18, Wikipedia pageimages, NPS
+   * curated, UNESCO main image, SF Films stills), then Mapillary
+   * street-level shots, then Google Place photos when deep-tier ran.
+   *
+   * The first entry doubles as the card's primary thumbnail. The rest
+   * power the "Photos" carousel — give scouts as much visual context
+   * as we can before they tab out to Google Maps.
+   */
+  photos: ReadonlyArray<SelectedPhoto>;
   /** Pre-built deep-link bundle. */
   deepLinks: DeepLinks;
 
@@ -511,11 +511,18 @@ function mapillaryForGsvHandoff(s: ScoredCandidate): MapillaryImage | null {
 // Phase 3: Paid enrichment for survivors (Place Details + GSV)
 // ---------------------------------------------------------------------------
 
-/** Cached static enrichment per coord. Not scene-dependent. */
+/**
+ * Cached static enrichment per coord. Not scene-dependent.
+ *
+ * Street View probing was removed: the static thumbnails were
+ * unreliable (often pointed at the wrong building when the OSM coord
+ * sat at a polygon centroid) and the interactive panorama costs us
+ * money on every load. Scouts get a free OSM map tile in the card's
+ * "Map" tab and a one-click "Open in Google Maps" button that gives
+ * them the full Street View experience without burning our quota.
+ */
 type StaticEnrichment = {
   googlePlace: GooglePlace | null;
-  /** GSV probe at the Mapillary photo coord (with that photo's heading). */
-  streetView: StreetViewProbe;
 };
 
 async function fetchStaticEnrichment(args: {
@@ -523,24 +530,19 @@ async function fetchStaticEnrichment(args: {
   mapillary: MapillaryImage | null;
   includeClosed: boolean;
 }): Promise<StaticEnrichment> {
-  const { candidate, mapillary, includeClosed } = args;
+  const { candidate, includeClosed } = args;
 
   const k = cacheKey("google:place-details", {
-    kind: "static-v3",
+    kind: "static-v4-no-streetview",
     osmId: candidate.id,
     lat: round(candidate.lat),
     lng: round(candidate.lng),
-    mLat: mapillary ? round(mapillary.lat) : null,
-    mLng: mapillary ? round(mapillary.lng) : null,
-    mHeading:
-      mapillary?.compassAngle != null ? Math.round(mapillary.compassAngle) : null,
     closed: includeClosed,
   });
 
   const cached = await cacheGet<StaticEnrichment>(k);
   if (cached) return cached;
 
-  // Place Details around the OSM coord.
   let googlePlace: GooglePlace | null = null;
   try {
     const places = await searchNearby({
@@ -556,30 +558,7 @@ async function fetchStaticEnrichment(args: {
     });
   }
 
-  // Street View probe at the Mapillary capture location, pointing the same
-  // direction the matching Mapillary photo was facing. This makes the GSV
-  // thumbnail show roughly the same scene as the Mapillary photo, with
-  // Google's higher resolution.
-  let sv: StreetViewProbe;
-  try {
-    if (mapillary && mapillary.compassAngle != null) {
-      sv = await probeStreetViewWithHeading(
-        mapillary.lat,
-        mapillary.lng,
-        mapillary.compassAngle,
-      );
-    } else {
-      sv = await probeStreetView(candidate.lat, candidate.lng);
-    }
-  } catch (err) {
-    logger.warn("static enrichment probeStreetView threw", {
-      id: candidate.id,
-      err: String(err),
-    });
-    sv = { available: false, capturedAt: null, thumbUrl: null, copyright: null };
-  }
-
-  const result: StaticEnrichment = { googlePlace, streetView: sv };
+  const result: StaticEnrichment = { googlePlace };
   await cacheSet(k, "google:place-details", result, STATIC_TTL_DAYS);
   return result;
 }
@@ -617,22 +596,6 @@ function selectedFromMapillary(
     capturedAt: m.capturedAt,
     attributionText: m.attribution,
     attributionHref: m.href,
-    visionScore: score?.score ?? null,
-    visionReason: score?.reason ?? null,
-  };
-}
-
-function selectedFromStreetView(
-  sv: StreetViewProbe,
-  score: VisionScore | null,
-): SelectedPhoto | null {
-  if (!sv.available || !sv.thumbUrl) return null;
-  return {
-    url: sv.thumbUrl,
-    source: "street_view",
-    capturedAt: sv.capturedAt,
-    attributionText: sv.copyright ?? "© Google",
-    attributionHref: null,
     visionScore: score?.score ?? null,
     visionReason: score?.reason ?? null,
   };
@@ -905,66 +868,69 @@ export const POST = withAuth(async (req) => {
   const locations: EnrichedLocation[] = finalSet.map((e) => {
     const candidate = e.candidate;
     const place = e.static.googlePlace;
-    const sv = e.static.streetView;
 
-    // Build candidate photos. Two paths:
-    //   - Vision ran (deep tier or high-confidence skip-vision didn't
-    //     apply): the multi-shot winner is canonical.
-    //   - Vision skipped (free tier): use the candidate's KNOWN
-    //     curated image first (Wikidata P18 / Wikipedia pageimages /
-    //     UNESCO main_image_url / NPS images[0] / SF Films, ...). It's
-    //     a hand-picked photo of the actual subject; vastly better than
-    //     a Mapillary streetview thumb of the empty intersection
-    //     nearby. Mapillary stays as fallback when no curated image
-    //     exists.
-    const visionRan = e.visionScore != null;
-
-    let winnerPhoto: SelectedPhoto | null = null;
-    if (visionRan && e.bestPhoto?.kind === "mapillary") {
-      winnerPhoto = selectedFromMapillary(e.bestPhoto.mapillary, e.visionScore);
-    } else if (visionRan && e.bestPhoto?.kind === "known") {
-      winnerPhoto = selectedFromKnown({
-        url: e.bestPhoto.url,
-        attributionText: null,
-        attributionHref: candidate.sourceUrl ?? null,
-        score: e.visionScore,
-      });
-    } else if (candidate.knownImageUrl) {
-      // Free tier: prefer the curated image directly.
-      winnerPhoto = selectedFromKnown({
-        url: candidate.knownImageUrl,
-        attributionText: null,
-        attributionHref: candidate.sourceUrl ?? null,
-        score: e.visionScore,
-      });
-    } else if (e.mapillary) {
-      winnerPhoto = selectedFromMapillary(e.mapillary, e.visionScore);
-    }
-
-    const streetViewPhoto = selectedFromStreetView(sv, e.visionScore);
-    const googlePhoto = place
-      ? selectedFromGooglePlace(place, e.visionScore)
-      : null;
-
-    // Photo priority: winner first (curated knownImageUrl on free tier,
-    // multi-shot vision winner on deep tier). Then Google Place Photo /
-    // GSV / closest-Mapillary as alternates so a "swap photo" UI in the
-    // future can offer them.
-    const photo = winnerPhoto ?? streetViewPhoto ?? googlePhoto ?? null;
-    const alternates: SelectedPhoto[] = [];
-    for (const p of [streetViewPhoto, googlePhoto]) {
-      if (p && p !== photo) alternates.push(p);
-    }
-
-    // ALWAYS use the candidate's original coords for user-facing links
-    // and the Street View modal. The matched Google Place's coords often
-    // point at a business pin INSIDE the building (e.g. a deli inside a
-    // historic facade), so opening Street View at those coords lands
-    // the user inside the deli — not what we want.
+    // Assemble the FULL set of photos available for this location,
+    // ordered by curated-quality and visual usefulness. Scouts want
+    // every angle we can give them BEFORE they tab out to Google Maps.
     //
-    // The Google Place is still useful for METADATA (name, rating,
-    // editorial summary, photos) — we just don't trust its coords for
-    // navigation.
+    // Order:
+    //   1. Vision-scoring winner (when it ran) — proven best match
+    //   2. Provider's curated image (`knownImageUrl`) — Wikidata P18,
+    //      Wikipedia pageimages, UNESCO main image, NPS curated, SF
+    //      Films stills — hand-picked photos of the actual subject
+    //   3. Mapillary closest hit at the candidate's coord
+    //   4. Mapillary alternates (other angles, recent shots)
+    //   5. Google Place photos (deep tier only — paid)
+    //
+    // Deduped by URL so the same image doesn't appear twice when two
+    // sources point at the same Wikimedia file.
+    const visionRan = e.visionScore != null;
+    const photos: SelectedPhoto[] = [];
+    const seenUrls = new Set<string>();
+    const tryPush = (p: SelectedPhoto | null): void => {
+      if (!p) return;
+      if (seenUrls.has(p.url)) return;
+      seenUrls.add(p.url);
+      photos.push(p);
+    };
+
+    if (visionRan && e.bestPhoto?.kind === "mapillary") {
+      tryPush(selectedFromMapillary(e.bestPhoto.mapillary, e.visionScore));
+    } else if (visionRan && e.bestPhoto?.kind === "known") {
+      tryPush(
+        selectedFromKnown({
+          url: e.bestPhoto.url,
+          attributionText: null,
+          attributionHref: candidate.sourceUrl ?? null,
+          score: e.visionScore,
+        }),
+      );
+    }
+    if (candidate.knownImageUrl) {
+      tryPush(
+        selectedFromKnown({
+          url: candidate.knownImageUrl,
+          attributionText: null,
+          attributionHref: candidate.sourceUrl ?? null,
+          score: e.visionScore,
+        }),
+      );
+    }
+    if (e.mapillary) {
+      tryPush(selectedFromMapillary(e.mapillary, e.visionScore));
+    }
+    for (const alt of e.mapillaryAlternates) {
+      tryPush(selectedFromMapillary(alt, null));
+    }
+    if (place) {
+      tryPush(selectedFromGooglePlace(place, e.visionScore));
+    }
+
+    // ALWAYS use the candidate's original coords for user-facing links.
+    // The matched Google Place's coords often point at a business pin
+    // INSIDE the building (e.g. a deli inside a historic facade), so
+    // navigation links would land the user inside the deli — not the
+    // monument they actually want.
     const lat = candidate.lat;
     const lng = candidate.lng;
 
@@ -1010,9 +976,7 @@ export const POST = withAuth(async (req) => {
       editorialSummary: place?.editorialSummary ?? null,
       googleMapsUri: place?.googleMapsUri ?? null,
       websiteUri: place?.websiteUri ?? null,
-      photo,
-      alternatePhotos: alternates,
-      streetView: sv,
+      photos,
       deepLinks,
       badges: buildBadges(candidate.tags),
       enrichmentSparse: place === null,
@@ -1029,7 +993,7 @@ export const POST = withAuth(async (req) => {
   // FOUND" as "candidate not viable" rather than rendering an empty card.
   // Phase 1 quality bar: every card must show something the user can
   // actually look at.
-  const withPhoto = locations.filter((loc) => loc.photo !== null);
+  const withPhoto = locations.filter((loc) => loc.photos.length > 0);
 
   // -------- Phase 5.5: film-history POST-CARD enrichment --------
   // Films should NEVER drive search ranking — they're metadata on a card,
@@ -1152,8 +1116,8 @@ export const POST = withAuth(async (req) => {
 
   // Final sort: vision score desc, then distance asc.
   withPhoto.sort((a, b) => {
-    const sa = a.photo?.visionScore ?? -1;
-    const sb = b.photo?.visionScore ?? -1;
+    const sa = a.photos[0]?.visionScore ?? -1;
+    const sb = b.photos[0]?.visionScore ?? -1;
     if (sa !== sb) return sb - sa;
     const da = a.distanceMeters ?? Number.POSITIVE_INFINITY;
     const db = b.distanceMeters ?? Number.POSITIVE_INFINITY;

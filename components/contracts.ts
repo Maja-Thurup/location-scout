@@ -26,12 +26,16 @@ export type PhotoSource = "mapillary" | "google" | "wikimedia" | "street_view";
 export type DeepLinks = {
   /** Open in Google Maps for viewing the location. */
   googleMaps: string;
-  /** Get driving directions in Google Maps. */
-  directions: string;
-  /** Open in Apple Maps (iOS). */
-  appleMaps: string;
-  /** Open and start navigation in Waze. */
-  waze: string;
+  /**
+   * Driving directions in Google Maps. Optional in v4: the card now
+   * surfaces only Google Maps to keep the action area clean. Kept on
+   * the type for tests and future use.
+   */
+  directions?: string;
+  /** Apple Maps deep link. Optional in v4 — see directions. */
+  appleMaps?: string;
+  /** Waze deep link. Optional in v4 — see directions. */
+  waze?: string;
 };
 
 export type DrivingDistance = {
@@ -94,29 +98,50 @@ export type LocationSource =
   | "nrhp"
   | "nhl";
 
+/**
+ * One photo carried on the LocationCard prop. Mirrors the SelectedPhoto
+ * shape from the API (URL + provenance + attribution + optional vision
+ * score) but is cloned here so the contract stays pure-frontend.
+ */
+export type LocationCardPhoto = {
+  url: string;
+  source: PhotoSource;
+  capturedAt: string | null;
+  attributionText: string;
+  attributionHref: string | null;
+  visionScore: number | null;
+  visionReason: string | null;
+};
+
 export type LocationCardProps = {
   id: string;
+  /**
+   * Display name. Falsy/empty means "no name available" — the card
+   * shows lat/lng coordinates instead (filmmaker-friendly fallback for
+   * unnamed OSM features).
+   */
   name: string;
-  address: string;
+  /** Postal address — present for back-compat but no longer rendered. */
+  address?: string;
   lat: number;
   lng: number;
   rating?: number;
 
-  /** Primary photo URL (Mapillary preferred, Google fallback). */
-  photoUrl?: string;
-  photoSource: PhotoSource | null;
-  photoCapturedAt?: string;
-  photoAttribution?: PhotoAttribution;
-
-  /** Static Street View thumbnail URL, if imagery exists at this coord. */
-  streetViewThumbUrl?: string;
-  /** Whether `google.maps.StreetViewPanorama` will succeed at this coord. */
-  hasInteractiveStreetView: boolean;
+  /**
+   * Every photo we have for this location, ordered most-curated first.
+   * Powers the "Photos" carousel above the info section. The first
+   * entry is the primary thumbnail.
+   */
+  photos: ReadonlyArray<LocationCardPhoto>;
 
   /** Driving distance + time from the user's crew base, if set. */
   drivingDistance?: DrivingDistance;
 
-  /** Pre-built deep-link URLs to other map apps. */
+  /**
+   * Deep-link bundle. Only `googleMaps` is rendered as a button in v4
+   * (apple/waze/directions removed for visual clarity); the other
+   * fields stay on the type for tests + future use.
+   */
   deepLinks: DeepLinks;
 
   /** Optional badges, e.g. "abandoned", "3 stories", "brick". */
@@ -125,7 +150,6 @@ export type LocationCardProps = {
   /** Per-location notes (free-tier feature). */
   notes?: string;
 
-  // ---- Phase 2a additions ----
   /** Providers that surfaced this location (for source pills). */
   sources?: ReadonlyArray<LocationSource>;
   /** Wikidata description / NYC fun-fact / Wikipedia summary, when present. */
@@ -142,7 +166,6 @@ export type LocationCardProps = {
   onSave?: (id: string) => void;
   onUnsave?: (id: string) => void;
   onNotesChange?: (id: string, notes: string) => void;
-  onOpenStreetView?: (id: string) => void;
 };
 
 // ---------------------------------------------------------------------------
