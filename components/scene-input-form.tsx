@@ -10,6 +10,8 @@ import posthog from "posthog-js";
 import type { Bbox } from "@/lib/bbox";
 import type { SceneAnalysis } from "@/lib/claude";
 import type { OsmCandidate } from "@/lib/overpass";
+import type { SourceDebugEntry } from "@/lib/source-debug";
+import { useDeveloperMode } from "@/lib/use-developer-mode";
 import type {
   DeepLinks,
   LocationSource,
@@ -133,6 +135,8 @@ type SearchOsmResponse = {
   highConfidence?: boolean;
   /** Per-provider source counts + timing, used by the debug panel. */
   providerStats?: Partial<Record<ProviderName, ProviderStat>>;
+  /** Full per-source inspector (developer mode). */
+  sourceDebug?: SourceDebugEntry[];
 };
 
 type SelectedPhoto = {
@@ -201,6 +205,7 @@ type EnrichResponse = {
     mapillaryDetectionsFound: number;
     visionSkipped?: boolean;
   };
+  sourceDebug?: SourceDebugEntry[];
 };
 
 type ApiError = { error: string; message?: string };
@@ -233,6 +238,7 @@ async function searchOsmRequest(input: {
   searchTier?: "free" | "deep";
   location?: string;
   radiusMiles: number | null;
+  developerMode?: boolean;
 }): Promise<SearchOsmResponse> {
   const res = await fetch("/api/search-osm", {
     method: "POST",
@@ -277,6 +283,7 @@ async function enrichLocationsRequest(input: {
   skipVision?: boolean;
   searchTier?: "free" | "deep";
   mapillaryClasses?: ReadonlyArray<string>;
+  developerMode?: boolean;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
     method: "POST",
@@ -431,6 +438,9 @@ export function SceneInputForm({
     },
   });
 
+  const { developerMode, hydrated: developerModeHydrated } = useDeveloperMode();
+  const devModeActive = developerModeHydrated && developerMode;
+
   const parseMutation = useMutation({ mutationFn: parseSceneRequest });
   const osmMutation = useMutation({ mutationFn: searchOsmRequest });
   const enrichMutation = useMutation({ mutationFn: enrichLocationsRequest });
@@ -488,6 +498,7 @@ export function SceneInputForm({
         searchTier,
         location,
         radiusMiles,
+        developerMode: devModeActive,
       });
       setOsmResult(osm);
       posthog.capture("osm_search_completed", {
@@ -554,6 +565,7 @@ export function SceneInputForm({
         // M5: server-side, free tier auto-disables vision regardless.
         searchTier,
         mapillaryClasses: analysis.mapillary_classes ?? [],
+        developerMode: devModeActive,
       });
       setEnrichResult(enriched);
       setStage({ kind: "ready" });
@@ -795,6 +807,8 @@ export function SceneInputForm({
           osm={osmResult}
           analysis={parseResult?.analysis ?? null}
           isSearching={stage.kind === "searching-osm"}
+          developerMode={devModeActive}
+          enrichSourceDebug={enrichResult?.sourceDebug}
         />
       )}
 
@@ -826,10 +840,14 @@ function SearchSummaryPanel({
   osm,
   analysis,
   isSearching,
+  developerMode,
+  enrichSourceDebug,
 }: {
   osm: SearchOsmResponse;
   analysis: SceneAnalysis | null;
   isSearching: boolean;
+  developerMode: boolean;
+  enrichSourceDebug?: SourceDebugEntry[];
 }) {
   // Build a "View all on Google Maps" URL using Claude's google_query (when
   // available) so users can browse the same conceptual search on Google's
@@ -895,8 +913,168 @@ function SearchSummaryPanel({
       </header>
 
       {osm.matchMode !== "strict" && <RelaxationExplainer osm={osm} />}
-      <ProviderStatsPanel stats={osm.providerStats} />
+      {developerMode ? (
+        <SourceDebugPanel
+          searchEntries={osm.sourceDebug ?? []}
+          enrichEntries={enrichSourceDebug}
+          cached={osm.cached}
+          rankedCandidateCount={osm.candidates.length}
+        />
+      ) : (
+        <ProviderStatsPanel stats={osm.providerStats} />
+      )}
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SourceDebugPanel — per-retriever request/response inspector (developer mode)
+// ---------------------------------------------------------------------------
+
+const SOURCE_STATUS_STYLES: Record<
+  SourceDebugEntry["status"],
+  string
+> = {
+  ok: "text-emerald-300",
+  empty: "text-muted-foreground",
+  skipped: "text-amber-300",
+  error: "text-rose-300",
+  cached: "text-sky-300",
+};
+
+function SourceDebugPanel({
+  searchEntries,
+  enrichEntries,
+  cached,
+  rankedCandidateCount,
+}: {
+  searchEntries: ReadonlyArray<SourceDebugEntry>;
+  enrichEntries?: ReadonlyArray<SourceDebugEntry>;
+  cached: boolean;
+  rankedCandidateCount: number;
+}) {
+  const enrich = enrichEntries ?? [];
+  const totalSources = searchEntries.length + enrich.length;
+  if (totalSources === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Developer mode is on but no source debug payloads were returned. Run a fresh
+        search (not from cache) to populate the inspector.
+      </p>
+    );
+  }
+
+  const totalRaw = searchEntries.reduce(
+    (acc, e) => acc + (e.truncated?.total ?? e.candidates.length),
+    0,
+  );
+
+  return (
+    <details className="text-xs text-muted-foreground" open>
+      <summary className="cursor-pointer select-none font-medium text-foreground/90">
+        Source inspector ({totalSources} sources · {totalRaw} raw candidates ·{" "}
+        {rankedCandidateCount} ranked
+        {cached ? " · cached search" : ""})
+      </summary>
+      <div className="mt-3 space-y-4">
+        {searchEntries.length > 0 && (
+          <SourceDebugSection title="Search phase" entries={searchEntries} />
+        )}
+        {enrich.length > 0 && (
+          <SourceDebugSection title="Enrich phase" entries={enrich} />
+        )}
+      </div>
+    </details>
+  );
+}
+
+function SourceDebugSection({
+  title,
+  entries,
+}: {
+  title: string;
+  entries: ReadonlyArray<SourceDebugEntry>;
+}) {
+  return (
+    <div className="space-y-2">
+      <h3 className="text-xs font-semibold tracking-wide text-foreground/80 uppercase">
+        {title}
+      </h3>
+      <ul className="space-y-2">
+        {entries.map((entry) => (
+          <li key={`${title}-${entry.sourceKey}`}>
+            <SourceDebugEntryPanel entry={entry} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function SourceDebugEntryPanel({ entry }: { entry: SourceDebugEntry }) {
+  const count = entry.truncated?.total ?? entry.candidates.length;
+  const statusClass = SOURCE_STATUS_STYLES[entry.status];
+
+  return (
+    <details className="rounded-md border border-white/10 bg-black/20">
+      <summary className="flex cursor-pointer select-none flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2">
+        <span className="font-medium text-foreground/90">{entry.displayName}</span>
+        <span className={`font-mono ${statusClass}`}>{entry.status}</span>
+        <span className="tabular-nums">
+          {count} candidate{count === 1 ? "" : "s"} · {entry.ms}ms
+        </span>
+        {entry.fromCache && (
+          <span className="text-sky-300/80">cache</span>
+        )}
+      </summary>
+      <div className="space-y-3 border-t border-white/10 px-3 py-3">
+        {entry.skipReason && (
+          <p className="text-amber-200/90">
+            Skipped: {entry.skipReason}
+          </p>
+        )}
+        {entry.error && (
+          <p className="text-rose-300">Error: {entry.error}</p>
+        )}
+        {entry.notes && (
+          <p className="text-muted-foreground">{entry.notes}</p>
+        )}
+        {entry.truncated && (
+          <p className="text-amber-200/80">
+            Showing {entry.truncated.shown} of {entry.truncated.total} candidates (cap).
+          </p>
+        )}
+        {entry.status === "empty" && count === 0 && !entry.skipReason && (
+          <p>Returned 0 candidates.</p>
+        )}
+        <DebugJsonBlock label="Request" value={entry.request} />
+        {entry.candidates.length > 0 && (
+          <DebugJsonBlock label="Candidates" value={entry.candidates} />
+        )}
+        {entry.enrich && (
+          <DebugJsonBlock label="Enrich payload" value={entry.enrich} />
+        )}
+      </div>
+    </details>
+  );
+}
+
+function DebugJsonBlock({
+  label,
+  value,
+}: {
+  label: string;
+  value: unknown;
+}) {
+  return (
+    <details className="text-xs">
+      <summary className="cursor-pointer select-none text-muted-foreground">
+        {label}
+      </summary>
+      <pre className="mt-1 max-h-80 overflow-auto rounded-md bg-black/40 p-2 font-mono text-[11px] leading-relaxed">
+        {JSON.stringify(value, null, 2)}
+      </pre>
+    </details>
   );
 }
 

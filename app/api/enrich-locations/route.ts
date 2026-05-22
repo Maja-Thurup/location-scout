@@ -27,6 +27,8 @@ import {
   type MapillaryImage,
 } from "@/lib/mapillary";
 import { runFilmHistoryProviders } from "@/lib/providers/registry";
+import { buildSourceDebugEntry } from "@/lib/source-debug";
+import type { EnrichSourcePayload, SourceDebugEntry } from "@/lib/source-debug";
 import type {
   AssociatedFilm,
   RawCandidate,
@@ -181,6 +183,8 @@ const requestSchema = z.object({
       east: z.number(),
     })
     .optional(),
+  /** When true, return per-source enrich-phase debug payloads. */
+  developerMode: z.boolean().optional().default(false),
 });
 
 export type SelectedPhoto = {
@@ -291,6 +295,7 @@ type EnrichResponse = {
     /** True when vision scoring was skipped (high-confidence tag match). */
     visionSkipped: boolean;
   };
+  sourceDebug?: SourceDebugEntry[];
 };
 
 // ---------------------------------------------------------------------------
@@ -352,6 +357,27 @@ function buildBadges(
 
 function round(n: number): number {
   return Math.round(n * 1e4) / 1e4;
+}
+
+function mapillaryImageDebug(m: MapillaryImage): Record<string, unknown> {
+  return {
+    id: m.id,
+    thumbUrl: m.thumbUrl,
+    qualityScore: m.qualityScore ?? null,
+    compassAngle: m.compassAngle ?? null,
+    isPano: m.isPanorama ?? false,
+  };
+}
+
+function googlePlaceDebug(p: GooglePlace): Record<string, unknown> {
+  return {
+    id: p.id,
+    displayName: p.displayName,
+    primaryType: p.primaryType,
+    lat: p.lat,
+    lng: p.lng,
+    businessStatus: p.businessStatus,
+  };
 }
 
 async function mapWithConcurrency<T, U>(
@@ -733,7 +759,11 @@ export const POST = withAuth(async (req) => {
     searchTier,
     mapillaryClasses,
     searchBbox,
+    developerMode,
   } = parsed.data;
+
+  const enrichByCandidateId: NonNullable<EnrichSourcePayload["byCandidateId"]> =
+    {};
 
   // M5: free tier defaults to single-shot photo + no vision unless the
   // caller explicitly asked otherwise. Deep tier respects whatever
@@ -789,6 +819,20 @@ export const POST = withAuth(async (req) => {
     (c) => gatherFreeSignals(c, targetColor, photosPerCandidate),
     MAX_PARALLEL,
   );
+
+  if (developerMode) {
+    for (const s of freeSignals) {
+      const imgs: Record<string, unknown>[] = [];
+      if (s.mapillary) imgs.push(mapillaryImageDebug(s.mapillary));
+      for (const alt of s.mapillaryAlternates) {
+        imgs.push(mapillaryImageDebug(alt));
+      }
+      enrichByCandidateId[s.candidate.id] = {
+        ...(enrichByCandidateId[s.candidate.id] ?? {}),
+        mapillaryImages: imgs,
+      };
+    }
+  }
 
   // Keep candidates that pass the color filter (or where color isn't a constraint).
   // Candidates with no Mapillary photo are kept since we can't apply the
@@ -852,6 +896,20 @@ export const POST = withAuth(async (req) => {
     );
   }
 
+  if (developerMode) {
+    for (const s of scored) {
+      if (!s.visionScore || !s.bestPhoto) continue;
+      enrichByCandidateId[s.candidate.id] = {
+        ...(enrichByCandidateId[s.candidate.id] ?? {}),
+        vision: {
+          imageUrl: s.bestPhoto.url,
+          score: s.visionScore.score,
+          reason: s.visionScore.reason ?? null,
+        },
+      };
+    }
+  }
+
   // Drop candidates whose vision score is below threshold. Strict mode
   // (the user's stated preference: better to show fewer high-confidence
   // matches than many marginal ones). When nothing passes, we degrade
@@ -907,6 +965,12 @@ export const POST = withAuth(async (req) => {
         mapillary: photoForHandoff,
         includeClosed,
       });
+      if (developerMode && stat.googlePlace) {
+        enrichByCandidateId[s.candidate.id] = {
+          ...(enrichByCandidateId[s.candidate.id] ?? {}),
+          googleNearby: [googlePlaceDebug(stat.googlePlace)],
+        };
+      }
       return { ...s, static: stat };
     },
     MAX_PARALLEL,
@@ -1069,7 +1133,15 @@ export const POST = withAuth(async (req) => {
         qid,
         existing: loc.wikidataFacts,
       });
-      if (enriched) loc.wikidataFacts = enriched;
+      if (enriched) {
+        loc.wikidataFacts = enriched;
+        if (developerMode) {
+          enrichByCandidateId[loc.id] = {
+            ...(enrichByCandidateId[loc.id] ?? {}),
+            wikidataRest: { qid, facts: enriched },
+          };
+        }
+      }
     }),
   );
 
@@ -1081,13 +1153,21 @@ export const POST = withAuth(async (req) => {
   // content-only signals (Wikidata landmarks / Wikipedia / OSM).
   // Each card is then matched against film-history coords within 50 m
   // and any associated films are merged into the card's `films` array.
+  let filmHistorySourceDebug: SourceDebugEntry[] = [];
   if (withPhoto.length > 0 && searchBbox) {
-    const filmHistoryRun = await runFilmHistoryProviders({
-      bbox: searchBbox,
-      sceneTokens: [],
-      locationKind: null,
-      osmTagsAlternatives: [],
-    }).catch(() => null);
+    const filmHistoryRun = await runFilmHistoryProviders(
+      {
+        bbox: searchBbox,
+        sceneTokens: [],
+        locationKind: null,
+        osmTagsAlternatives: [],
+      },
+      { developerMode },
+    ).catch(() => null);
+
+    if (developerMode && filmHistoryRun) {
+      filmHistorySourceDebug = filmHistoryRun.sourceDebug;
+    }
 
     if (filmHistoryRun && filmHistoryRun.candidates.length > 0) {
       const filmCandidates: ReadonlyArray<RawCandidate> = filmHistoryRun.candidates;
@@ -1225,6 +1305,107 @@ export const POST = withAuth(async (req) => {
     minVisionScore,
   });
 
+  let sourceDebug: SourceDebugEntry[] | undefined;
+  if (developerMode) {
+    const mapillaryImageCount = Object.values(enrichByCandidateId).reduce(
+      (acc, v) => acc + (v.mapillaryImages?.length ?? 0),
+      0,
+    );
+    const mlyDetectT0 = Date.now();
+    sourceDebug = [
+      buildSourceDebugEntry({
+        sourceKey: "mapillary-images",
+        displayName: "Mapillary images (enrich)",
+        ms: 0,
+        error: null,
+        request: {
+          photosPerCandidate,
+          searchTier,
+          candidateCount: dedupedCandidates.length,
+        },
+        candidates: [],
+        enrich: { byCandidateId: enrichByCandidateId },
+        notes: `${mapillaryImageCount} images across ${Object.keys(enrichByCandidateId).length} candidates`,
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "mapillary-detections",
+        displayName: "Mapillary detections (enrich)",
+        ms: Date.now() - mlyDetectT0,
+        error: null,
+        skipped: mapillaryClasses.length === 0 || !searchBbox,
+        skipReason:
+          mapillaryClasses.length === 0
+            ? "no mapillary_classes"
+            : !searchBbox
+              ? "no search_bbox"
+              : null,
+        request: {
+          searchBbox: searchBbox ?? null,
+          mapillaryClasses,
+        },
+        candidates: [],
+        enrich: {
+          summary: {
+            detections: detections.map((d) => ({
+              id: d.id,
+              lat: d.lat,
+              lng: d.lng,
+              objectClass: d.objectClass,
+            })),
+          },
+        },
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "google-places-nearby",
+        displayName: "Google Places nearby (enrich)",
+        ms: 0,
+        error: null,
+        request: { includeClosed, survivors: survivors.length },
+        candidates: [],
+        enrich: { byCandidateId: enrichByCandidateId },
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "street-view",
+        displayName: "Street View static",
+        ms: 0,
+        error: null,
+        skipped: true,
+        skipReason: "Street View probe removed — use Mapillary + Google Maps deep links",
+        request: {},
+        candidates: [],
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "vision-claude",
+        displayName: "Claude vision scoring",
+        ms: 0,
+        error: null,
+        skipped: skipVision,
+        skipReason: skipVision
+          ? searchTier === "free"
+            ? "free tier / high-confidence skip"
+            : "skipVision flag"
+          : null,
+        request: {
+          sceneTokens,
+          visionScoreLimit,
+          minVisionScore,
+        },
+        candidates: [],
+        enrich: { byCandidateId: enrichByCandidateId },
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "wikidata-rest",
+        displayName: "Wikidata REST (card enrich)",
+        ms: 0,
+        error: null,
+        request: { cardsWithQid: qidByLocId.size },
+        candidates: [],
+        enrich: { byCandidateId: enrichByCandidateId },
+      }),
+      ...filmHistorySourceDebug,
+    ];
+  }
+
   const response: EnrichResponse = {
     locations: withPhoto,
     visionScoringApplied,
@@ -1240,6 +1421,7 @@ export const POST = withAuth(async (req) => {
       mapillaryDetectionsFound: detections.length,
       visionSkipped: skipVision,
     },
+    sourceDebug,
   };
   return NextResponse.json(response, { status: 200 });
 });

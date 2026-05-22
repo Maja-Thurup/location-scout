@@ -521,19 +521,6 @@ export const wikidataLandmarkProvider: CandidateProvider = {
       regexFallbackTerms: [...subjects.regexFallbackTerms].sort(),
     });
 
-    const cached = await cacheGet<RawCandidate[]>(cKey);
-    if (cached) {
-      return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
-    }
-
-    // Build the queries we want to run in parallel:
-    //   1. Class-based bbox query (existing behaviour) — broad recall
-    //      across all monuments / buildings / heritage sites.
-    //   2. P180-depicts query — laser-precise for "horse statue" type
-    //      prompts when we recognise the subject.
-    //   3. Label-regex fallback — for prompts whose subject isn't in
-    //      our Q-id table ("lighthouse", "windmill") so the user's
-    //      keyword still drives retrieval.
     const queries: Array<{ kind: string; sparql: string }> = [
       { kind: "class-bbox", sparql: buildSparqlQuery(bbox, 500) },
     ];
@@ -544,8 +531,6 @@ export const wikidataLandmarkProvider: CandidateProvider = {
       });
     }
     if (subjects.regexFallbackTerms.length > 0) {
-      // Combine fallback terms into one disjunctive regex to keep us
-      // at one extra round-trip rather than N.
       const pattern = subjects.regexFallbackTerms
         .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
         .join("|");
@@ -555,6 +540,31 @@ export const wikidataLandmarkProvider: CandidateProvider = {
       });
     }
 
+    const debugRequest = {
+      endpoint: "https://query.wikidata.org/sparql",
+      subjectQids: subjects.qids,
+      regexFallbackTerms: subjects.regexFallbackTerms,
+      queries: queries.map((q) => ({ kind: q.kind, sparql: q.sparql })),
+    };
+
+    const cached = await cacheGet<RawCandidate[]>(cKey);
+    if (cached) {
+      return {
+        candidates: cached,
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: { fromCache: true, request: debugRequest },
+      };
+    }
+
+    // Build the queries we want to run in parallel:
+    //   1. Class-based bbox query (existing behaviour) — broad recall
+    //      across all monuments / buildings / heritage sites.
+    //   2. P180-depicts query — laser-precise for "horse statue" type
+    //      prompts when we recognise the subject.
+    //   3. Label-regex fallback — for prompts whose subject isn't in
+    //      our Q-id table ("lighthouse", "windmill") so the user's
+    //      keyword still drives retrieval.
     const results = await Promise.allSettled(
       queries.map((q) => executeSparql(q.sparql).then((raw) => ({ kind: q.kind, raw }))),
     );
@@ -587,11 +597,21 @@ export const wikidataLandmarkProvider: CandidateProvider = {
     }
 
     if (!anySucceeded) {
-      return { candidates: [], elapsedMs: Date.now() - t0, error: "all_queries_failed" };
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: "all_queries_failed",
+        debug: { request: debugRequest },
+      };
     }
 
     const out = Array.from(merged.values());
     await cacheSet(cKey, "wikidata:sparql", out, 7);
-    return { candidates: out, elapsedMs: Date.now() - t0, error: null };
+    return {
+      candidates: out,
+      elapsedMs: Date.now() - t0,
+      error: null,
+      debug: { request: debugRequest },
+    };
   },
 };

@@ -260,9 +260,21 @@ export const wikipediaGeosearchProvider: CandidateProvider = {
       bbox,
       searchTerm: searchTerm ?? "",
     });
+    const debugRequest = {
+      api: WIKIPEDIA_API,
+      searchTerm,
+      geosearchUrl: buildGeosearchUrl(bbox),
+      fullTextUrl: searchTerm ? buildFullTextSearchUrl(bbox, searchTerm) : null,
+    };
+
     const cached = await cacheGet<RawCandidate[]>(cKey);
     if (cached) {
-      return { candidates: cached, elapsedMs: Date.now() - t0, error: null };
+      return {
+        candidates: cached,
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: { fromCache: true, request: debugRequest },
+      };
     }
 
     // Run geosearch (broad bbox sweep) + optionally full-text search
@@ -301,11 +313,21 @@ export const wikipediaGeosearchProvider: CandidateProvider = {
     }
 
     if (!anySucceeded) {
-      return { candidates: [], elapsedMs: Date.now() - t0, error: "all_queries_failed" };
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: "all_queries_failed",
+        debug: { request: debugRequest },
+      };
     }
 
     const out = Array.from(merged.values());
     await cacheSet(cKey, "wikipedia:geosearch", out, 7);
-    return { candidates: out, elapsedMs: Date.now() - t0, error: null };
+    return {
+      candidates: out,
+      elapsedMs: Date.now() - t0,
+      error: null,
+      debug: { request: debugRequest },
+    };
   },
 };

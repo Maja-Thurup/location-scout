@@ -17,11 +17,14 @@ import { type GooglePlace, searchText } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
 import { findDetectionsInBbox } from "@/lib/mapillary";
 import {
+  buildUnionOverpassQuery,
   type MatchMode,
   type OsmCandidate,
   searchOsm,
   searchOsmRich,
 } from "@/lib/overpass";
+import { buildSourceDebugEntry } from "@/lib/source-debug";
+import type { SourceDebugEntry } from "@/lib/source-debug";
 import { mergeCandidates } from "@/lib/providers/dedupe";
 import { runProviders } from "@/lib/providers/registry";
 import { rrfRank } from "@/lib/providers/rrf";
@@ -123,6 +126,9 @@ const requestSchema = z.object({
       east: z.number(),
     })
     .optional(),
+
+  /** When true, return per-source request/response payloads (not cached). */
+  developerMode: z.boolean().optional().default(false),
 });
 
 /**
@@ -192,6 +198,7 @@ type SearchOsmResponse = {
    * disagreements.
    */
   highConfidence: boolean;
+  sourceDebug?: SourceDebugEntry[];
 };
 
 type CachedSearchValue = {
@@ -204,6 +211,7 @@ type CachedSearchValue = {
   alternativesSucceeded: number;
   providerStats: Record<ProviderName, { count: number; ms: number; error: string | null }>;
   highConfidence: boolean;
+  sourceDebug?: SourceDebugEntry[];
 };
 
 // ---------------------------------------------------------------------------
@@ -319,6 +327,7 @@ export const POST = withAuth(async (req) => {
     location,
     radiusMiles,
     bbox: suppliedBbox,
+    developerMode,
   } = parsed.data;
 
   const effectiveAlternatives: ReadonlyArray<Record<string, string>> =
@@ -388,7 +397,7 @@ export const POST = withAuth(async (req) => {
     searchTier,
   });
   const cached = await cacheGet<CachedSearchValue>(key);
-  if (cached?.candidates) {
+  if (cached?.candidates && !developerMode) {
     logger.info("search-osm cache hit", {
       userId: req.dbUserId,
       ms: Date.now() - t0,
@@ -420,6 +429,7 @@ export const POST = withAuth(async (req) => {
   // 3) PARALLEL: run OSM and the provider registry.
   //    OSM has its own tier-relaxation logic; providers each cache for
   //    7 days so re-runs are nearly free.
+  const osmT0 = Date.now();
   const osmPromise = (async () => {
     return effectiveAlternatives.length > 1
       ? await searchOsmRich({
@@ -428,12 +438,15 @@ export const POST = withAuth(async (req) => {
         })
       : await searchOsm({ bbox, osmTags: effectiveAlternatives[0]! });
   })();
-  const providersPromise = runProviders({
-    bbox,
-    sceneTokens,
-    locationKind,
-    osmTagsAlternatives: effectiveAlternatives,
-  });
+  const providersPromise = runProviders(
+    {
+      bbox,
+      sceneTokens,
+      locationKind,
+      osmTagsAlternatives: effectiveAlternatives,
+    },
+    { developerMode },
+  );
 
   // 3b) DEEP TIER ONLY: parallel Google Places searchText. This is the
   // entity-name index — for prompts like "horse statue in a park" or
@@ -441,7 +454,8 @@ export const POST = withAuth(async (req) => {
   // (Sherman Monument, Joan of Arc Statue, ...) instantly. We pay
   // ~$0.02 per searchText call and gate this behind the "deep" tier
   // so free-tier searches stay near-zero cost.
-  const googleTextPromise: Promise<GooglePlace[]> =
+  const googleT0 = Date.now();
+  const googleTextPromise: Promise<{ places: GooglePlace[]; error: string | null }> =
     searchTier === "deep" && googleQuery && googleQuery.trim().length >= 2
       ? searchText({
           textQuery: googleQuery,
@@ -449,13 +463,14 @@ export const POST = withAuth(async (req) => {
           includedType: googleTypes?.[0],
           includeClosedPermanently: false,
           maxResultCount: 20,
-        }).catch((err) => {
-          logger.warn("deep-tier Google searchText threw (non-fatal)", {
-            err: err instanceof Error ? err.message : String(err),
-          });
-          return [];
         })
-      : Promise.resolve([] as GooglePlace[]);
+          .then((places) => ({ places, error: null }))
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn("deep-tier Google searchText threw (non-fatal)", { err: msg });
+            return { places: [] as GooglePlace[], error: msg };
+          })
+      : Promise.resolve({ places: [] as GooglePlace[], error: null });
 
   let osmResult;
   try {
@@ -478,14 +493,18 @@ export const POST = withAuth(async (req) => {
   // returns an error stat. We await separately so an OSM throw doesn't
   // cancel them (and vice versa).
   const providerResult = await providersPromise;
-  const googleTextResults = await googleTextPromise;
+  const googleTextResult = await googleTextPromise;
+  const googleTextResults = googleTextResult.places;
+  const osmMs = Date.now() - osmT0;
+  const googleMs = Date.now() - googleT0;
 
   let effectiveBbox = osmResult.effectiveBbox;
-  const osmCandidates = osmResult.candidates.filter(
+  const osmRawBeforeFilter = osmResult.candidates;
+  const osmCandidates = osmRawBeforeFilter.filter(
     (c) => !shouldExcludeOsmCommercialOnSculptureScene(c.tags, sceneTokens),
   );
   const droppedOsmCommercial =
-    osmResult.candidates.length - osmCandidates.length;
+    osmRawBeforeFilter.length - osmCandidates.length;
   if (droppedOsmCommercial > 0) {
     logger.info("search-osm dropped commercial OSM name-regex false positives", {
       droppedOsmCommercial,
@@ -498,15 +517,18 @@ export const POST = withAuth(async (req) => {
   // 3.5) Mapillary detections — additional OSM-flavored candidates from
   // street-level object detections (benches, hydrants, etc.).
   const mapillaryCandidates: OsmCandidate[] = [];
+  const mlyT0 = Date.now();
+  let mapillaryDetectionsRaw: Awaited<ReturnType<typeof findDetectionsInBbox>> = [];
+  let mapillaryDetectionsError: string | null = null;
   if (mapillaryClasses && mapillaryClasses.length > 0) {
     const bboxStr = `${effectiveBbox.west},${effectiveBbox.south},${effectiveBbox.east},${effectiveBbox.north}`;
     try {
-      const detections = await findDetectionsInBbox({
+      mapillaryDetectionsRaw = await findDetectionsInBbox({
         bboxStr,
         classes: mapillaryClasses,
         limit: 80,
       });
-      for (const d of detections) {
+      for (const d of mapillaryDetectionsRaw) {
         mapillaryCandidates.push({
           id: `mapillary/${d.id}`,
           type: "node",
@@ -517,17 +539,20 @@ export const POST = withAuth(async (req) => {
           name: null,
         });
       }
-      if (detections.length > 0) {
+      if (mapillaryDetectionsRaw.length > 0) {
         logger.info("search-osm Mapillary detections merged", {
-          count: detections.length,
+          count: mapillaryDetectionsRaw.length,
         });
       }
     } catch (err) {
+      mapillaryDetectionsError =
+        err instanceof Error ? err.message : String(err);
       logger.warn("search-osm Mapillary detections threw (non-fatal)", {
-        err: String(err),
+        err: mapillaryDetectionsError,
       });
     }
   }
+  const mapillaryMs = Date.now() - mlyT0;
 
   // 4) Build the unified raw-candidate pool: OSM + Mapillary + providers
   //    + (deep tier only) Google Places searchText.
@@ -764,6 +789,83 @@ export const POST = withAuth(async (req) => {
     perProvider: providerResult.perProvider,
   });
 
+  let sourceDebug: SourceDebugEntry[] | undefined;
+  if (developerMode) {
+    let overpassQuery: string | null = null;
+    try {
+      overpassQuery = buildUnionOverpassQuery({
+        bbox,
+        osmTagsAlternatives: effectiveAlternatives,
+      });
+    } catch {
+      overpassQuery = null;
+    }
+
+    const extras: SourceDebugEntry[] = [
+      buildSourceDebugEntry({
+        sourceKey: "osm-overpass",
+        displayName: "OSM Overpass",
+        ms: osmMs,
+        error: null,
+        request: {
+          bbox,
+          osmTagsAlternatives: effectiveAlternatives,
+          overpassQuery,
+          matchMode: finalMatchMode,
+          mirror: osmResult.mirror,
+          expansionMultiplier: finalExpansion,
+          alternativesTried,
+          alternativesSucceeded,
+        },
+        candidates: osmRawBeforeFilter.map(osmCandidateToRaw),
+        notes:
+          droppedOsmCommercial > 0
+            ? `Post-fetch: removed ${droppedOsmCommercial} commercial OSM name-regex false positives`
+            : null,
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "mapillary-detections",
+        displayName: "Mapillary detections (search)",
+        ms: mapillaryMs,
+        error: mapillaryDetectionsError,
+        skipped: !mapillaryClasses?.length,
+        skipReason: !mapillaryClasses?.length
+          ? "no mapillary_classes in scene parse"
+          : null,
+        request: {
+          bbox: effectiveBbox,
+          mapillaryClasses: mapillaryClasses ?? [],
+        },
+        candidates: mapillaryCandidates.map(osmCandidateToRaw),
+        enrich: {
+          summary: { detections: mapillaryDetectionsRaw },
+        },
+      }),
+      buildSourceDebugEntry({
+        sourceKey: "google-places-text",
+        displayName: "Google Places searchText",
+        ms: googleMs,
+        error: googleTextResult.error,
+        skipped: searchTier !== "deep",
+        skipReason:
+          searchTier !== "deep"
+            ? "free tier — Google searchText not run"
+            : !googleQuery?.trim()
+              ? "no google_query"
+              : null,
+        request: {
+          textQuery: googleQuery ?? null,
+          bbox,
+          includedType: googleTypes?.[0] ?? null,
+          searchTier,
+        },
+        candidates: googleTextResults.map(googlePlaceToRaw),
+      }),
+    ];
+
+    sourceDebug = [...extras, ...providerResult.sourceDebug];
+  }
+
   const response: SearchOsmResponse = {
     bbox: effectiveBbox,
     requestedBbox: bbox,
@@ -779,6 +881,7 @@ export const POST = withAuth(async (req) => {
     alternativesSucceeded,
     providerStats: providerResult.perProvider,
     highConfidence,
+    sourceDebug,
   };
   return NextResponse.json(response, { status: 200 });
 });

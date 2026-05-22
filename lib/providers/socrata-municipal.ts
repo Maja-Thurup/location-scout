@@ -253,17 +253,23 @@ async function searchDataset(
 }
 
 export const socrataMunicipalProvider: CandidateProvider = {
-  // We piggy-back on `own-db` ProviderName so existing dedupe / RRF
-  // weights treat municipal datasets the same as our imported tables.
-  // Adding a new ProviderName would require schema migrations
-  // elsewhere; reusing keeps this provider self-contained.
   name: "own-db",
+  debugKey: "socrata-municipal",
+  displayName: "Socrata municipal (NYC / SF / Chicago)",
   supportsBbox: (bbox) => DATASETS.some((d) => isBboxOverlapping(d.bbox, bbox)),
   async search(input: ProviderInput): Promise<ProviderResult> {
     const t0 = Date.now();
     const eligible = DATASETS.filter((d) => isBboxOverlapping(d.bbox, input.bbox));
     if (eligible.length === 0) {
-      return { candidates: [], elapsedMs: Date.now() - t0, error: null };
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: {
+          skipReason: "bbox does not overlap any registered municipal dataset",
+          request: { datasets: DATASETS.map((d) => d.label) },
+        },
+      };
     }
 
     const { joined } = extractKeywords(input.sceneTokens, {
@@ -277,7 +283,21 @@ export const socrataMunicipalProvider: CandidateProvider = {
     );
     const results = await Promise.all(fetches);
     const out: RawCandidate[] = results.flat();
-    return { candidates: out, elapsedMs: Date.now() - t0, error: null };
+    return {
+      candidates: out,
+      elapsedMs: Date.now() - t0,
+      error: null,
+      debug: {
+        request: {
+          datasets: eligible.map((d) => ({
+            id: d.id,
+            label: d.label,
+            domain: d.domain,
+          })),
+          keywordQuery: q,
+        },
+      },
+    };
   },
 };
 

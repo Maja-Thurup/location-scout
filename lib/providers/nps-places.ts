@@ -675,13 +675,28 @@ export const npsPlacesProvider: CandidateProvider = {
     const t0 = Date.now();
 
     if (!env.NPS_API_KEY) {
-      // Quietly skip when the optional key is missing.
-      return { candidates: [], elapsedMs: Date.now() - t0, error: null };
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: {
+          skipReason: "NPS_API_KEY not set",
+          request: { endpoint: "https://developer.nps.gov/api/v1" },
+        },
+      };
     }
 
     const states = statesIntersectingBbox(input.bbox);
     if (states.length === 0) {
-      return { candidates: [], elapsedMs: Date.now() - t0, error: null };
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: {
+          skipReason: "bbox does not intersect any US state (NPS is US-only)",
+          request: { bbox: input.bbox },
+        },
+      };
     }
 
     const npsQuery = extractNpsQuery(input.sceneTokens);
@@ -797,6 +812,17 @@ export const npsPlacesProvider: CandidateProvider = {
       if (c && inBbox({ lat: c.lat, lng: c.lng })) out.push(c);
     }
 
-    return { candidates: out, elapsedMs: Date.now() - t0, error: null };
+    return {
+      candidates: out,
+      elapsedMs: Date.now() - t0,
+      error: null,
+      debug: {
+        request: {
+          states,
+          keywordQuery: extractNpsQuery(input.sceneTokens),
+          endpoints: ["/places", "/parks", "/articles", "/people", "/campgrounds"],
+        },
+      },
+    };
   },
 };

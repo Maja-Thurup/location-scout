@@ -352,7 +352,15 @@ export const ridbRecreationProvider: CandidateProvider = {
   async search(input: ProviderInput): Promise<ProviderResult> {
     const t0 = Date.now();
     if (!env.RIDB_API_KEY) {
-      return { candidates: [], elapsedMs: Date.now() - t0, error: null };
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: {
+          skipReason: "RIDB_API_KEY not set",
+          request: { endpoint: RIDB_BASE },
+        },
+      };
     }
     const ridbQuery = extractRidbQuery(input.sceneTokens);
 
@@ -443,12 +451,25 @@ export const ridbRecreationProvider: CandidateProvider = {
         const c = recAreaToCandidate(r);
         if (c) out.push(c);
       }
-      return { candidates: out, elapsedMs: Date.now() - t0, error: null };
+      return {
+        candidates: out,
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: {
+          request: {
+            endpoint: RIDB_BASE,
+            keywordQuery: ridbQuery.joined,
+            keywordTokens: ridbQuery.list,
+            endpoints: ["facilities", "recareas"],
+          },
+        },
+      };
     } catch (err) {
       return {
         candidates: [],
         elapsedMs: Date.now() - t0,
         error: err instanceof Error ? err.message : String(err),
+        debug: { request: { endpoint: RIDB_BASE, keywordQuery: ridbQuery.joined } },
       };
     }
   },

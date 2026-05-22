@@ -183,16 +183,32 @@ export type ProviderInput = {
   osmTagsAlternatives: ReadonlyArray<Record<string, string>>;
 };
 
+/** Developer-mode metadata attached to a provider run. */
+export type ProviderDebugMeta = {
+  request?: Record<string, unknown>;
+  skipReason?: string | null;
+  fromCache?: boolean;
+  notes?: string | null;
+};
+
 export type ProviderResult = {
   candidates: RawCandidate[];
   /** Wall-clock time spent in this provider, for observability. */
   elapsedMs: number;
   /** Hard error, if any — surfaced for debugging but never throws. */
   error: string | null;
+  debug?: ProviderDebugMeta;
 };
 
 export interface CandidateProvider {
   name: ProviderName;
+  /**
+   * Stable key for developer-mode inspector (defaults to `name`).
+   * Socrata uses `own-db` as ProviderName but `socrata-municipal` here.
+   */
+  debugKey?: string;
+  /** Human label in the source inspector UI. */
+  displayName?: string;
   /** Cheap geographic gate so we don't fire NYC-only providers in Brooklyn-NM. */
   supportsBbox(bbox: Bbox): boolean;
   /** Run a single candidate query. Must never throw — return `{ error }` instead. */

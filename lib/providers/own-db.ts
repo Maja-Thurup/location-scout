@@ -125,6 +125,19 @@ export const ownDbProvider: CandidateProvider = {
     }
 
     const out: RawCandidate[] = rows.map(placeToCandidate);
-    return { candidates: out, elapsedMs: Date.now() - t0, error: null };
+    return {
+      candidates: out,
+      elapsedMs: Date.now() - t0,
+      error: null,
+      debug: {
+        request: {
+          table: "Place",
+          bbox,
+          limit: QUERY_LIMIT,
+          orderBy: "popularityScore desc",
+        },
+        notes: rows.length === 0 ? "Place table empty or no rows in bbox" : null,
+      },
+    };
   },
 };
