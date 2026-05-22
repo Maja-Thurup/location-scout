@@ -9,6 +9,7 @@ import posthog from "posthog-js";
 
 import type { Bbox } from "@/lib/bbox";
 import type { SceneAnalysis } from "@/lib/claude";
+import { resolveRetrievalPlan, type RetrievalPlan } from "@/lib/retrieval-plan";
 import type { OsmCandidate } from "@/lib/overpass";
 import type { SourceDebugEntry } from "@/lib/source-debug";
 import { useDeveloperMode } from "@/lib/use-developer-mode";
@@ -106,6 +107,8 @@ type RankedCandidate = OsmCandidate & {
   sourceUrl?: string | null;
   /** Optional Wikidata facts, populated when any source had a Q-id. */
   wikidataFacts?: WikidataFactsClient;
+  tagHitCount?: number;
+  tagOverlapScore?: number;
 };
 
 type ProviderStat = {
@@ -137,6 +140,7 @@ type SearchOsmResponse = {
   providerStats?: Partial<Record<ProviderName, ProviderStat>>;
   /** Full per-source inspector (developer mode). */
   sourceDebug?: SourceDebugEntry[];
+  retrievalPlan?: RetrievalPlan | null;
 };
 
 type SelectedPhoto = {
@@ -239,6 +243,7 @@ async function searchOsmRequest(input: {
   location?: string;
   radiusMiles: number | null;
   developerMode?: boolean;
+  retrievalPlan?: RetrievalPlan | null;
 }): Promise<SearchOsmResponse> {
   const res = await fetch("/api/search-osm", {
     method: "POST",
@@ -284,6 +289,7 @@ async function enrichLocationsRequest(input: {
   searchTier?: "free" | "deep";
   mapillaryClasses?: ReadonlyArray<string>;
   developerMode?: boolean;
+  retrievalPlan?: RetrievalPlan | null;
 }): Promise<EnrichResponse> {
   const res = await fetch("/api/enrich-locations", {
     method: "POST",
@@ -484,6 +490,7 @@ export function SceneInputForm({
         ? analysis.osm_tags_alternatives
         : undefined;
     const sceneTokens = analysis.scene_tokens ?? [];
+    const retrievalPlan = resolveRetrievalPlan(analysis);
     let osm: SearchOsmResponse;
     try {
       osm = await osmMutation.mutateAsync({
@@ -499,6 +506,7 @@ export function SceneInputForm({
         location,
         radiusMiles,
         developerMode: devModeActive,
+        retrievalPlan,
       });
       setOsmResult(osm);
       posthog.capture("osm_search_completed", {
@@ -547,6 +555,8 @@ export function SceneInputForm({
           associatedFilms: c.associatedFilms,
           sourceUrl: c.sourceUrl,
           wikidataFacts: c.wikidataFacts,
+          tagHitCount: c.tagHitCount,
+          tagOverlapScore: c.tagOverlapScore,
         })),
         searchCenter: osm.center,
         searchBbox: osm.bbox,
@@ -566,6 +576,7 @@ export function SceneInputForm({
         searchTier,
         mapillaryClasses: analysis.mapillary_classes ?? [],
         developerMode: devModeActive,
+        retrievalPlan: osm.retrievalPlan ?? retrievalPlan,
       });
       setEnrichResult(enriched);
       setStage({ kind: "ready" });

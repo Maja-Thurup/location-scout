@@ -21,12 +21,24 @@ import {
   countDetectionsNearPoint,
   findBestImageNear,
   findBestPanoNear,
+  fetchImageDetections,
   findDetectionsInBbox,
   findImagesNear,
   type MapillaryDetection,
   type MapillaryImage,
 } from "@/lib/mapillary";
 import { mapSceneToMapillary } from "@/lib/mapillary/scene-to-classes";
+import {
+  backgroundDetectionClasses,
+  compareEnrichTiers,
+  computeEnrichRankTier,
+  resolveMapillaryClassesFromPlan,
+  retrievalPlanSchema,
+  shouldRunMapillaryBboxSearch,
+  shouldUseEnrichDetectionFilter,
+  type EnrichRankTier,
+  type RetrievalPlan,
+} from "@/lib/retrieval-plan";
 import { runFilmHistoryProviders } from "@/lib/providers/registry";
 import { buildSourceDebugEntry } from "@/lib/source-debug";
 import type { EnrichSourcePayload, SourceDebugEntry } from "@/lib/source-debug";
@@ -110,6 +122,9 @@ const candidateSchema = z.object({
   sourceUrl: z.string().nullable().optional(),
   /** Optional Wikidata facts pre-populated by search-osm. */
   wikidataFacts: wikidataFactsSchema.optional(),
+  /** From search-osm ranking (for tier sort). */
+  tagHitCount: z.number().int().min(0).optional().default(0),
+  tagOverlapScore: z.number().min(0).optional().default(0),
 });
 
 const requestSchema = z.object({
@@ -186,6 +201,8 @@ const requestSchema = z.object({
     .optional(),
   /** When true, return per-source enrich-phase debug payloads. */
   developerMode: z.boolean().optional().default(false),
+  /** Structured plan from parse-scene / search-osm. */
+  retrievalPlan: retrievalPlanSchema.optional(),
 });
 
 export type SelectedPhoto = {
@@ -275,6 +292,10 @@ export type EnrichedLocation = {
    * a Q-id but no facts payload yet.
    */
   wikidataFacts?: WikidataFacts;
+  /** Sort tier: 1 = Mapillary + background, 2 = Mapillary only, 3 = strong subject, 4 = rest. */
+  enrichRankTier?: EnrichRankTier;
+  mapillaryAttached?: boolean;
+  backgroundMatchCount?: number;
 };
 
 type EnrichResponse = {
@@ -718,6 +739,21 @@ function selectedFromKnown(args: {
   };
 }
 
+/** Count how many required Mapillary detection classes appear in one image. */
+async function countBackgroundClassesInImage(
+  imageId: string,
+  required: ReadonlyArray<string>,
+): Promise<number> {
+  if (!imageId || required.length === 0) return 0;
+  const dets = await fetchImageDetections(imageId);
+  const found = new Set(dets.map((d) => d.objectClass));
+  let n = 0;
+  for (const c of required) {
+    if (found.has(c)) n++;
+  }
+  return n;
+}
+
 // ---------------------------------------------------------------------------
 // Route handler
 // ---------------------------------------------------------------------------
@@ -761,7 +797,10 @@ export const POST = withAuth(async (req) => {
     mapillaryClasses,
     searchBbox,
     developerMode,
+    retrievalPlan: requestRetrievalPlan,
   } = parsed.data;
+
+  const retrievalPlan: RetrievalPlan | null = requestRetrievalPlan ?? null;
 
   const enrichByCandidateId: NonNullable<EnrichSourcePayload["byCandidateId"]> =
     {};
@@ -800,20 +839,36 @@ export const POST = withAuth(async (req) => {
   // When the scene calls out specific objects (bench, bike rack, etc.),
   // fetching all matching detections for the bbox in one call is far
   // cheaper than per-candidate fetches.
-  const enrichMlyPlan = mapSceneToMapillary({
+  const enrichMlyFallback = mapSceneToMapillary({
     sceneTokens,
     mapillaryClasses,
   });
+  const enrichMlyFromPlan = retrievalPlan
+    ? resolveMapillaryClassesFromPlan(retrievalPlan)
+    : null;
+  const enrichMlyPlan = enrichMlyFromPlan
+    ? { ...enrichMlyFallback, ...enrichMlyFromPlan }
+    : enrichMlyFallback;
   const enrichMlyBboxClasses = [
     ...new Set([...mapillaryClasses, ...enrichMlyPlan.bboxClasses]),
   ];
+  const bgDetectionClasses = retrievalPlan
+    ? backgroundDetectionClasses(retrievalPlan)
+    : [];
+  const backgroundRequested = bgDetectionClasses.length > 0;
+
   let detections: MapillaryDetection[] = [];
-  if (enrichMlyBboxClasses.length > 0 && searchBbox) {
+  const runEnrichMlyBbox =
+    retrievalPlan != null
+      ? shouldRunMapillaryBboxSearch(retrievalPlan)
+      : enrichMlyBboxClasses.length > 0;
+  if (runEnrichMlyBbox && enrichMlyBboxClasses.length > 0 && searchBbox) {
     detections = await findDetectionsInBbox({
       bbox: searchBbox,
       classes: enrichMlyBboxClasses,
       limit: 200,
-      maxTiles: 40,
+      maxTiles: 12,
+      maxDurationMs: 15_000,
     });
   }
 
@@ -853,17 +908,20 @@ export const POST = withAuth(async (req) => {
   // -------- Phase 1.5: object-class detections (Mapillary) --------
   // When the scene calls out specific objects, drop candidates that have
   // none of them within 50m. Free filter, no API calls per candidate.
-  const afterDetectionFilter =
-    enrichMlyBboxClasses.length > 0
-      ? afterColorFilter.filter((s) => {
-          const hits = countDetectionsNearPoint(
-            detections,
-            { lat: s.candidate.lat, lng: s.candidate.lng },
-            50,
-          );
-          return hits > 0;
-        })
-      : afterColorFilter;
+  const useDetectionFilter =
+    retrievalPlan != null
+      ? shouldUseEnrichDetectionFilter(retrievalPlan)
+      : enrichMlyBboxClasses.length > 0;
+  const afterDetectionFilter = useDetectionFilter
+    ? afterColorFilter.filter((s) => {
+        const hits = countDetectionsNearPoint(
+          detections,
+          { lat: s.candidate.lat, lng: s.candidate.lng },
+          50,
+        );
+        return hits > 0;
+      })
+    : afterColorFilter;
 
   // -------- Phase 2: vision scoring on Mapillary photos --------
   // Two paths:
@@ -904,6 +962,36 @@ export const POST = withAuth(async (req) => {
       visionScoreLimit,
     );
   }
+
+  // -------- Phase 2.5: per-photo background verify (retrieval plan) --------
+  type ScoredWithBg = (typeof scored)[number] & {
+    backgroundMatchCount: number;
+    mapillaryAttached: boolean;
+  };
+  const scoredWithBackground: ScoredWithBg[] = await Promise.all(
+    scored.map(async (s) => {
+      const mapillaryAttached = Boolean(s.mapillary);
+      let backgroundMatchCount = 0;
+      if (backgroundRequested && s.mapillary?.id) {
+        backgroundMatchCount = await countBackgroundClassesInImage(
+          s.mapillary.id,
+          bgDetectionClasses,
+        );
+      }
+      return { ...s, backgroundMatchCount, mapillaryAttached };
+    }),
+  );
+  const bgMetaByCandidateId = new Map<
+    string,
+    { mapillaryAttached: boolean; backgroundMatchCount: number }
+  >();
+  for (const s of scoredWithBackground) {
+    bgMetaByCandidateId.set(s.candidate.id, {
+      mapillaryAttached: s.mapillaryAttached,
+      backgroundMatchCount: s.backgroundMatchCount,
+    });
+  }
+  scored = scoredWithBackground;
 
   if (developerMode) {
     for (const s of scored) {
@@ -1114,6 +1202,22 @@ export const POST = withAuth(async (req) => {
       // Card-time fill-in for Q-id-only candidates happens below in
       // the post-mapping enrichment pass.
       wikidataFacts: candidate.wikidataFacts,
+      ...(() => {
+        const bg = bgMetaByCandidateId.get(candidate.id);
+        const mapillaryAttached = bg?.mapillaryAttached ?? Boolean(e.mapillary);
+        const backgroundMatchCount = bg?.backgroundMatchCount ?? 0;
+        return {
+          mapillaryAttached,
+          backgroundMatchCount,
+          enrichRankTier: computeEnrichRankTier({
+            mapillaryAttached,
+            backgroundMatchCount,
+            backgroundRequested,
+            tagHitCount: candidate.tagHitCount ?? 0,
+            hasCuratedImage: Boolean(candidate.knownImageUrl),
+          }),
+        };
+      })(),
     };
   });
 
@@ -1281,15 +1385,40 @@ export const POST = withAuth(async (req) => {
     }),
   );
 
-  // Final sort: vision score desc, then distance asc.
-  withPhoto.sort((a, b) => {
-    const sa = a.photos[0]?.visionScore ?? -1;
-    const sb = b.photos[0]?.visionScore ?? -1;
-    if (sa !== sb) return sb - sa;
-    const da = a.distanceMeters ?? Number.POSITIVE_INFINITY;
-    const db = b.distanceMeters ?? Number.POSITIVE_INFINITY;
-    return da - db;
-  });
+  // Final sort: tier (Mapillary+background first) when plan requests it.
+  const tierSort =
+    retrievalPlan?.ranking.tier_mapillary_with_background_first === true;
+  if (tierSort) {
+    withPhoto.sort((a, b) => {
+      const tagHits = (loc: EnrichedLocation) => {
+        const c = candidates.find((x) => x.id === loc.id);
+        return c?.tagHitCount ?? 0;
+      };
+      return compareEnrichTiers(
+        {
+          tier: a.enrichRankTier ?? 4,
+          tagHitCount: tagHits(a),
+          visionScore: a.photos[0]?.visionScore ?? -1,
+          distanceMeters: a.distanceMeters ?? Number.POSITIVE_INFINITY,
+        },
+        {
+          tier: b.enrichRankTier ?? 4,
+          tagHitCount: tagHits(b),
+          visionScore: b.photos[0]?.visionScore ?? -1,
+          distanceMeters: b.distanceMeters ?? Number.POSITIVE_INFINITY,
+        },
+      );
+    });
+  } else {
+    withPhoto.sort((a, b) => {
+      const sa = a.photos[0]?.visionScore ?? -1;
+      const sb = b.photos[0]?.visionScore ?? -1;
+      if (sa !== sb) return sb - sa;
+      const da = a.distanceMeters ?? Number.POSITIVE_INFINITY;
+      const db = b.distanceMeters ?? Number.POSITIVE_INFINITY;
+      return da - db;
+    });
+  }
 
   const visionScoringApplied = scored.some((s) => s.visionScore != null);
 

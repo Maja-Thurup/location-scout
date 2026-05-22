@@ -182,6 +182,59 @@ describe("tagOverlapScore", () => {
     expect(b.score).toBeCloseTo(a.score + 0.5, 5);
   });
 
+  it("Sakura Grove (subject:cherry_blossom + altLabels) matches a 'cherry tree' prompt", () => {
+    // Generic any-prompt scenario: an OSM node tagged with subject-
+    // family keys plus a Wikidata altLabels list. The blob must
+    // surface both so a "cherry tree" prompt reaches it without the
+    // subject string appearing in the name.
+    const c = merged({
+      name: "Sakura Grove",
+      description: "A planted grove on the riverbank",
+      tags: {
+        leisure: "park",
+        subject: "cherry blossom",
+        artwork_subject: "cherry tree",
+        natural: "tree",
+      },
+      wikidataFacts: {
+        inception: null,
+        creators: [],
+        architects: [],
+        materials: [],
+        genres: [],
+        depicts: [],
+        namedAfter: ["sakura"],
+        partOf: [],
+        hasParts: [],
+        commonsCategory: null,
+        altLabels: ["Cherry Blossom Park", "Sakura Park"],
+      },
+    });
+    const tokens = ["cherry", "blossom", "tree", "park"];
+    const o = tagOverlapScore(c, tokens);
+    expect(o.matched).toContain("cherry");
+    expect(o.matched).toContain("blossom");
+    expect(o.matched).toContain("tree");
+    expect(o.matched).toContain("park");
+    expect(o.score).toBeGreaterThan(2);
+  });
+
+  it("buildCandidateText surfaces subject-family tag values into the blob", () => {
+    const c = merged({
+      name: "Memorial",
+      description: null,
+      tags: {
+        statue: "Marie Curie",
+        artwork_type: "bust",
+        historic: "memorial",
+      },
+    });
+    const blob = buildCandidateText(c);
+    expect(blob).toContain("marie curie");
+    expect(blob).toContain("bust");
+    expect(blob).toContain("memorial");
+  });
+
   it("countOsmAlternativeHits matches classifier tags on the node", () => {
     const c = merged({
       tags: { tourism: "artwork", historic: "memorial" },

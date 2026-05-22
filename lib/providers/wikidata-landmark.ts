@@ -512,22 +512,32 @@ export const wikidataLandmarkProvider: CandidateProvider = {
     const { bbox, sceneTokens } = input;
 
     const subjects = extractSubjects(sceneTokens);
+    // Merge planner-supplied Q-ids with the dictionary-derived ones.
+    // Generic for any prompt — `query_hints.depicts_qids` is filled
+    // by the planner from `wbsearchentities` (or the SUBJECT_QIDS
+    // dictionary cache) for the subject noun in the prompt.
+    const planDepicts = input.queryHints?.wikidataDepictsQids ?? [];
+    const planClasses = input.queryHints?.wikidataClassesQids ?? [];
+    const allDepictsQids = Array.from(
+      new Set<string>([...subjects.qids, ...planDepicts]),
+    ).filter((q) => /^Q\d+$/.test(q));
 
     const cKey = cacheKey("wikidata:sparql", {
-      kind: "landmark-v5-facts-enriched",
+      kind: "landmark-v6-plan-hints",
       bbox,
       classes: TARGET_CLASSES,
-      subjectQids: [...subjects.qids].sort(),
+      subjectQids: [...allDepictsQids].sort(),
+      planClasses: [...planClasses].sort(),
       regexFallbackTerms: [...subjects.regexFallbackTerms].sort(),
     });
 
     const queries: Array<{ kind: string; sparql: string }> = [
       { kind: "class-bbox", sparql: buildSparqlQuery(bbox, 500) },
     ];
-    if (subjects.qids.length > 0) {
+    if (allDepictsQids.length > 0) {
       queries.push({
         kind: "p180-depicts",
-        sparql: buildP180Query(bbox, subjects.qids, 200),
+        sparql: buildP180Query(bbox, allDepictsQids, 200),
       });
     }
     if (subjects.regexFallbackTerms.length > 0) {
@@ -542,7 +552,9 @@ export const wikidataLandmarkProvider: CandidateProvider = {
 
     const debugRequest = {
       endpoint: "https://query.wikidata.org/sparql",
-      subjectQids: subjects.qids,
+      subjectQids: allDepictsQids,
+      planDepictsQids: planDepicts,
+      planClassesQids: planClasses,
       regexFallbackTerms: subjects.regexFallbackTerms,
       queries: queries.map((q) => ({ kind: q.kind, sparql: q.sparql })),
     };

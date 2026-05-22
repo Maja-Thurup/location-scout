@@ -253,6 +253,30 @@ export const wikipediaGeosearchProvider: CandidateProvider = {
     const t0 = Date.now();
     const { bbox, sceneTokens } = input;
 
+    // Self-skip when the planner asked us to gate on the upstream
+    // Q-id pool AND that pool already covers the bbox. Saves a full
+    // MediaWiki round-trip when Wikidata + OSM already produced
+    // candidates with sitelinks (which lib/wikipedia-extracts will
+    // pick up directly from sitelinks.enwiki).
+    if (
+      input.queryHints?.wikipediaRunOnlyWhenNoQids === true &&
+      (input.queryHints.wikipediaUpstreamQids?.length ?? 0) > 0
+    ) {
+      return {
+        candidates: [],
+        elapsedMs: Date.now() - t0,
+        error: null,
+        debug: {
+          skipReason: `gated by retrieval_plan: ${input.queryHints.wikipediaUpstreamQids?.length ?? 0} upstream Q-ids — extracts handled via sitelinks`,
+          request: {
+            api: WIKIPEDIA_API,
+            run_only_when_no_qids: true,
+            upstreamQidCount: input.queryHints.wikipediaUpstreamQids?.length ?? 0,
+          },
+        },
+      };
+    }
+
     const searchTerm = buildSearchTerm(sceneTokens);
 
     const cKey = cacheKey("wikipedia:geosearch", {

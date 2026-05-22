@@ -10,6 +10,8 @@ import { checkRateLimit, incrementUsage } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+/** Claude parse can exceed the default 10s Vercel Hobby cap on cold starts. */
+export const maxDuration = 60;
 
 // Allowed radii. `null` (or absent) means "use the location's natural area"
 // (we'll fall back to the geocoded bbox in M3).
@@ -105,7 +107,7 @@ export const POST = withAuth(async (req) => {
   // this constant whenever the prompt or output schema changes
   // materially. v4 drops anti_tokens and reframes scene_tokens as
   // prompt-derived only (no inferred attributes).
-  const PARSE_SCENE_SCHEMA_VERSION = "v5-subject-only-name-regex";
+  const PARSE_SCENE_SCHEMA_VERSION = "v7-perf-source-hints";
   const key = cacheKey("claude:parse-scene", {
     schema: PARSE_SCENE_SCHEMA_VERSION,
     sceneText,

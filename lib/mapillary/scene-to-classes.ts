@@ -6,8 +6,20 @@ export type MapillaryClassPlan = {
   unmatchedTokens: string[];
 };
 
-/** scene_token / visual cue → canonical Mapillary object_value. */
+/**
+ * scene_token / visual cue → canonical Mapillary `object_value`.
+ *
+ * Two families:
+ *   - Points (bbox-searchable via /map_features): objects, signs,
+ *     poles, traffic lights, pavement markings, construction.
+ *   - Segmentation (image-scan only via /{id}/detections):
+ *     vegetation / mountain / sand / sky / building.
+ *
+ * The keys are lowercased, space-separated user words. Match is exact
+ * (not regex) — Claude or the planner emits the canonical token.
+ */
 const TOKEN_TO_MAPILLARY: Record<string, string | string[]> = {
+  // Furniture / objects
   bench: "object--bench",
   benches: "object--bench",
   "bike rack": "object--bike-rack",
@@ -17,10 +29,63 @@ const TOKEN_TO_MAPILLARY: Record<string, string | string[]> = {
   mailbox: "object--mailbox",
   manhole: "object--manhole",
   "phone booth": "object--phone-booth",
+  trash: "object--trash-can",
+  "trash can": "object--trash-can",
+  bin: "object--trash-can",
+
+  // Signs / billboards / banners (the "big sign" family)
+  billboard: "object--sign--advertisement",
+  "big sign": "object--sign--advertisement",
+  hoarding: "object--sign--advertisement",
+  advertisement: "object--sign--advertisement",
+  "info sign": "object--sign--information",
+  "information board": "object--sign--information",
+  "info board": "object--sign--information",
+  kiosk: "object--sign--information",
+  storefront: "object--sign--store",
+  "shop sign": "object--sign--store",
+  "store sign": "object--sign--store",
+  banner: "object--banner",
+
+  // Poles / supports
+  pole: "object--support--pole",
+  "lamp post": "object--street-light",
+  lamppost: "object--street-light",
+  "street light": "object--street-light",
+  streetlight: "object--street-light",
+  "sign pole": "object--support--pole",
+  "utility pole": "object--support--utility-pole",
+  "telephone pole": "object--support--utility-pole",
+
+  // Traffic lights
+  "traffic light": "object--traffic-light--general-upright",
+  "traffic signal": "object--traffic-light--general-upright",
+  "stoplight": "object--traffic-light--general-upright",
+  "crosswalk light": "object--traffic-light--pedestrians",
+  "pedestrian signal": "object--traffic-light--pedestrians",
+
+  // Pavement markings
+  arrow: "marking--discrete--arrow--straight",
+  "lane arrow": "marking--discrete--arrow--straight",
+  crosswalk: "marking--discrete--crosswalk-zebra",
+  zebra: "marking--discrete--crosswalk-zebra",
+  "stop line": "marking--discrete--stop-line",
   cobblestone: "marking--surface--cobblestone",
-  brick: "marking--surface--cobblestone",
-  crosswalk: "construction--flat--crosswalk-plain",
+  brick: "marking--surface--brick",
+
+  // Construction
+  driveway: "construction--flat--driveway",
   sidewalk: "construction--flat--sidewalk",
+  "pedestrian area": "construction--flat--pedestrian-area",
+  bridge: "construction--structure--bridge",
+  barrier: "construction--barrier--temporary",
+  cone: "object--traffic-cone",
+  "traffic cone": "object--traffic-cone",
+  "parking meter": "object--parking-meter",
+  cctv: "object--cctv-camera",
+  camera: "object--cctv-camera",
+
+  // Segmentation-only (image-scan mode) — these are NOT bbox-searchable.
   park: ["nature--vegetation", "construction--flat--pedestrian-area"],
   parkland: ["nature--vegetation", "construction--flat--pedestrian-area"],
   grass: "nature--vegetation",
@@ -28,25 +93,47 @@ const TOKEN_TO_MAPILLARY: Record<string, string | string[]> = {
   trees: "nature--vegetation",
   vegetation: "nature--vegetation",
   greenery: "nature--vegetation",
+  wooded: "nature--vegetation",
+  forest: "nature--vegetation",
   building: "construction--structure--building",
   buildings: "construction--structure--building",
   facade: "construction--structure--building",
-  bridge: "construction--structure--bridge",
+  skyline: "construction--structure--building",
   water: "nature--water",
   lake: "nature--water",
   pond: "nature--water",
+  river: "nature--water",
+  ocean: "nature--water",
+  sea: "nature--water",
   mountain: "nature--mountain",
+  mountains: "nature--mountain",
   hill: "nature--mountain",
-  streetlight: "object--street-light",
-  "street light": "object--street-light",
-  lamppost: "object--street-light",
-  trash: "object--trash-can",
-  "trash can": "object--trash-can",
+  alps: "nature--mountain",
+  ridge: "nature--mountain",
+  sand: "nature--sand",
+  beach: "nature--sand",
+  sky: "nature--sky",
+  snow: "nature--snow",
+  terrain: "nature--terrain",
 };
 
-/** Tokens with no Mapillary class — use OSM/Wikidata instead. */
+/**
+ * Tokens that have NO Mapillary class — semantic subjects (statue,
+ * monument, animal nouns) are discoverable via OSM/Wikidata, never
+ * via /map_features. Listed here so the planner can route them to the
+ * subject-discovery path instead of trying to fetch detections.
+ */
 const NON_MAPILLARY_TOKENS = new Set([
   "horse",
+  "dog",
+  "cat",
+  "lion",
+  "eagle",
+  "buffalo",
+  "bear",
+  "tiger",
+  "whale",
+  "elephant",
   "statue",
   "monument",
   "memorial",
@@ -54,6 +141,11 @@ const NON_MAPILLARY_TOKENS = new Set([
   "equestrian",
   "artwork",
   "mural",
+  "obelisk",
+  "carousel",
+  "lighthouse",
+  "windmill",
+  "watermill",
 ]);
 
 function normalizeToken(t: string): string {

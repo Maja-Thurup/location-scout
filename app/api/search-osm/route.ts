@@ -12,9 +12,23 @@ import {
 } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { forwardGeocode } from "@/lib/geocode";
-import { deriveOsmDescription, extractOsmWikidataQid } from "@/lib/osm-description";
+import {
+  deriveOsmDescription,
+  extractOsmSubjectWikidataQid,
+  extractOsmWikidataQid,
+} from "@/lib/osm-description";
 import { shouldExcludeOsmCommercialOnSculptureScene } from "@/lib/osm-scene-filter";
 import { mapSceneToMapillary } from "@/lib/mapillary/scene-to-classes";
+import {
+  buildConceptTokenWeights,
+  getOsmExtraArms,
+  resolveMapillaryClassesFromPlan,
+  retrievalPlanSchema,
+  shouldRunMapillaryBboxSearch,
+  type RetrievalPlan,
+} from "@/lib/retrieval-plan";
+import { fetchWikidataItemsById } from "@/lib/wikidata-graphql";
+import { fetchExtractsByTitles } from "@/lib/wikipedia-extracts";
 import { enrichWikidataFacts } from "@/lib/wikidata-rest";
 import { type GooglePlace, searchText } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
@@ -132,6 +146,9 @@ const requestSchema = z.object({
 
   /** When true, return per-source request/response payloads (not cached). */
   developerMode: z.boolean().optional().default(false),
+
+  /** Structured retrieval plan from parse-scene (or client-side fallback). */
+  retrievalPlan: retrievalPlanSchema.optional(),
 });
 
 /**
@@ -201,6 +218,7 @@ type SearchOsmResponse = {
    * disagreements.
    */
   highConfidence: boolean;
+  retrievalPlan?: RetrievalPlan | null;
   sourceDebug?: SourceDebugEntry[];
 };
 
@@ -335,10 +353,33 @@ export const POST = withAuth(async (req) => {
     radiusMiles,
     bbox: suppliedBbox,
     developerMode,
+    retrievalPlan: requestPlan,
   } = parsed.data;
 
-  const effectiveAlternatives: ReadonlyArray<Record<string, string>> =
+  const retrievalPlan: RetrievalPlan | null = requestPlan ?? null;
+
+  // Merge planner-emitted OSM subject-family arms into the alternatives.
+  // Generic for any prompt — the arms come from `retrieval_plan.sources.osm.query_hints.extra_arms`,
+  // which the planner fills from the prompt's parsed nouns, not a
+  // hardcoded subject list. Dedupe against the existing alternatives so
+  // we never run the same filter twice.
+  const baseAlternatives: ReadonlyArray<Record<string, string>> =
     osmTagsAlternatives.length > 0 ? osmTagsAlternatives : [osmTags];
+  const extraArms = getOsmExtraArms(retrievalPlan);
+  const seenArmKeys = new Set<string>(
+    baseAlternatives.map((alt) => JSON.stringify(alt)),
+  );
+  const mergedAlternatives: Array<Record<string, string>> = [
+    ...baseAlternatives,
+  ];
+  for (const arm of extraArms) {
+    const key = JSON.stringify(arm);
+    if (seenArmKeys.has(key)) continue;
+    seenArmKeys.add(key);
+    mergedAlternatives.push(arm);
+  }
+  const effectiveAlternatives: ReadonlyArray<Record<string, string>> =
+    mergedAlternatives;
 
   // 1) Resolve bbox.
   let bbox: Bbox;
@@ -452,7 +493,7 @@ export const POST = withAuth(async (req) => {
       locationKind,
       osmTagsAlternatives: effectiveAlternatives,
     },
-    { developerMode },
+    { developerMode, retrievalPlan },
   );
 
   // 3b) DEEP TIER ONLY: parallel Google Places searchText. This is the
@@ -523,22 +564,33 @@ export const POST = withAuth(async (req) => {
 
   // 3.5) Mapillary detections — map_features for bbox-searchable classes
   // resolved from scene_tokens + Claude mapillary_classes.
-  const mlyPlan = mapSceneToMapillary({
+  const mlyFallback = mapSceneToMapillary({
     sceneTokens,
     mapillaryClasses: mapillaryClasses ?? [],
     locationKind,
   });
+  const mlyFromPlan = retrievalPlan
+    ? resolveMapillaryClassesFromPlan(retrievalPlan)
+    : null;
+  const mlyPlan = mlyFromPlan
+    ? { ...mlyFallback, ...mlyFromPlan }
+    : mlyFallback;
   const mapillaryCandidates: OsmCandidate[] = [];
   const mlyT0 = Date.now();
   let mapillaryDetectionsRaw: Awaited<ReturnType<typeof findDetectionsInBbox>> = [];
   let mapillaryDetectionsError: string | null = null;
-  if (mlyPlan.bboxClasses.length > 0) {
+  const runMlyBbox =
+    retrievalPlan != null
+      ? shouldRunMapillaryBboxSearch(retrievalPlan)
+      : mlyPlan.bboxClasses.length > 0;
+  if (runMlyBbox && mlyPlan.bboxClasses.length > 0) {
     try {
       mapillaryDetectionsRaw = await findDetectionsInBbox({
         bbox: effectiveBbox,
         classes: mlyPlan.bboxClasses,
         limit: 120,
-        maxTiles: 40,
+        maxTiles: 12,
+        maxDurationMs: 15_000,
       });
       for (const d of mapillaryDetectionsRaw) {
         mapillaryCandidates.push({
@@ -665,6 +717,10 @@ export const POST = withAuth(async (req) => {
     const overlap = tagOverlapScore(c, sceneTokens, {
       subjectNameRegex,
       osmTagsAlternatives: effectiveAlternatives,
+      conceptTokenWeights:
+        retrievalPlan && retrievalPlan.ranking.use_concept_weights
+          ? buildConceptTokenWeights(retrievalPlan)
+          : undefined,
     });
     overlapByCandidate.set(c.id, overlap);
   }
@@ -742,11 +798,89 @@ export const POST = withAuth(async (req) => {
     )
     .slice(0, MAX_OUTPUT_CANDIDATES);
 
-  // 6.4) Wikidata REST backfill for OSM-tagged Q-ids missing facts.
-  const WIKIDATA_BACKFILL_CAP = 25;
+  // 6.4) Wikidata + Wikipedia bulk backfill — single round-trip for
+  // facts and Wikipedia article titles via Wikibase GraphQL (when
+  // enabled), then a second round-trip for the lead extracts. Falls
+  // back to per-Q-id REST when GraphQL is disabled.
+  const WIKIDATA_BACKFILL_CAP = 24;
+  const backfillTargets = ranked.slice(0, WIKIDATA_BACKFILL_CAP);
+
+  // Map Q-id -> ranked candidate (and capture both subject:wikidata
+  // and direct wikidata tags so a "subject Q-id" hit also enriches
+  // the carrier element, e.g. an OSM way that points at a sculpture).
+  const qidToCandidate = new Map<string, RankedCandidate[]>();
+  for (const c of backfillTargets) {
+    const qids = new Set<string>();
+    const direct = extractOsmWikidataQid(c.tags);
+    if (direct) qids.add(direct);
+    const subj = extractOsmSubjectWikidataQid(c.tags);
+    if (subj) qids.add(subj);
+    for (const qid of qids) {
+      const arr = qidToCandidate.get(qid) ?? [];
+      arr.push(c);
+      qidToCandidate.set(qid, arr);
+    }
+  }
+
   let wikidataBackfillCount = 0;
+  let wikipediaExtractCount = 0;
+  if (qidToCandidate.size > 0) {
+    const bundles = await fetchWikidataItemsById([...qidToCandidate.keys()]);
+
+    // Bulk-fetch lead extracts for every enwiki sitelink we got back.
+    const titles = Array.from(
+      new Set(
+        Array.from(bundles.values())
+          .map((b) => b.enwikiTitle)
+          .filter((t): t is string => typeof t === "string" && t.length > 0),
+      ),
+    );
+    const extracts = titles.length > 0 ? await fetchExtractsByTitles(titles) : new Map();
+
+    for (const [qid, bundle] of bundles) {
+      const targets = qidToCandidate.get(qid) ?? [];
+      const hasFacts =
+        bundle.facts.inception ||
+        bundle.facts.creators.length > 0 ||
+        bundle.facts.depicts.length > 0 ||
+        bundle.facts.materials.length > 0 ||
+        bundle.facts.genres.length > 0 ||
+        bundle.facts.namedAfter.length > 0 ||
+        bundle.facts.altLabels.length > 0;
+      for (const c of targets) {
+        if (hasFacts && !c.wikidataFacts) {
+          c.wikidataFacts = bundle.facts;
+          wikidataBackfillCount++;
+        }
+        // Prefer the Wikipedia lead extract for the description when
+        // we have one — much richer than any synthesised "Depicts: X".
+        if (bundle.enwikiTitle) {
+          const ex = extracts.get(bundle.enwikiTitle);
+          if (ex && (!c.description || c.description.length < 80)) {
+            const trimmed =
+              ex.extract.length > 600
+                ? `${ex.extract.slice(0, 600).trim()}…`
+                : ex.extract.trim();
+            if (trimmed) {
+              c.description = trimmed;
+              wikipediaExtractCount++;
+            }
+          }
+        }
+        // Fallback synthesised description from depicts when no
+        // Wikipedia extract was available.
+        if (!c.description && bundle.facts.depicts.length > 0) {
+          c.description = `Depicts: ${bundle.facts.depicts.slice(0, 3).join(", ")}`;
+        }
+      }
+    }
+  }
+
+  // 6.4b) REST safety net for any OSM-tagged Q-id that GraphQL didn't
+  // return facts for (e.g. when WIKIDATA_GRAPHQL_ENABLED is false and
+  // the bulk fetch shape changes upstream).
   await Promise.all(
-    ranked.slice(0, WIKIDATA_BACKFILL_CAP).map(async (c) => {
+    backfillTargets.map(async (c) => {
       const qid = extractOsmWikidataQid(c.tags);
       if (!qid || c.wikidataFacts) return;
       const facts = await enrichWikidataFacts({ qid, existing: c.wikidataFacts });
@@ -766,8 +900,12 @@ export const POST = withAuth(async (req) => {
       }
     }),
   );
-  if (wikidataBackfillCount > 0) {
-    logger.info("search-osm wikidata REST backfill", { count: wikidataBackfillCount });
+  if (wikidataBackfillCount > 0 || wikipediaExtractCount > 0) {
+    logger.info("search-osm wikidata + wikipedia backfill", {
+      qidCount: qidToCandidate.size,
+      factsApplied: wikidataBackfillCount,
+      extractsApplied: wikipediaExtractCount,
+    });
   }
 
   // 6.5) Decide whether vision scoring is necessary at enrichment time.
@@ -868,15 +1006,19 @@ export const POST = withAuth(async (req) => {
         displayName: "Mapillary detections (search)",
         ms: mapillaryMs,
         error: mapillaryDetectionsError,
-        skipped: mlyPlan.bboxClasses.length === 0,
+        skipped: !runMlyBbox || mlyPlan.bboxClasses.length === 0,
         skipReason:
-          mlyPlan.bboxClasses.length === 0
-            ? mlyPlan.imageScanClasses.length > 0
-              ? "bbox classes empty — image-scan classes run at enrich"
-              : mlyPlan.unmatchedTokens.length > 0
-                ? `no Mapillary classes for tokens: ${mlyPlan.unmatchedTokens.join(", ")}`
-                : "no scene cues map to Mapillary object_values"
-            : null,
+          !runMlyBbox
+            ? retrievalPlan
+              ? `retrieval_plan mapillary.mode=${retrievalPlan.mapillary.mode} — no bbox search`
+              : "bbox map_features disabled"
+            : mlyPlan.bboxClasses.length === 0
+              ? mlyPlan.imageScanClasses.length > 0
+                ? "bbox classes empty — image-scan classes run at enrich"
+                : mlyPlan.unmatchedTokens.length > 0
+                  ? `no Mapillary classes for tokens: ${mlyPlan.unmatchedTokens.join(", ")}`
+                  : "no scene cues map to Mapillary object_values"
+              : null,
         request: {
           bbox: effectiveBbox,
           resolvedMapillaryClasses: mlyPlan,
@@ -927,6 +1069,7 @@ export const POST = withAuth(async (req) => {
     alternativesSucceeded,
     providerStats: providerResult.perProvider,
     highConfidence,
+    retrievalPlan,
     sourceDebug,
   };
   return NextResponse.json(response, { status: 200 });

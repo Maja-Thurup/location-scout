@@ -4,7 +4,11 @@ import type { Bbox } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
-import { splitBboxIntoTiles, tileToBboxStr } from "@/lib/mapillary/tiles";
+import {
+  shouldSkipTiledMapillarySearch,
+  splitBboxIntoTiles,
+  tileToBboxStr,
+} from "@/lib/mapillary/tiles";
 
 // ---------------------------------------------------------------------------
 // Mapillary Graph API — free crowdsourced street-level photography.
@@ -608,6 +612,9 @@ async function fetchMapFeaturesOneTile(
   return out;
 }
 
+const MAPILLARY_TILE_CONCURRENCY = 5;
+const MAPILLARY_TILED_SEARCH_BUDGET_MS = 18_000;
+
 export async function findDetectionsInBbox(input: {
   /** Legacy: "minLng,minLat,maxLng,maxLat" */
   bboxStr?: string;
@@ -615,6 +622,8 @@ export async function findDetectionsInBbox(input: {
   classes: ReadonlyArray<string>;
   limit?: number;
   maxTiles?: number;
+  /** Stop fetching tiles after this many ms (avoids Vercel 504). */
+  maxDurationMs?: number;
 }): Promise<MapillaryDetection[]> {
   if (input.classes.length === 0) return [];
 
@@ -627,6 +636,13 @@ export async function findDetectionsInBbox(input: {
   }
   if (!bbox) return [];
 
+  if (shouldSkipTiledMapillarySearch(bbox)) {
+    logger.info("mapillary detections skipped — search bbox too large for tiled map_features", {
+      classes: input.classes,
+    });
+    return [];
+  }
+
   const k = cacheKey("mapillary:image", {
     kind: "detections-tiled-v1",
     bbox,
@@ -635,19 +651,32 @@ export async function findDetectionsInBbox(input: {
   const cached = await cacheGet<MapillaryDetection[]>(k);
   if (cached) return cached;
 
-  const tiles = splitBboxIntoTiles(bbox, undefined, input.maxTiles ?? 40);
+  const tiles = splitBboxIntoTiles(bbox, undefined, input.maxTiles ?? 12);
   const perTileLimit = Math.max(20, Math.floor((input.limit ?? 500) / tiles.length));
   const seen = new Map<string, MapillaryDetection>();
+  const budgetMs = input.maxDurationMs ?? MAPILLARY_TILED_SEARCH_BUDGET_MS;
+  const t0 = Date.now();
 
   try {
-    for (const tile of tiles) {
-      const batch = await fetchMapFeaturesOneTile(
-        tileToBboxStr(tile),
-        input.classes,
-        perTileLimit,
+    for (let i = 0; i < tiles.length; i += MAPILLARY_TILE_CONCURRENCY) {
+      if (Date.now() - t0 >= budgetMs) {
+        logger.warn("mapillary detections time budget exhausted", {
+          tilesDone: i,
+          tilesTotal: tiles.length,
+          budgetMs,
+        });
+        break;
+      }
+      const chunk = tiles.slice(i, i + MAPILLARY_TILE_CONCURRENCY);
+      const batches = await Promise.all(
+        chunk.map((tile) =>
+          fetchMapFeaturesOneTile(tileToBboxStr(tile), input.classes, perTileLimit),
+        ),
       );
-      for (const d of batch) {
-        if (!seen.has(d.id)) seen.set(d.id, d);
+      for (const batch of batches) {
+        for (const d of batch) {
+          if (!seen.has(d.id)) seen.set(d.id, d);
+        }
       }
     }
   } catch (err) {

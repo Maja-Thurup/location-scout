@@ -103,6 +103,25 @@ const PREFIX_KEYS = new Set<string>();
 const REGEX_META = /[|()^$.*+?\\[\]]/;
 
 /**
+ * Subject / type / era / style keys that should be treated as
+ * free-text values when their value contains regex meta. These are
+ * the SUBJECT-FAMILY arms emitted by Claude — generic for any
+ * prompt (subject = horse / lion / MLK / art deco / Roman / …).
+ *
+ * Word-boundary wrapping is applied (same as `name`) so a subject
+ * filter on "lion" doesn't match "Million-Dollar Trust" or other
+ * spurious substrings.
+ */
+const SUBJECT_FAMILY_KEYS = new Set<string>([
+  "artwork_subject",
+  "artwork_type",
+  "statue",
+  "memorial",
+  "subject",
+  "historic:civilization",
+]);
+
+/**
  * Turn `horse|equestrian|cavalry` into `\bhorse\b|\bequestrian\b|\bcavalry\b`
  * so Overpass does not return "Seahorse" or "Horseshoe Bar".
  * Multi-word alternatives (if any) are left as plain substrings.
@@ -131,17 +150,19 @@ function tagFilter(key: string, value: string): string {
   if (CASE_INSENSITIVE_KEYS.has(key)) {
     return `["${safeKey}"~"^${safeValue}$",i]`;
   }
-  // Free-text keys (name, description, ...) with regex meta -> regex match.
-  // This makes name-keyword alternatives work without a separate API.
-  if (
-    (key === "name" || key === "name:en" || key === "description") &&
-    REGEX_META.test(value)
-  ) {
-    const namePattern =
-      key === "name" || key === "name:en"
+  // Free-text keys (name, description, subject-family) with regex meta
+  // -> regex match. This makes the SUBJECT-FAMILY arms work for any
+  // prompt without a separate API path. Word-boundary wrapping
+  // prevents spurious substring hits for short subject nouns.
+  const isNameLike = key === "name" || key === "name:en";
+  const isDescription = key === "description";
+  const isSubjectFamily = SUBJECT_FAMILY_KEYS.has(key);
+  if ((isNameLike || isDescription || isSubjectFamily) && REGEX_META.test(value)) {
+    const pattern =
+      isNameLike || isSubjectFamily
         ? wrapNameRegexWithWordBoundaries(safeValue)
         : safeValue;
-    return `["${safeKey}"~"${namePattern}",i]`;
+    return `["${safeKey}"~"${pattern}",i]`;
   }
   return `["${safeKey}"="${safeValue}"]`;
 }

@@ -216,6 +216,42 @@ function idfWeight(token: string): number {
   return TOKEN_IDF_WEIGHTS.get(normalized) ?? DEFAULT_TOKEN_WEIGHT;
 }
 
+/**
+ * Tag keys whose VALUE we surface verbatim into the blob (not as
+ * "key=value"). These hold the subject/type/era nouns the ranking
+ * matcher actually reads. Same family for any prompt — the prompt
+ * parse fills in the value.
+ */
+const BLOB_VALUE_KEYS: ReadonlyArray<string> = [
+  "name",
+  "name:en",
+  "alt_name",
+  "alt_name:en",
+  "loc_name",
+  "was:name",
+  "old_name",
+  "official_name",
+  "subject",
+  "subject:en",
+  "artwork_subject",
+  "artwork_type",
+  "statue",
+  "memorial",
+  "historic",
+  "historic:civilization",
+  "building:architecture",
+  "tourism",
+  "leisure",
+  "man_made",
+  "amenity",
+  "natural",
+  "shop",
+  "inscription",
+  "inscription:en",
+  "memorial:text",
+  "artist_name",
+];
+
 /** Convert a candidate's text fields into a single lowercased blob. */
 export function buildCandidateText(c: MergedCandidate): string {
   const parts: string[] = [];
@@ -227,11 +263,29 @@ export function buildCandidateText(c: MergedCandidate): string {
   if (c.wikidataFacts?.altLabels?.length) {
     parts.push(...c.wikidataFacts.altLabels);
   }
-  for (const v of Object.values(c.tags)) {
+  if (c.wikidataFacts?.namedAfter?.length) {
+    parts.push(...c.wikidataFacts.namedAfter);
+  }
+  if (c.wikidataFacts?.materials?.length) {
+    parts.push(...c.wikidataFacts.materials);
+  }
+  if (c.wikidataFacts?.genres?.length) {
+    parts.push(...c.wikidataFacts.genres);
+  }
+  // Surface high-signal tag values verbatim so synonym expansion
+  // ("equestrian" → "horse") matches both name AND structured tags.
+  for (const k of BLOB_VALUE_KEYS) {
+    const v = c.tags[k];
     if (typeof v === "string" && v.length > 0) parts.push(v);
   }
-  const artworkSubject = c.tags["artwork_subject"];
-  if (artworkSubject) parts.push(`artwork_subject=${artworkSubject}`);
+  // Append every remaining tag's value. We catch anything not in the
+  // value-keys list above (e.g. building:material, surface, …) so the
+  // matcher still sees rare but discriminative attributes.
+  const seen = new Set<string>(BLOB_VALUE_KEYS);
+  for (const [k, v] of Object.entries(c.tags)) {
+    if (seen.has(k)) continue;
+    if (typeof v === "string" && v.length > 0) parts.push(v);
+  }
   return parts.join(" \u2022 ").toLowerCase();
 }
 
@@ -269,6 +323,7 @@ function tokenAlternates(token: string): string[] {
 function countMatches(
   tokens: ReadonlyArray<string>,
   haystack: string,
+  conceptTokenWeights?: ReadonlyMap<string, number>,
 ): { matched: string[]; weightedScore: number } {
   const matched: string[] = [];
   let weightedScore = 0;
@@ -276,11 +331,13 @@ function countMatches(
     const lower = t.toLowerCase().trim();
     if (lower.length === 0) continue;
     if (GENERIC_TOKENS.has(lower)) continue;
+    const conceptMul = conceptTokenWeights?.get(lower);
     const variants = tokenAlternates(lower);
     for (const v of variants) {
       if (haystack.includes(v)) {
         matched.push(lower);
-        weightedScore += idfWeight(lower);
+        const base = idfWeight(lower);
+        weightedScore += conceptMul != null ? base * conceptMul : base;
         break;
       }
     }
@@ -313,6 +370,8 @@ export type TagOverlapOptions = {
   osmTagsAlternatives?: ReadonlyArray<Record<string, string>>;
   /** Pipe-separated name synonyms from the `name` alternative. */
   subjectNameRegex?: string | null;
+  /** Per-token multipliers from retrieval_plan concepts (overrides flat IDF). */
+  conceptTokenWeights?: ReadonlyMap<string, number>;
 };
 
 /**
@@ -356,7 +415,7 @@ export function tagOverlapScore(
   opts: TagOverlapOptions = {},
 ): TagOverlapScore {
   const blob = buildCandidateText(candidate);
-  const positive = countMatches(sceneTokens, blob);
+  const positive = countMatches(sceneTokens, blob, opts.conceptTokenWeights);
 
   // OSM `artwork_subject=*` is the community's subject tag (taginfo).
   // When it matches a scene token, add a strong flat boost — often present

@@ -8,6 +8,14 @@ import { ownDbProvider } from "@/lib/providers/own-db";
 import { ridbRecreationProvider } from "@/lib/providers/ridb-recreation";
 import { sfFilmLocationsProvider } from "@/lib/providers/sf-films";
 import { socrataMunicipalProvider } from "@/lib/providers/socrata-municipal";
+import {
+  getOsmExtraArms,
+  getWikidataClassesQids,
+  getWikidataDepictsQids,
+  isProviderEnabled,
+  shouldGateWikipediaOnQids,
+  type RetrievalPlan,
+} from "@/lib/retrieval-plan";
 import type {
   CandidateProvider,
   ProviderInput,
@@ -53,6 +61,7 @@ async function runProviderList(
   input: ProviderInput,
   label: string,
   collectSourceDebug: boolean,
+  retrievalPlan?: RetrievalPlan | null,
 ): Promise<{
   candidates: RawCandidate[];
   perProvider: Record<ProviderName, { count: number; ms: number; error: string | null }>;
@@ -63,9 +72,45 @@ async function runProviderList(
   const perProvider: Record<string, { count: number; ms: number; error: string | null }> =
     {};
 
+  // Pre-compute query hints once for the run; passed on every
+  // ProviderInput so each provider sees the same shared context.
+  const planQueryHints: ProviderInput["queryHints"] = retrievalPlan
+    ? {
+        osmExtraArms: getOsmExtraArms(retrievalPlan),
+        wikidataDepictsQids: getWikidataDepictsQids(retrievalPlan),
+        wikidataClassesQids: getWikidataClassesQids(retrievalPlan),
+        wikipediaRunOnlyWhenNoQids: shouldGateWikipediaOnQids(retrievalPlan),
+      }
+    : undefined;
+
+  // Track Q-ids surfaced by upstream providers so the Wikipedia
+  // provider can self-skip when run_only_when_no_qids is set. Order
+  // matters: providers in `list` run sequentially below; Wikipedia
+  // sits after Wikidata in DEFAULT_CONTENT_PROVIDERS, so by the time
+  // it runs the upstream Q-id pool is already populated.
+  const upstreamQids = new Set<string>();
+
   for (const p of list) {
     const key = providerDebugKey(p);
     const display = providerDisplayName(p);
+
+    if (retrievalPlan && !isProviderEnabled(retrievalPlan, p.name)) {
+      const entry = buildSourceDebugEntry({
+        sourceKey: key,
+        displayName: display,
+        ms: 0,
+        error: null,
+        skipped: true,
+        skipReason:
+          retrievalPlan.sources[p.name]?.reason ??
+          "disabled by retrieval_plan",
+        request: { bbox: input.bbox, retrievalPlan: retrievalPlan.sources[p.name] },
+        candidates: [],
+      });
+      if (collectSourceDebug) sourceDebug.push(entry);
+      perProvider[p.name] = { count: 0, ms: 0, error: null };
+      continue;
+    }
 
     if (!p.supportsBbox(input.bbox)) {
       const entry = buildSourceDebugEntry({
@@ -83,9 +128,19 @@ async function runProviderList(
       continue;
     }
 
+    const providerInput: ProviderInput = {
+      ...input,
+      queryHints: planQueryHints
+        ? {
+            ...planQueryHints,
+            wikipediaUpstreamQids: [...upstreamQids],
+          }
+        : input.queryHints,
+    };
+
     let r: ProviderResult;
     try {
-      r = await p.search(input);
+      r = await p.search(providerInput);
     } catch (err) {
       r = {
         candidates: [],
@@ -100,6 +155,22 @@ async function runProviderList(
       ms: r.elapsedMs,
       error: r.error,
     };
+
+    // Update the upstream Q-id pool from this provider's results so
+    // downstream providers (e.g. Wikipedia) can gate on it.
+    for (const c of r.candidates) {
+      const tagQid = c.tags["wikidata"] ?? c.tags["wikidata:qid"];
+      if (typeof tagQid === "string" && /^Q\d+$/.test(tagQid)) {
+        upstreamQids.add(tagQid);
+      }
+      if (
+        (c.source === "wikidata-landmark" ||
+          c.source === "wikidata-filming-location") &&
+        /^Q\d+$/.test(c.externalId)
+      ) {
+        upstreamQids.add(c.externalId);
+      }
+    }
 
     if (r.error) {
       logger.warn(`${label} provider failed (continuing)`, {
@@ -145,7 +216,7 @@ async function runProviderList(
 
 export async function runProviders(
   input: ProviderInput,
-  options?: { developerMode?: boolean },
+  options?: { developerMode?: boolean; retrievalPlan?: RetrievalPlan | null },
 ): Promise<{
   candidates: RawCandidate[];
   perProvider: Record<ProviderName, { count: number; ms: number; error: string | null }>;
@@ -156,6 +227,7 @@ export async function runProviders(
     input,
     "default-content",
     options?.developerMode ?? false,
+    options?.retrievalPlan ?? null,
   );
 }
 

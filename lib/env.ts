@@ -81,6 +81,25 @@ const serverEnvSchema = z.object({
    * field shown alongside the App Token / Key ID.
    */
   SOCRATA_APP_TOKEN_SECRET: z.string().optional(),
+
+  /**
+   * Wikibase GraphQL feature flag. When set to "1"/"true" the
+   * Wikidata enrichment path uses the experimental GraphQL endpoint
+   * (https://www.wikidata.org/w/index.php?title=Wikibase:Wikibase_GraphQL)
+   * to bulk-fetch facts and sitelinks for up to 50 Q-ids per call.
+   *
+   * Wikibase GraphQL is currently marked "not yet stable" upstream;
+   * gate this behind a flag so the REST fallback (lib/wikidata-rest.ts)
+   * remains the production path. Default: off.
+   */
+  WIKIDATA_GRAPHQL_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (!v) return false;
+      const t = v.toLowerCase().trim();
+      return t === "1" || t === "true" || t === "on" || t === "yes";
+    }),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;

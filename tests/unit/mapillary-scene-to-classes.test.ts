@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { mapSceneToMapillary } from "@/lib/mapillary/scene-to-classes";
-import { splitBboxIntoTiles, tileAreaDeg2 } from "@/lib/mapillary/tiles";
+import {
+  bboxAreaDeg2,
+  shouldSkipTiledMapillarySearch,
+  splitBboxIntoTiles,
+  tileAreaDeg2,
+} from "@/lib/mapillary/tiles";
 
 describe("mapSceneToMapillary", () => {
   it("maps park tokens to vegetation and pedestrian-area", () => {
@@ -26,6 +31,19 @@ describe("mapSceneToMapillary", () => {
     const plan = mapSceneToMapillary({ sceneTokens: ["building", "urban"] });
     expect(plan.imageScanClasses).toContain("construction--structure--building");
     expect(plan.bboxClasses).not.toContain("construction--structure--building");
+  });
+});
+
+describe("shouldSkipTiledMapillarySearch", () => {
+  it("skips city-scale bboxes", () => {
+    const la = { south: 33.7, west: -118.7, north: 34.3, east: -118.1 };
+    expect(bboxAreaDeg2(la)).toBeGreaterThan(0.02);
+    expect(shouldSkipTiledMapillarySearch(la)).toBe(true);
+  });
+
+  it("allows neighborhood-scale bboxes", () => {
+    const small = { south: 34.05, west: -118.28, north: 34.08, east: -118.24 };
+    expect(shouldSkipTiledMapillarySearch(small)).toBe(false);
   });
 });
 

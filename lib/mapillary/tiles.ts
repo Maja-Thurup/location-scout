@@ -3,6 +3,21 @@ import type { Bbox } from "@/lib/bbox";
 /** Mapillary bbox queries must be < 0.01 degrees square (API v4). */
 export const MAPILLARY_MAX_BBOX_AREA_DEG2 = 0.009;
 
+/**
+ * Above this total bbox area, tiled `/map_features` search is skipped.
+ * City/metro boxes (e.g. all of LA) need dozens of tiles × seconds each
+ * and routinely exceed Vercel's function timeout → HTTP 504.
+ */
+export const MAPILLARY_SKIP_TILED_SEARCH_AREA_DEG2 = 0.02;
+
+export function bboxAreaDeg2(bbox: Bbox): number {
+  return (bbox.east - bbox.west) * (bbox.north - bbox.south);
+}
+
+export function shouldSkipTiledMapillarySearch(bbox: Bbox): boolean {
+  return bboxAreaDeg2(bbox) > MAPILLARY_SKIP_TILED_SEARCH_AREA_DEG2;
+}
+
 export type MapillaryTile = {
   west: number;
   south: number;

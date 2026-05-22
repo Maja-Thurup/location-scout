@@ -132,6 +132,13 @@ export const sceneAnalysisSchema = z.object({
    * Mapillary detections endpoint in that case.
    */
   mapillary_classes: z.array(z.string()).default([]),
+
+  /**
+   * Structured retrieval plan: which sources to run, Mapillary mode,
+   * primary vs background concepts, and enrich strategy. Executed
+   * deterministically in search-osm / enrich-locations.
+   */
+  retrieval_plan: z.record(z.string(), z.unknown()).optional(),
 });
 
 export type SceneAnalysis = z.infer<typeof sceneAnalysisSchema>;
@@ -176,7 +183,8 @@ Return ONLY a single JSON object, no prose, no code fences. The schema is:
   "mood": "string or null",
   "time_of_day": "string or null",
   "interior_exterior": "interior" | "exterior" | "both" | null,
-  "mapillary_classes": ["string", "..."]
+  "mapillary_classes": ["string", "..."],
+  "retrieval_plan": { ... see retrieval_plan section below ... }
 }
 
 Guidance for fields:
@@ -270,6 +278,54 @@ Guidance for fields:
          { "leisure": "nature_reserve" }
        ]
 
+  SUBJECT-FAMILY ALTERNATIVES — when the prompt names a depicted/typed/
+  historic noun (an animal, a person, a building style, an era, a
+  faction…), in addition to the primary classifier emit Overpass arms
+  on the SUBJECT key family below. These keys are present on hundreds
+  of thousands of OSM features regardless of subject — generic for any
+  prompt, no subject-specific code anywhere downstream.
+
+  Subject keys (use the value derived from the user's prompt):
+    "artwork_subject"        — free-text subject of public artwork.
+                               Animal / person / event / abstract concept.
+                               Example: "horse", "lion", "MLK", "Vietnam".
+    "artwork_type"           — artwork subtype.
+                               Example: "statue", "mural", "installation",
+                               "bust", "relief", "graffiti".
+    "statue"                 — statue subtype when prompt names a form.
+                               Example: "equestrian", "bust", "figure",
+                               "relief".
+    "memorial"               — memorial subtype when prompt implies a
+                               memorial. Example: "statue", "plaque",
+                               "cross", "monument", "obelisk", "stone".
+    "subject"                — open-text subject.
+    "historic:civilization"  — era. Example: "roman", "greek", "aztec".
+    "building:architecture"  — style. Example: "art_deco", "brutalist",
+                               "gothic".
+
+  Values may be regexes (pipe-separated alternates) — just like the
+  "name" key. Matching is case-insensitive. Examples:
+
+    Prompt mentions "horse" subject:
+      { "artwork_subject": "horse|equestrian|cavalry|jockey|rider|knight" }
+
+    Prompt names a person:
+      { "artwork_subject": "martin luther king|mlk|king" }
+
+    Prompt names a memorial form:
+      { "memorial": "statue|memorial|monument|obelisk" }
+
+    Prompt names an era:
+      { "historic:civilization": "roman" }
+
+    Prompt names a style:
+      { "building:architecture": "art_deco|art deco" }
+
+  Do NOT emit subject-family arms when the prompt has no specific noun
+  (e.g. "an old building" — there's no subject; let the primary
+  classifier handle it). Skip them rather than emitting weak/empty
+  filters.
+
   NAME-KEYWORD ALTERNATIVES — when the prompt names a SPECIFIC subject
   whose match is more likely to be in the feature's NAME than its
   classifier tag (statues, monuments, lighthouses, windmills, named
@@ -298,18 +354,23 @@ Guidance for fields:
 
   Examples:
 
-    Scene: "horse statue in a park" (subject = horse)
+    Scene: "horse statue in a park" (subject = horse, form = statue)
     -> [
          { "tourism": "artwork" },
          { "historic": "memorial" },
          { "historic": "monument" },
+         { "artwork_subject": "horse|equestrian|cavalry|jockey|rider|knight" },
+         { "artwork_type": "statue|sculpture" },
+         { "statue": "equestrian|figure" },
+         { "memorial": "statue|monument" },
          { "name": "horse|equestrian|cavalry|jockey|rider|knight" },
          { "leisure": "park" }
        ]
-    GOOD: regex = horse synonyms only.
-    BAD:  regex would be "horse|equestrian|...|statue" — the trailing
-          "statue" makes everything with "statue" in its name match,
-          including non-horse statues.
+    GOOD: subject-family arms emit the noun ("horse") on the OSM
+          subject keys (artwork_subject / statue / memorial). The name
+          regex stays subject-only — no "statue" trailing.
+    BAD:  name regex with trailing "statue" — matches every "Statue
+          of [X]" in the city, including non-horse statues.
 
     Scene: "old lighthouse on a cliff" (subject = lighthouse)
     -> [
@@ -326,10 +387,12 @@ Guidance for fields:
          { "landuse": "farmland" }
        ]
 
-    Scene: "lion statue at a museum entrance" (subject = lion)
+    Scene: "lion statue at a museum entrance" (subject = lion, form = statue)
     -> [
          { "tourism": "artwork" },
          { "historic": "monument" },
+         { "artwork_subject": "lion|lions|leonine" },
+         { "artwork_type": "statue|sculpture" },
          { "name": "lion|lions" },
          { "tourism": "museum" }
        ]
@@ -455,25 +518,137 @@ Guidance for fields:
 - interior_exterior: pick one if obvious from the scene; null if unclear.
 
 - mapillary_classes: ZERO to FOUR canonical Mapillary "object_value" strings
-  for objects/materials specifically called out in the scene. Use ONLY for
-  things Mapillary's car-mounted cameras actually see at street level.
+  for objects / signs / markings the scene specifically calls out at
+  street level. ONLY use the Points list below — these are the values
+  /map_features accepts for bbox queries.
 
-  Available canonical values (use exactly these, no others):
-    "object--bench", "object--bike-rack", "object--fire-hydrant",
-    "object--mailbox", "object--manhole", "object--phone-booth",
-    "object--street-light", "object--trash-can", "object--traffic-cone",
-    "object--parking-meter", "object--catch-basin",
-    "marking--surface--cobblestone", "marking--surface--brick"
+  Points (bbox-searchable; emit these for /map_features):
+    Objects:           "object--bench", "object--bike-rack",
+                       "object--billboard", "object--catch-basin",
+                       "object--cctv-camera", "object--fire-hydrant",
+                       "object--junction-box", "object--mailbox",
+                       "object--manhole", "object--parking-meter",
+                       "object--phone-booth", "object--street-light",
+                       "object--trash-can", "object--traffic-cone",
+                       "object--water-valve", "object--banner"
+    Signs (non-traffic): "object--sign--advertisement",
+                       "object--sign--information",
+                       "object--sign--store"
+    Supports / poles:  "object--support--pole",
+                       "object--support--utility-pole",
+                       "object--support--traffic-sign-frame"
+    Traffic lights:    "object--traffic-light--general-upright",
+                       "object--traffic-light--general-horizontal",
+                       "object--traffic-light--general-single",
+                       "object--traffic-light--pedestrians",
+                       "object--traffic-light--cyclists",
+                       "object--traffic-light--other"
+    Pavement markings: "marking--surface--cobblestone",
+                       "marking--surface--brick",
+                       "marking--discrete--arrow--straight",
+                       "marking--discrete--arrow--left",
+                       "marking--discrete--arrow--right",
+                       "marking--discrete--crosswalk-zebra",
+                       "marking--discrete--stop-line",
+                       "marking--discrete--symbol--bicycle",
+                       "marking--discrete--text",
+                       "marking--discrete--give-way-row",
+                       "marking--discrete--give-way-single"
+    Construction:      "construction--barrier--temporary",
+                       "construction--flat--crosswalk-plain",
+                       "construction--flat--driveway",
+                       "construction--flat--pedestrian-area",
+                       "construction--flat--sidewalk",
+                       "construction--structure--bridge"
 
-  Trees, buildings, and most natural features are NOT detected by Mapillary
-  — emit empty array for those.
+  Segmentation classes (NEVER emit for mapillary_classes — they are
+  pixel-level, not bbox-queryable). These belong in the retrieval_plan
+  background_concepts only:
+    "construction--structure--building", "nature--mountain",
+    "nature--sand", "nature--sky", "nature--snow", "nature--terrain",
+    "nature--vegetation", "nature--water"
+
+  Trees, buildings, mountains, water are NOT Points. They go into the
+  retrieval_plan as background_concepts with verify_in mapillary_photo
+  (which uses the per-image detections endpoint), never here.
 
   Examples:
     "cobblestone alley with bike racks" -> ["marking--surface--cobblestone", "object--bike-rack"]
     "neon-lit diner with phone booth"   -> ["object--phone-booth"]
     "bench on a wooded path"            -> ["object--bench"]
+    "billboard above a sidewalk"        -> ["object--sign--advertisement", "construction--flat--sidewalk"]
     "abandoned brick warehouse"         -> []
     "old blue building with trees"      -> []
+    "horse statue in a park"            -> []
+    "mountain road at dusk"             -> []
+
+- retrieval_plan: REQUIRED. Plans which data sources and Mapillary modes to use.
+  Do NOT tune for one example — generalize from the user's prompt.
+
+  {
+    "primary_subject": {
+      "type": "named_entity|osm_feature|street_object|landscape|interior|generic",
+      "label": "short label",
+      "osm_focus": true,
+      "wikidata_focus": true
+    },
+    "enrich_strategy": "default|subject_then_mapillary_then_background|landscape_image_scan",
+    "concepts": [
+      { "id": "subject", "terms": ["..."], "role": "primary", "weight": 1.0, "verify_in": "none" },
+      { "id": "setting", "terms": ["park"], "role": "setting", "weight": 0.25, "verify_in": "none" },
+      { "id": "bg", "terms": ["trees"], "role": "background", "weight": 0.4, "verify_in": "mapillary_photo" }
+    ],
+    "dependencies": [{ "kind": "in_setting", "primary": "subject", "secondary": "setting" }],
+    "sources": {
+      "wikidata-landmark": { "enabled": true, "priority": 1.0 },
+      "wikipedia-geosearch": { "enabled": true, "priority": 0.8 },
+      "nps-places": { "enabled": false, "priority": 0, "reason": "optional short reason" },
+      "ridb-recreation": { "enabled": false },
+      "own-db": { "enabled": true, "priority": 0.8 }
+    },
+    "mapillary": {
+      "mode": "none|point_images|bbox_objects|image_scan",
+      "classes": [],
+      "image_scan_required_classes": [],
+      "min_classes_for_filter": 2,
+      "use_for": ["attach_photos"],
+      "not_for": ["find_subject"],
+      "rationale": "one sentence"
+    },
+    "ranking": {
+      "use_concept_weights": true,
+      "tier_mapillary_with_background_first": false,
+      "min_primary_overlap": 0.5
+    }
+  }
+
+  Mapillary mode rules:
+  - point_images: Find subject via OSM/Wikidata first; use Mapillary only to attach
+    street photos at candidate coordinates. Use for statues, monuments, named artwork.
+    Set use_for: ["attach_photos","background_verify"] when user wants trees/buildings
+    IN THE BACKGROUND of the photo. NEVER use map_features to discover the subject.
+  - bbox_objects: User names street-level objects (bench, hydrant, cobblestone) OR
+    mapillary_classes non-empty. use_for may include find_subject.
+  - image_scan: Scene needs pixel classes in the same frame (mountain + road, etc.).
+    Fill image_scan_required_classes with canonical Mapillary values.
+  - none: Mapillary adds no retrieval value (interiors, etc.).
+
+  enrich_strategy:
+  - subject_then_mapillary_then_background: monument/statue + optional background
+    (trees, buildings behind). tier_mapillary_with_background_first: true.
+  - landscape_image_scan: vista / road / mountain scenes.
+  - default: everything else.
+
+  Concept roles:
+  - primary: what the filmmaker must find (statue, warehouse, diner).
+  - setting: where it sits (park, plaza) — lower weight.
+  - background: visual backdrop to verify IN PHOTOS (trees, buildings) — verify_in mapillary_photo.
+
+  Examples:
+  - "statue with trees behind it" -> enrich_strategy subject_then_mapillary_then_background,
+    mapillary.mode point_images, background concept trees, tier_mapillary_with_background_first true.
+  - "bench on cobblestone street" -> mapillary.mode bbox_objects, classes bench + cobblestone.
+  - "mountain road at dusk" -> landscape_image_scan, image_scan mountain + road classes.
 
 If the input is ambiguous or unsafe, still return a best-effort JSON object.
 Never refuse and never explain.`;

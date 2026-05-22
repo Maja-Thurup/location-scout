@@ -181,6 +181,23 @@ export type ProviderInput = {
    * other providers may ignore them.
    */
   osmTagsAlternatives: ReadonlyArray<Record<string, string>>;
+  /**
+   * Optional per-source query hints from the retrieval_plan. Each
+   * provider reads the slice it cares about; unknown fields are
+   * ignored. Generic for any prompt — derived from parsed nouns.
+   */
+  queryHints?: {
+    /** OSM subject-family extra arms (artwork_subject, statue, …). */
+    osmExtraArms?: ReadonlyArray<Record<string, string>>;
+    /** Wikidata P180 (depicts) Q-ids resolved from prompt subject. */
+    wikidataDepictsQids?: ReadonlyArray<string>;
+    /** Wikidata P31 (instance-of) Q-ids resolved from prompt form. */
+    wikidataClassesQids?: ReadonlyArray<string>;
+    /** Whether the Wikipedia provider should self-skip when Q-ids exist. */
+    wikipediaRunOnlyWhenNoQids?: boolean;
+    /** Q-ids the Wikipedia provider sees from upstream sources. */
+    wikipediaUpstreamQids?: ReadonlyArray<string>;
+  };
 };
 
 /** Developer-mode metadata attached to a provider run. */
