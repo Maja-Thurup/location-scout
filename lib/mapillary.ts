@@ -1,8 +1,10 @@
 import { z } from "zod";
 
+import type { Bbox } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
+import { splitBboxIntoTiles, tileToBboxStr } from "@/lib/mapillary/tiles";
 
 // ---------------------------------------------------------------------------
 // Mapillary Graph API — free crowdsourced street-level photography.
@@ -571,47 +573,26 @@ export type MapillaryDetection = {
  * "object--bench", "object--bike-rack", "marking--surface--cobblestone".
  * We pass the list to the Mapillary API verbatim.
  */
-export async function findDetectionsInBbox(input: {
-  bboxStr: string; // "minLng,minLat,maxLng,maxLat"
-  classes: ReadonlyArray<string>;
-  limit?: number;
-}): Promise<MapillaryDetection[]> {
-  if (input.classes.length === 0) return [];
-
-  const k = cacheKey("mapillary:image", {
-    kind: "detections",
-    bbox: input.bboxStr,
-    classes: [...input.classes].sort(),
-  });
-  const cached = await cacheGet<MapillaryDetection[]>(k);
-  if (cached) return cached;
-
+async function fetchMapFeaturesOneTile(
+  bboxStr: string,
+  classes: ReadonlyArray<string>,
+  limit: number,
+): Promise<MapillaryDetection[]> {
   const url = new URL(`${MAPILLARY_BASE}/map_features`);
   url.searchParams.set("access_token", env.MAPILLARY_TOKEN);
-  url.searchParams.set("bbox", input.bboxStr);
+  url.searchParams.set("bbox", bboxStr);
   url.searchParams.set("fields", "id,object_value,object_type,geometry");
-  url.searchParams.set("object_values", input.classes.join(","));
-  url.searchParams.set("limit", String(input.limit ?? 500));
+  url.searchParams.set("object_values", classes.join(","));
+  url.searchParams.set("limit", String(limit));
 
-  let raw: unknown;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(MAPILLARY_TIMEOUT_MS) });
-    if (!res.ok) {
-      logger.warn("mapillary detections http error", { status: res.status });
-      await cacheSet(k, "mapillary:image", [], 14);
-      return [];
-    }
-    raw = await res.json();
-  } catch (err) {
-    logger.warn("mapillary detections fetch failed", { err: String(err) });
+  const res = await fetch(url, { signal: AbortSignal.timeout(MAPILLARY_TIMEOUT_MS) });
+  if (!res.ok) {
+    logger.warn("mapillary detections http error", { status: res.status, bboxStr });
     return [];
   }
-
+  const raw = await res.json();
   const parsed = detectionsResponseSchema.safeParse(raw);
-  if (!parsed.success || !parsed.data.data) {
-    await cacheSet(k, "mapillary:image", [], 14);
-    return [];
-  }
+  if (!parsed.success || !parsed.data.data) return [];
 
   const out: MapillaryDetection[] = [];
   for (const d of parsed.data.data) {
@@ -624,7 +605,57 @@ export async function findDetectionsInBbox(input: {
       lng: coords[0],
     });
   }
+  return out;
+}
 
+export async function findDetectionsInBbox(input: {
+  /** Legacy: "minLng,minLat,maxLng,maxLat" */
+  bboxStr?: string;
+  bbox?: Bbox;
+  classes: ReadonlyArray<string>;
+  limit?: number;
+  maxTiles?: number;
+}): Promise<MapillaryDetection[]> {
+  if (input.classes.length === 0) return [];
+
+  let bbox: Bbox | null = input.bbox ?? null;
+  if (!bbox && input.bboxStr) {
+    const parts = input.bboxStr.split(",").map(Number);
+    if (parts.length === 4 && parts.every((n) => !Number.isNaN(n))) {
+      bbox = { west: parts[0]!, south: parts[1]!, east: parts[2]!, north: parts[3]! };
+    }
+  }
+  if (!bbox) return [];
+
+  const k = cacheKey("mapillary:image", {
+    kind: "detections-tiled-v1",
+    bbox,
+    classes: [...input.classes].sort(),
+  });
+  const cached = await cacheGet<MapillaryDetection[]>(k);
+  if (cached) return cached;
+
+  const tiles = splitBboxIntoTiles(bbox, undefined, input.maxTiles ?? 40);
+  const perTileLimit = Math.max(20, Math.floor((input.limit ?? 500) / tiles.length));
+  const seen = new Map<string, MapillaryDetection>();
+
+  try {
+    for (const tile of tiles) {
+      const batch = await fetchMapFeaturesOneTile(
+        tileToBboxStr(tile),
+        input.classes,
+        perTileLimit,
+      );
+      for (const d of batch) {
+        if (!seen.has(d.id)) seen.set(d.id, d);
+      }
+    }
+  } catch (err) {
+    logger.warn("mapillary detections fetch failed", { err: String(err) });
+    return [];
+  }
+
+  const out = Array.from(seen.values());
   await cacheSet(k, "mapillary:image", out, 14);
   return out;
 }

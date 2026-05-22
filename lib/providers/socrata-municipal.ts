@@ -91,6 +91,13 @@ const CHICAGO_BBOX: Bbox = {
   east: -87.52,
 };
 
+const LA_BBOX: Bbox = {
+  south: 33.65,
+  west: -118.75,
+  north: 34.45,
+  east: -118.1,
+};
+
 /**
  * NYC Public Art / Landmarks dataset (DCLA: Public Art Map).
  * Each row is a sculpture / mural / installation in the five
@@ -193,8 +200,44 @@ const SF_HISTORIC_SITES: DatasetEntry = {
 };
 
 /**
- * Chicago Landmark Districts dataset.
+ * LA Public Arts (City of Los Angeles open data).
+ * https://data.lacity.org/City-Infrastructure-Service-Requests/PublicArts/q3kc-wj3g
  */
+const LA_PUBLIC_ART: DatasetEntry = {
+  id: "q3kc-wj3g",
+  label: "la-public-art",
+  domain: "data.lacity.org",
+  bbox: LA_BBOX,
+  geomColumn: "location_1",
+  toCandidate: (row) => {
+    const point =
+      readPoint(row.location_1 ?? row.location ?? row.the_geom ?? row.geom);
+    if (!point) return null;
+    const title = String(
+      row.title ?? row.artwork_title ?? row.name ?? row.project_name ?? "",
+    );
+    const artist = String(row.artist ?? row.artist_name ?? "");
+    const medium = String(row.medium ?? row.artwork_type ?? "");
+    const desc = String(row.description ?? row.notes ?? "");
+    return {
+      externalId: `la-public-art:${row.objectid ?? row.id ?? title}`,
+      source: "own-db",
+      lat: point.lat,
+      lng: point.lng,
+      name: title || null,
+      description: desc?.slice(0, 280) || null,
+      knownImageUrl: null,
+      tags: {
+        "socrata:dataset": "la-public-art",
+        ...(artist ? { "socrata:artist": artist } : {}),
+        ...(medium ? { "socrata:medium": medium } : {}),
+      },
+      associatedFilms: [],
+      sourceUrl: `https://data.lacity.org/City-Infrastructure-Service-Requests/PublicArts/q3kc-wj3g`,
+    };
+  },
+};
+
 const CHI_LANDMARKS: DatasetEntry = {
   id: "tdab-kixi",
   label: "chicago-landmarks",
@@ -226,6 +269,7 @@ const DATASETS: ReadonlyArray<DatasetEntry> = [
   NYC_LANDMARKS,
   SF_HISTORIC_SITES,
   CHI_LANDMARKS,
+  LA_PUBLIC_ART,
 ];
 
 const rowSchema = z.record(z.string(), z.unknown());
@@ -255,7 +299,7 @@ async function searchDataset(
 export const socrataMunicipalProvider: CandidateProvider = {
   name: "own-db",
   debugKey: "socrata-municipal",
-  displayName: "Socrata municipal (NYC / SF / Chicago)",
+  displayName: "Socrata municipal (NYC / SF / Chicago / LA)",
   supportsBbox: (bbox) => DATASETS.some((d) => isBboxOverlapping(d.bbox, bbox)),
   async search(input: ProviderInput): Promise<ProviderResult> {
     const t0 = Date.now();

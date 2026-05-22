@@ -107,14 +107,18 @@ export function buildSourceDebugEntry(args: {
   };
 }
 
+/** Keys that must never be redacted (contain "token" substring but are not secrets). */
+const DEBUG_ALLOWLIST_KEYS = new Set(["sceneTokens", "scene_tokens"]);
+
 /** Strip accidental secret keys from debug request objects. */
 export function sanitizeDebugRequest(
   req: Record<string, unknown>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  const secretPattern = /key|token|secret|password|apikey|api_key/i;
+  const secretKeyPattern =
+    /^(.*_)?(api[_-]?key|access_token|refresh_token|app_token|authorization|password|secret)$/i;
   for (const [k, v] of Object.entries(req)) {
-    if (secretPattern.test(k)) {
+    if (!DEBUG_ALLOWLIST_KEYS.has(k) && secretKeyPattern.test(k)) {
       out[k] = v ? "[redacted]" : v;
     } else if (v && typeof v === "object" && !Array.isArray(v)) {
       out[k] = sanitizeDebugRequest(v as Record<string, unknown>);

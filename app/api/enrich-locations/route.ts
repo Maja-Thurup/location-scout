@@ -26,6 +26,7 @@ import {
   type MapillaryDetection,
   type MapillaryImage,
 } from "@/lib/mapillary";
+import { mapSceneToMapillary } from "@/lib/mapillary/scene-to-classes";
 import { runFilmHistoryProviders } from "@/lib/providers/registry";
 import { buildSourceDebugEntry } from "@/lib/source-debug";
 import type { EnrichSourcePayload, SourceDebugEntry } from "@/lib/source-debug";
@@ -799,12 +800,20 @@ export const POST = withAuth(async (req) => {
   // When the scene calls out specific objects (bench, bike rack, etc.),
   // fetching all matching detections for the bbox in one call is far
   // cheaper than per-candidate fetches.
+  const enrichMlyPlan = mapSceneToMapillary({
+    sceneTokens,
+    mapillaryClasses,
+  });
+  const enrichMlyBboxClasses = [
+    ...new Set([...mapillaryClasses, ...enrichMlyPlan.bboxClasses]),
+  ];
   let detections: MapillaryDetection[] = [];
-  if (mapillaryClasses.length > 0 && searchBbox) {
-    const bboxStr = `${searchBbox.west},${searchBbox.south},${searchBbox.east},${searchBbox.north}`;
+  if (enrichMlyBboxClasses.length > 0 && searchBbox) {
     detections = await findDetectionsInBbox({
-      bboxStr,
-      classes: mapillaryClasses,
+      bbox: searchBbox,
+      classes: enrichMlyBboxClasses,
+      limit: 200,
+      maxTiles: 40,
     });
   }
 
@@ -845,7 +854,7 @@ export const POST = withAuth(async (req) => {
   // When the scene calls out specific objects, drop candidates that have
   // none of them within 50m. Free filter, no API calls per candidate.
   const afterDetectionFilter =
-    mapillaryClasses.length > 0
+    enrichMlyBboxClasses.length > 0
       ? afterColorFilter.filter((s) => {
           const hits = countDetectionsNearPoint(
             detections,
@@ -1332,16 +1341,19 @@ export const POST = withAuth(async (req) => {
         displayName: "Mapillary detections (enrich)",
         ms: Date.now() - mlyDetectT0,
         error: null,
-        skipped: mapillaryClasses.length === 0 || !searchBbox,
+        skipped: enrichMlyBboxClasses.length === 0 || !searchBbox,
         skipReason:
-          mapillaryClasses.length === 0
-            ? "no mapillary_classes"
+          enrichMlyBboxClasses.length === 0
+            ? enrichMlyPlan.imageScanClasses.length > 0
+              ? "image-scan classes only (not in map_features bbox)"
+              : "no Mapillary bbox classes resolved"
             : !searchBbox
               ? "no search_bbox"
               : null,
         request: {
           searchBbox: searchBbox ?? null,
-          mapillaryClasses,
+          resolvedMapillaryClasses: enrichMlyPlan,
+          enrichMlyBboxClasses,
         },
         candidates: [],
         enrich: {

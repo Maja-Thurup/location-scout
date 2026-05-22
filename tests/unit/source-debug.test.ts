@@ -70,11 +70,21 @@ describe("sanitizeDebugRequest", () => {
     const out = sanitizeDebugRequest({
       bbox: { south: 1 },
       api_key: "secret-value",
-      nested: { token: "abc" },
+      access_token: "secret-value",
     });
     expect(out.api_key).toBe("[redacted]");
-    expect(out.nested).toEqual({ token: "[redacted]" });
+    expect(out.access_token).toBe("[redacted]");
     expect(out.bbox).toEqual({ south: 1 });
+  });
+
+  it("does not redact sceneTokens", () => {
+    const tokens = ["horse", "statue", "park"];
+    const out = sanitizeDebugRequest({
+      sceneTokens: tokens,
+      scene_tokens: tokens,
+    });
+    expect(out.sceneTokens).toEqual(tokens);
+    expect(out.scene_tokens).toEqual(tokens);
   });
 });
 

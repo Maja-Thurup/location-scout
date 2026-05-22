@@ -12,7 +12,10 @@ import {
 } from "@/lib/bbox";
 import { cacheGet, cacheKey, cacheSet } from "@/lib/cache";
 import { forwardGeocode } from "@/lib/geocode";
+import { deriveOsmDescription, extractOsmWikidataQid } from "@/lib/osm-description";
 import { shouldExcludeOsmCommercialOnSculptureScene } from "@/lib/osm-scene-filter";
+import { mapSceneToMapillary } from "@/lib/mapillary/scene-to-classes";
+import { enrichWikidataFacts } from "@/lib/wikidata-rest";
 import { type GooglePlace, searchText } from "@/lib/google-places";
 import { logger } from "@/lib/logger";
 import { findDetectionsInBbox } from "@/lib/mapillary";
@@ -241,15 +244,19 @@ export function sceneImpliesAbandonment(args: {
 // ---------------------------------------------------------------------------
 
 function osmCandidateToRaw(c: OsmCandidate): RawCandidate {
+  const qid = extractOsmWikidataQid(c.tags);
   return {
     externalId: c.id,
     source: "osm",
     lat: c.lat,
     lng: c.lng,
     name: c.name,
-    description: null,
+    description: deriveOsmDescription(c.tags),
     knownImageUrl: null,
-    tags: c.tags,
+    tags: {
+      ...c.tags,
+      ...(qid ? { "wikidata:qid": qid } : {}),
+    },
     associatedFilms: [],
     sourceUrl: `https://www.openstreetmap.org/${c.type}/${c.osmId}`,
   };
@@ -514,19 +521,24 @@ export const POST = withAuth(async (req) => {
   let finalExpansion: 1 | 2 | 4 = osmResult.expansionMultiplier;
   let finalPrimaryTag = osmResult.primaryTag;
 
-  // 3.5) Mapillary detections — additional OSM-flavored candidates from
-  // street-level object detections (benches, hydrants, etc.).
+  // 3.5) Mapillary detections — map_features for bbox-searchable classes
+  // resolved from scene_tokens + Claude mapillary_classes.
+  const mlyPlan = mapSceneToMapillary({
+    sceneTokens,
+    mapillaryClasses: mapillaryClasses ?? [],
+    locationKind,
+  });
   const mapillaryCandidates: OsmCandidate[] = [];
   const mlyT0 = Date.now();
   let mapillaryDetectionsRaw: Awaited<ReturnType<typeof findDetectionsInBbox>> = [];
   let mapillaryDetectionsError: string | null = null;
-  if (mapillaryClasses && mapillaryClasses.length > 0) {
-    const bboxStr = `${effectiveBbox.west},${effectiveBbox.south},${effectiveBbox.east},${effectiveBbox.north}`;
+  if (mlyPlan.bboxClasses.length > 0) {
     try {
       mapillaryDetectionsRaw = await findDetectionsInBbox({
-        bboxStr,
-        classes: mapillaryClasses,
-        limit: 80,
+        bbox: effectiveBbox,
+        classes: mlyPlan.bboxClasses,
+        limit: 120,
+        maxTiles: 40,
       });
       for (const d of mapillaryDetectionsRaw) {
         mapillaryCandidates.push({
@@ -730,6 +742,34 @@ export const POST = withAuth(async (req) => {
     )
     .slice(0, MAX_OUTPUT_CANDIDATES);
 
+  // 6.4) Wikidata REST backfill for OSM-tagged Q-ids missing facts.
+  const WIKIDATA_BACKFILL_CAP = 25;
+  let wikidataBackfillCount = 0;
+  await Promise.all(
+    ranked.slice(0, WIKIDATA_BACKFILL_CAP).map(async (c) => {
+      const qid = extractOsmWikidataQid(c.tags);
+      if (!qid || c.wikidataFacts) return;
+      const facts = await enrichWikidataFacts({ qid, existing: c.wikidataFacts });
+      const hasFacts =
+        facts &&
+        (facts.inception ||
+          facts.creators.length > 0 ||
+          facts.depicts.length > 0 ||
+          facts.materials.length > 0 ||
+          facts.genres.length > 0);
+      if (hasFacts && facts) {
+        c.wikidataFacts = facts;
+        if (!c.description && facts.depicts.length > 0) {
+          c.description = `Depicts: ${facts.depicts.slice(0, 3).join(", ")}`;
+        }
+        wikidataBackfillCount++;
+      }
+    }),
+  );
+  if (wikidataBackfillCount > 0) {
+    logger.info("search-osm wikidata REST backfill", { count: wikidataBackfillCount });
+  }
+
   // 6.5) Decide whether vision scoring is necessary at enrichment time.
   // Strong tag overlap on enough candidates means vision is unlikely to
   // change the ranking, so the enrichment route can skip it (free tier
@@ -828,13 +868,19 @@ export const POST = withAuth(async (req) => {
         displayName: "Mapillary detections (search)",
         ms: mapillaryMs,
         error: mapillaryDetectionsError,
-        skipped: !mapillaryClasses?.length,
-        skipReason: !mapillaryClasses?.length
-          ? "no mapillary_classes in scene parse"
-          : null,
+        skipped: mlyPlan.bboxClasses.length === 0,
+        skipReason:
+          mlyPlan.bboxClasses.length === 0
+            ? mlyPlan.imageScanClasses.length > 0
+              ? "bbox classes empty — image-scan classes run at enrich"
+              : mlyPlan.unmatchedTokens.length > 0
+                ? `no Mapillary classes for tokens: ${mlyPlan.unmatchedTokens.join(", ")}`
+                : "no scene cues map to Mapillary object_values"
+            : null,
         request: {
           bbox: effectiveBbox,
-          mapillaryClasses: mapillaryClasses ?? [],
+          resolvedMapillaryClasses: mlyPlan,
+          claudeMapillaryClasses: mapillaryClasses ?? [],
         },
         candidates: mapillaryCandidates.map(osmCandidateToRaw),
         enrich: {
